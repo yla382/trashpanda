@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model files and outputs: never commit these
+*.safetensors
+*.pth
+*.pt
+*.ckpt
+*.gguf
+models/
+output/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
