@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "dumpsterpanda"
-version = "0.0.2"
+version = "0.0.3"
 description = "Run models bigger than your GPU: layer-by-layer weight streaming across GPU, RAM and disk."
 authors = ["yla382"]
 readme = "README.md"
@@ -24,6 +24,19 @@ safetensors = ">=0.4.3"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"
+psutil = "*"
+numpy = "*"      # safetensors.torch.save_file (used by the tests) needs it
+# CPU-only torch for running the tests. Real users install the build that matches their GPU themselves.
+torch = { version = ">=2.1", source = "pytorch-cpu" }
+
+[[tool.poetry.source]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
