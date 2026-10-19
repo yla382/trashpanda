@@ -1,16 +1,16 @@
 [tool.poetry]
 name = "dumpsterpanda"
-version = "0.0.4"
+version = "0.0.5"
 description = "Run models bigger than your GPU: layer-by-layer weight streaming across GPU, RAM and disk."
 authors = ["yla382"]
 readme = "README.md"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 repository = "https://github.com/yla382/trashpanda"
 keywords = ["pytorch", "offloading", "low-vram", "safetensors", "quantization", "inference"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]

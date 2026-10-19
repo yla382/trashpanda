@@ -5,6 +5,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com), versions follow 
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-10-19
+### Added
+- Prefetching: while one block computes, the next block's compact tensors are copied to the GPU on a second CUDA stream. The execution order is learned during the first pass. Applies to blocks waiting in RAM; disk blocks are not prefetched yet
+
+### Changed
+- License changed from Apache-2.0 to AGPL-3.0-only. Versions 0.0.1 to 0.0.4 remain available under Apache-2.0
+
 ## [0.0.4] - 2026-10-18
 ### Fixed
 - Windows error 1455 ("paging file too small") when reading disk-tier blocks while the model runs. Each read used to memory-map the whole checkpoint; it now seeks and reads only the bytes it needs

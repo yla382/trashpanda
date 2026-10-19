@@ -101,7 +101,8 @@ as norms are left alone).
   the hooks, drop the weights, empty the GPU cache and report memory before and after). For now, free memory
   yourself: `handle.remove()`, `del model`, `gc.collect()`, `torch.cuda.empty_cache()`; for the strictest cleanup
   (system RAM in particular), run heavy stages in their own process
-* prefetching the next block while the current one computes
+* full overlap of copying and computing: blocks waiting in RAM are prefetched, but the copy from ordinary
+  (pageable) memory is not fully asynchronous yet, and disk blocks are not prefetched at all
 * int8 / 4-bit formats (fp8 and ordinary float dtypes only)
 * LoRA/LoKr adapters, multi-GPU, model definitions
 
@@ -129,7 +130,10 @@ as norms are left alone).
 * planner: replace the fixed 3 GB RAM reserve with one that scales with the machine
 * planner: fill the GPU from a measured activation size instead of a fixed headroom
 * planner: take memory held by other loaded models into account, or at least warn about it
-* prefetch the next block (read from disk, copy from RAM) while the current block computes, and use pinned memory
+* prefetching, step 2: a small pool of pinned staging buffers (and a background thread) so the copy from RAM to the
+  GPU is truly asynchronous
+* prefetching, step 3: read disk blocks ahead of time into the pinned buffers, with a look-ahead of more than one
+  block for slow drives
 * a cost model that chooses between GPU, RAM and disk from measured disk and PCIe speed
 * `release()` / `stage()` helpers for cleaning up between models
 
@@ -144,4 +148,4 @@ Tests run on the CPU with a tiny fake model.
 
 ## License
 
-Apache-2.0
+AGPL-3.0-only. See [LICENSE](LICENSE).

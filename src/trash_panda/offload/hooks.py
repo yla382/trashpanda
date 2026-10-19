@@ -55,6 +55,70 @@ class DiskReader:
         }
 
 
+class _Entry:
+    """One wrapped block: what it holds, which block ran after it, and its prefetched tensors."""
+
+    def __init__(self, slots, scales, reader):
+        self.slots  = slots
+        self.scales = scales 
+        self.reader = reader
+        self.next   = None
+        self.staged = None
+
+
+class _Prefetcher:
+    """Copies the next block's compact tensors to the device on a second CUDA stream"""
+
+    def __init__(self, device: torch.device):
+        self.device  = device
+        self.stream  = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self.last    = None
+        self.pending = None
+
+    def learn(self, entry) -> None:
+        if self.last is not None:
+            self.last.next = entry
+        self.last = entry
+
+    def stage(self, entry) -> None:
+        if self.stream is None or entry is None or entry.reader is not None or entry.staged is not None:
+            return
+        if self.pending is not None:
+            self.pending.staged = None
+
+        tensors = {}
+        with torch.cuda.stream(self.stream):
+            for name, _owner, _leaf, _is_param, orig in entry.slots:
+                scale = entry.scales.get(name)
+                tensors[name] = (
+                    orig.to(self.device, non_blocking=True),
+                    scale.to(self.device, non_blocking=True) if scale is not None else None,
+                )
+            event = torch.cuda.Event()
+            event.record(self.stream)
+        entry.staged = (tensors, event)
+        self.pending = entry
+
+    def take(self, entry):
+        """The staged tensors, once their copy has finished, or None if nothing was staged."""
+        staged, entry.staged = entry.staged, None
+        if self.pending is entry:
+            self.pending = None
+        if staged is None:
+            return None
+        
+        tensors, event = staged
+        compute = torch.cuda.current_stream(self.device)
+        compute.wait_event(event)
+
+        for raw, scale in tensors.values():
+            raw.record_stream(compute)
+            if scale is not None:
+                scale.record_stream(compute)
+        return tensors
+        
+
+
 def _needs_wrapping(slots, scales, device: torch.device, dtype: torch.dtype, disk) -> bool:
     if disk is not None:
         return True
@@ -74,13 +138,15 @@ def offload_blocks(
     device: Union[str, torch.device, None] = None,
     compute_dtype: torch.dtype = torch.bfloat16,
     disk: Optional[Callable[[nn.Module], Optional[DiskReader]]] = None,
+    prefetcher: Optional["_Prefetcher"] = None
 ) -> OffloadHandle:
     """Low-level: wrap each block so its weights are expanded on `device` only while it runs.
 
     Blocks whose weights are already on the device in the compute dtype are left untouched.
     `disk` (advanced) maps a block to a DiskReader when its weights live in the checkpoint file."""
-    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    dev    = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     handle = OffloadHandle()
+    prefetcher = prefetcher or _Prefetcher(dev)
 
     for block in blocks:
         scales = {
@@ -100,16 +166,27 @@ def offload_blocks(
         if not _needs_wrapping(slots, scales, dev, compute_dtype, reader):
             continue
 
-        def bring(slots=slots, scales=scales, reader=reader):
-            data = reader.read() if reader is not None else None
-            for name, owner, leaf, is_param, orig in slots:
+        entry  = _Entry(slots, scales, reader)
+
+        def bring(entry=entry):
+            data   = entry.reader.read() if entry.reader is not None else None
+            staged = None
+            if data is None:
+                staged = prefetcher.take(entry)
+                if staged is None:
+                    prefetcher.stage(entry)
+                    staged = prefetcher.take(entry)
+            for name, owner, leaf, is_param, orig in entry.slots:
                 if data is not None:
                     raw, scale = data[name]
+                elif staged is not None:
+                    raw, scale = staged[name]
                 else:
-                    raw, scale = orig, scales.get(name)
-                t = expand(raw, scale, compute_dtype, dev) if raw.is_floating_point() else raw.to(dev)
+                    raw, scale = orig, entry.scales.get(name)
+                t = expand(raw, scale, compute_dtype, dev) if raw.is_floating_point() else  raw.to(dev)
+
                 if is_param:
-                    owner._parameters[leaf] = nn.Parameter(t, requires_grad=False)
+                    owner._parameters[leaf]  = nn.Parameter(t, requires_grad=False)
                 else:
                     owner._buffers[leaf] = t
 
@@ -122,16 +199,20 @@ def offload_blocks(
 
         original_forward = block.forward
 
-        def wrapped(*args, _orig=original_forward, _bring=bring, _restore=restore, **kwargs):
+        def wrapped(*args, _orig=original_forward, _bring=bring, _restore=restore, _entry=entry, **kwargs):
+            prefetcher.learn(_entry)
             _bring()
+            prefetcher.stage(_entry.next)
+
             try:
                 return _orig(*args, **kwargs)
             finally:
                 _restore()
 
-        def undo(block=block, restore=restore):
+        def undo(block=block, restore=restore, entry=entry):
             restore()
             block.__dict__.pop("forward", None)
+            entry.staged = None
 
         block.forward = wrapped
         handle._add(undo)
@@ -158,6 +239,7 @@ def install_offload(
     cdt = compute_dtype or (state.compute_dtype if state is not None else plan.compute_dtype)
 
     handle = OffloadHandle()
+    pre    = _Prefetcher(torch.device(dev or ("cuda" if torch.cuda.is_available() else "cpu")))
     for b in plan.blocks:
         block = model.get_submodule(b.prefix.rstrip("."))
         reader_factory = None
@@ -165,5 +247,5 @@ def install_offload(
             if state is None:
                 raise ValueError("Disk blocks need a model loaded with stream_load().")
             reader_factory = lambda _blk, p=b.prefix: DiskReader(state.checkpoint, state.disk_keys, p)
-        handle.extend(offload_blocks([block], device=dev, compute_dtype=cdt, disk=reader_factory))
+        handle.extend(offload_blocks([block], device=dev, compute_dtype=cdt, disk=reader_factory, prefetcher=pre))
     return handle
