@@ -24,11 +24,29 @@ needed), and fp8 (with or without scale tensors) is kept compact so more fits.
 
 ## Install
 
-Install PyTorch first (the build that matches your GPU), then:
+Install PyTorch first (the build that matches your GPU, see https://pytorch.org), then:
+
+```
+pip install dumpsterpanda
+```
+
+The package is imported as `trash_panda`:
+
+```python
+import trash_panda
+```
+
+To try the latest development version straight from GitHub instead:
 
 ```
 pip install git+https://github.com/yla382/trashpanda.git
 ```
+
+### Why is it called `dumpsterpanda` on PyPI? 🦝😢
+
+The project is called **trash-panda**, but the name [`trashpanda`](https://pypi.org/project/trashpanda/#description)
+was already taken on PyPI, and PyPI wouldn't let `trash-panda` sit that close to it either. So the raccoon moved
+one dumpster over. The import is still `trash_panda`.
 
 ## Use
 
