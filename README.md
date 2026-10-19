@@ -94,9 +94,44 @@ as norms are left alone).
 
 ## What it does not do (yet)
 
+* coordinating memory between several models that are loaded at the same time (for example a text encoder
+  and a diffusion model). Each model is planned on its own from the memory that is free when you plan it, so
+  plan them one after the other, or free the first model before loading the next
+* one-call cleanup after a model is done (a `release(model)` helper and a pipeline `stage()` helper that remove
+  the hooks, drop the weights, empty the GPU cache and report memory before and after). For now, free memory
+  yourself: `handle.remove()`, `del model`, `gc.collect()`, `torch.cuda.empty_cache()`; for the strictest cleanup
+  (system RAM in particular), run heavy stages in their own process
 * prefetching the next block while the current one computes
 * int8 / 4-bit formats (fp8 and ordinary float dtypes only)
 * LoRA/LoKr adapters, multi-GPU, model definitions
+
+## Known issues
+
+* **Automatic plans change from run to run.** `plan()` uses the RAM that is free at the moment you call it, and
+  free RAM varies. On a 16 GB machine the same script gave a RAM budget of 6.2 GB in one run and 8.0 GB in
+  another, which moved several blocks between RAM and disk
+* **Load other models before you plan.** If a second model (a text encoder, a VAE) is loaded after `plan()`, the
+  RAM the plan counted on is taken, Windows pages the weights out, and the first step is very slow. Create the other
+  models first so the plan sees the memory that is really left
+* **The default RAM reserve is conservative.** `min_free_ram="3GB"` keeps 3 GB free, which on a 16 GB machine can
+  send blocks to disk that would have fit. Try `"500MB"` to `"1GB"`
+* **The default VRAM headroom is a fixed guess.** `headroom_vram="1.5GB"` does not know how much memory your
+  activations need (it grows with image size). If too many blocks are resident, Windows silently spills GPU memory
+  into shared system memory and every step becomes several times slower, with no error. Lower `resident_blocks`, or
+  set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" in the NVIDIA Control Panel so it fails loudly
+* **Disk blocks are read one after another with the compute.** Nothing overlaps, so each disk block adds its full
+  read time to every step. This is slow on a SATA SSD
+* **Tested on one setup so far:** a 12B diffusion model (fp8 with scales) on Windows with an RTX 3060 (12 GB) and
+  16 GB of RAM. Other models, GPUs and operating systems are not covered yet
+
+## Next steps
+
+* planner: replace the fixed 3 GB RAM reserve with one that scales with the machine
+* planner: fill the GPU from a measured activation size instead of a fixed headroom
+* planner: take memory held by other loaded models into account, or at least warn about it
+* prefetch the next block (read from disk, copy from RAM) while the current block computes, and use pinned memory
+* a cost model that chooses between GPU, RAM and disk from measured disk and PCIe speed
+* `release()` / `stage()` helpers for cleaning up between models
 
 ## Development
 

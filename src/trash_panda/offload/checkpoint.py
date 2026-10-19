@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import struct
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,8 @@ class TensorInfo:
     dtype: str                     # safetensors dtype string, e.g. "BF16", "F8_E4M3"
     shape: Tuple[int, ...]
     file: Path
+    start: int = 0                 # absolute byte offsets of the data inside `file`
+    end: int = 0
 
     @property
     def numel(self) -> int:
@@ -68,6 +71,15 @@ def _resolve_files(path: Union[str, Path]) -> List[Path]:
     raise FileNotFoundError(f"Checkpoint not found: {p}")
 
 
+def _read_header(f: Path) -> Tuple[Dict[str, dict], int]:
+    """The json header of a safetensors file and the offset where the tensor data begins."""
+    with open(f, "rb") as fh:
+        (n,) = struct.unpack("<Q", fh.read(8))
+        header = json.loads(fh.read(n))
+    header.pop("__metadata__", None)
+    return header, 8 + n
+
+
 class Checkpoint:
     """Header-level view of a (possibly sharded) safetensors checkpoint.
 
@@ -79,10 +91,10 @@ class Checkpoint:
         self.files = _resolve_files(path)
         self._index: Dict[str, TensorInfo] = {}
         for f in self.files:
-            with safe_open(str(f), framework="pt") as fh:
-                for key in fh.keys():
-                    sl = fh.get_slice(key)
-                    self._index[key] = TensorInfo(key, sl.get_dtype(), tuple(sl.get_shape()), f)
+            header, base = _read_header(f)
+            for key, meta in header.items():
+                a, b = meta["data_offsets"]
+                self._index[key] = TensorInfo(key, meta["dtype"], tuple(meta["shape"]), f, base + a, base + b)
         self._stack: Optional[ExitStack] = None
         self._handles: Dict[Path, object] = {}
 
@@ -106,6 +118,13 @@ class Checkpoint:
         return sum(i.nbytes for i in self._index.values())
 
     # -- tensor reads
+    # Two modes:
+    #  * inside `with checkpoint:` (loading) each file is opened once with safetensors' memory map, as a normal
+    #    safe_open load does. Tensors that wait in RAM then stay file-backed, which Windows can drop and re-read
+    #    instead of writing them to the pagefile when memory runs short.
+    #  * outside it (reading disk-tier blocks while the model runs) plain seek-and-read of just the bytes needed.
+    #    Mapping the whole file for every read charges the commit limit on Windows and fails with
+    #    "paging file too small" (error 1455) on big checkpoints.
     def __enter__(self) -> "Checkpoint":
         self._stack = ExitStack()
         self._handles = {f: self._stack.enter_context(safe_open(str(f), framework="pt")) for f in self.files}
@@ -116,13 +135,25 @@ class Checkpoint:
             self._stack.close()
         self._stack, self._handles = None, {}
 
+    @staticmethod
+    def _read_one(fh, info: TensorInfo) -> torch.Tensor:
+        fh.seek(info.start)
+        buf = bytearray(info.end - info.start)
+        fh.readinto(buf)
+        dtype = info.torch_dtype
+        if dtype is None:
+            raise ValueError(f"Unsupported dtype {info.dtype} for {info.key!r}")
+        if not buf:
+            return torch.empty(info.shape, dtype=dtype)
+        return torch.frombuffer(buf, dtype=torch.uint8).view(dtype).reshape(info.shape)
+
     def get_tensor(self, key: str) -> torch.Tensor:
         info = self._index[key]
         handle = self._handles.get(info.file)
         if handle is not None:
             return handle.get_tensor(key)
-        with safe_open(str(info.file), framework="pt") as fh:
-            return fh.get_tensor(key)
+        with open(info.file, "rb") as fh:
+            return self._read_one(fh, info)
 
     def read(self, keys: Iterable[str]) -> Dict[str, torch.Tensor]:
         """Read several tensors, opening each file once."""
@@ -136,7 +167,7 @@ class Checkpoint:
                 for k in ks:
                     out[k] = handle.get_tensor(k)
             else:
-                with safe_open(str(f), framework="pt") as fh:
-                    for k in ks:
-                        out[k] = fh.get_tensor(k)
+                with open(f, "rb") as fh:
+                    for k in sorted(ks, key=lambda k: self._index[k].start):
+                        out[k] = self._read_one(fh, self._index[k])
         return out

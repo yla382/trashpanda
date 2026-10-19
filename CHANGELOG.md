@@ -5,6 +5,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com), versions follow 
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-10-18
+### Fixed
+- Windows error 1455 ("paging file too small") when reading disk-tier blocks while the model runs. Each read used to memory-map the whole checkpoint; it now seeks and reads only the bytes it needs
+
+### Changed
+- While loading (`with checkpoint:` / `stream_load`) the checkpoint is opened once with safetensors' memory map, so tensors waiting in RAM stay file-backed and Windows can drop and re-read them instead of paging them out. Disk-tier reads at run time use plain seek-and-read
+- `Checkpoint` reads the safetensors header itself (byte offsets are kept in `TensorInfo`)
+
 ## [0.0.3] - 2026-10-18
 ### Added
 - `plan()` and `Plan.manual()` to decide where each block lives (GPU, RAM or disk), automatically or by hand
