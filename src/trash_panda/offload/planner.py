@@ -20,6 +20,14 @@ from .formats import expanded_nbytes, parse_dtype, stored_nbytes
 from .hardware import Hardware, detect_hardware
 from .report import fmt_bytes
 
+_GB = 1024 ** 3
+
+def _auto_ram_reserve(hw: Hardware) -> int:
+    """RAM kept free for the OS and other program: 8% of the machine's RAM, between 1GB and 4GB"""
+    if not hw.ram_total:
+        return 2 * _GB
+    return int(min(max(0.08 * hw.ram_total, 1 * _GB), 4 * _GB))
+
 
 class Tier(str, Enum):
     GPU = "gpu"      # resident: kept on the compute device
@@ -163,8 +171,9 @@ def plan(
     resident_blocks: Optional[int] = None,
     max_vram: Union[None, int, str] = None,
     headroom_vram: Union[int, str] = "1.5GB",
+    activation_vram: Union[None, int, str] = None,
     max_ram: Union[None, int, str] = None,
-    min_free_ram: Union[int, str] = "3GB",
+    min_free_ram: Union[int, str] = "auto",
     allow_disk: bool = True,
     hardware: Optional[Hardware] = None,
     groups: Optional[List[BlockGroup]] = None,
@@ -174,8 +183,9 @@ def plan(
     resident_blocks  force this many blocks (from the start) to be GPU-resident instead of "as many as fit"
     max_vram         VRAM to use (default: what is free right now)
     headroom_vram    VRAM kept free for activations, the CUDA context and other programs
+    activation_vram  measured GPU memory the activations need (see measure_activation_vram); replaces headroom_cram
     max_ram          RAM to use for streamed blocks (default: what is available right now)
-    min_free_ram     RAM kept free for the operating system and other programs
+    min_free_ram     RAM kept free for the operating system and other programs ("auto": 8% of the machine's RAM, 1 to 4GB)
     allow_disk       blocks that do not fit in RAM stay in the checkpoint file (slow) instead of RAM
     """
     cdt = parse_dtype(compute_dtype) or torch.bfloat16
@@ -212,7 +222,13 @@ def plan(
         other += expanded_nbytes(info.shape, info.torch_dtype, cdt)
 
     # -- budgets
-    headroom = parse_bytes(headroom_vram) or 0
+    activation = parse_bytes(activation_vram)
+    if activation is not None:
+        margin = max(int(0.05 * hw.vram_total), _GB // 2) # allocator slack and fragmentation
+        headroom = activation + margin
+    else:
+        headroom = parse_bytes(headroom_vram) or 0
+    
     vram_cap = parse_bytes(max_vram)
     vram_budget = (vram_cap if vram_cap is not None else hw.vram_free) - headroom
     vram_budget = max(vram_budget, 0)
@@ -251,8 +267,15 @@ def plan(
 
     # -- RAM vs disk for the rest
     ram_cap = parse_bytes(max_ram)
-    ram_budget = (ram_cap if ram_cap is not None else hw.ram_available) - (parse_bytes(min_free_ram) or 0)
+    if isinstance(min_free_ram, str) and min_free_ram.strip().lower() == "auto":
+        ram_reserve  = _auto_ram_reserve(hw)
+    else:
+        ram_reserve = parse_bytes(min_free_ram) or 0
+   
+    ram_budget = (ram_cap if ram_cap is not None else hw.ram_available) - ram_reserve
     ram_budget = max(ram_budget, 0)
+
+    
     ram_left = ram_budget
     for b in blocks[n_res:]:
         if b.stored_bytes <= ram_left:

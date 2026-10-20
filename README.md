@@ -86,6 +86,27 @@ stream_load(model, path, offload_prefixes=["blocks."], resident_prefixes=["block
 offload_blocks(model.blocks, device="cuda", compute_dtype=torch.bfloat16)
 ```
 
+### Fitting the GPU to your workload
+
+How many blocks can stay on the GPU depends on how much memory your activations need, which grows with image
+size and cannot be known before the model runs. By default the planner keeps a fixed `headroom_vram="1.5GB"` free.
+To use a measured value instead, run your real call once and read the peak:
+
+```python
+from trash_panda import install_offload, measure_activation_vram, plan, stream_load
+
+p = plan(model, path)
+stream_load(model, path, plan=p)
+install_offload(model)
+
+need = measure_activation_vram(lambda: run_my_generation(), p)   # include everything that runs, such as a VAE decode
+print(f"activations need {need / 1e9:.2f} GB")
+
+p = plan(model, path, activation_vram="2.6GB")                   # next time: fill the rest of the GPU
+```
+
+The value is per model and per input size, so measure again if you change the resolution.
+
 ### Storage dtype
 
 By default weights are kept exactly as stored in the file. Optionally, `storage_dtype="bf16"` casts waiting
@@ -112,23 +133,28 @@ as norms are left alone).
   free RAM varies. On a 16 GB machine the same script gave a RAM budget of 6.2 GB in one run and 8.0 GB in
   another, which moved several blocks between RAM and disk
 * **Load other models before you plan.** If a second model (a text encoder, a VAE) is loaded after `plan()`, the
-  RAM the plan counted on is taken, Windows pages the weights out, and the first step is very slow. Create the other
-  models first so the plan sees the memory that is really left
-* **The default RAM reserve is conservative.** `min_free_ram="3GB"` keeps 3 GB free, which on a 16 GB machine can
-  send blocks to disk that would have fit. Try `"500MB"` to `"1GB"`
+  memory the plan counted on is taken. In RAM, Windows pages the weights out and the first step is very slow. On the
+  GPU, too many blocks stay resident and the overflow spills into shared memory, which can make every step several
+  times slower. Create the other models first so the plan sees the memory that is really left
+* **The default RAM reserve is a rule of thumb.** `min_free_ram="auto"` keeps 8% of the machine's RAM free (between
+  1 and 4 GB, so about 1.3 GB on a 16 GB machine). If your other programs use a lot of memory, or very little, set
+  `min_free_ram` yourself, for example `"500MB"` or `0`
 * **The default VRAM headroom is a fixed guess.** `headroom_vram="1.5GB"` does not know how much memory your
-  activations need (it grows with image size). If too many blocks are resident, Windows silently spills GPU memory
-  into shared system memory and every step becomes several times slower, with no error. Lower `resident_blocks`, or
-  set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" in the NVIDIA Control Panel so it fails loudly
+  activations need (it grows with image size), and measuring it is a manual step for now (see "Fitting the GPU to
+  your workload"). If too many blocks are resident, Windows silently spills GPU memory into shared system memory
+  and every step becomes several times slower, with no error. Pass a measured `activation_vram`, lower
+  `resident_blocks`, or set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" in the NVIDIA Control
+  Panel so it fails loudly
 * **Disk blocks are read one after another with the compute.** Nothing overlaps, so each disk block adds its full
-  read time to every step. This is slow on a SATA SSD
+  read time to every step. This is slow on a SATA SSD: with 9 blocks (3.2 GB) on disk, a step took 17.2 s instead of
+  10.9 s, which is about the time to read 3.2 GB at 500 MB/s
 * **Tested on one setup so far:** a 12B diffusion model (fp8 with scales) on Windows with an RTX 3060 (12 GB) and
   16 GB of RAM. Other models, GPUs and operating systems are not covered yet
 
 ## Next steps
 
-* planner: replace the fixed 3 GB RAM reserve with one that scales with the machine
-* planner: fill the GPU from a measured activation size instead of a fixed headroom
+* planner: measure the activation size automatically (and remember it per model and input size) instead of
+  asking you to run `measure_activation_vram` once
 * planner: take memory held by other loaded models into account, or at least warn about it
 * prefetching, step 2: a small pool of pinned staging buffers (and a background thread) so the copy from RAM to the
   GPU is truly asynchronous
