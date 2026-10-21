@@ -66,6 +66,46 @@ class _Entry:
         self.staged = None
 
 
+_ALIGN = 256
+
+def _aligned(n: int) -> int:
+    """Round a byte count up so every tensor in a pinned buffer starts at a properly asigned offset."""
+    return (n + _ALIGN - 1) // _ALIGN * _ALIGN
+
+
+class _PinnedPool:
+    """A few page-locked (pinned) host buffers that blocks are copied through on their way to the GPU.
+
+    Only these buffers are pinned, not the whole RAM tier. A buffer is reused only after the GPU copy that
+    read from it has finished."""
+
+    def __init__(self, count: int = 2) -> None:
+        self.buffers = [None] * count #uint8 tensors, grown when a bigger block shows up
+        self.events  = [None] * count  #the GPU copy that last read from each buffer
+        self.cursor  = 0
+
+    def acquire(self, nbytes: int):
+        """(index, buffer) with room for nbytes, or None if pinned memory could not be allocated."""
+        i = self.cursor
+        self.cursor = (i + 1) % len(self.buffers)
+        if self.events[i] is not None:
+            self.events[i].synchronize()
+            self.events[i] = None
+        buf = self.buffers[i]
+        if buf is None or buf.numel() < nbytes:
+            try:
+                buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+            except RuntimeError: # pinning failed (not enough memory, or no CUDA)
+                return None
+            self.buffers[i] = buf
+        return i, buf
+
+
+    def release(self, i: int, event) -> None:
+        """Remember which GPU copy still reads from buffer i"""
+        self.events[i] = event
+
+
 class _Prefetcher:
     """Copies the next block's compact tensors to the device on a second CUDA stream"""
 
@@ -74,6 +114,7 @@ class _Prefetcher:
         self.stream  = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.last    = None
         self.pending = None
+        self.pool    = _PinnedPool() if self.stream is not None else None
 
     def learn(self, entry) -> None:
         if self.last is not None:
@@ -86,16 +127,36 @@ class _Prefetcher:
         if self.pending is not None:
             self.pending.staged = None
 
-        tensors = {}
+        sources = []
+
+        for name, _owner, _leaf, _is_param, orig in entry.slots:
+            sources.append((name, 0, orig))
+            scale = entry.scales.get(name)
+            if scale is not None:
+                sources.append((name, 1, scale))
+
+        total = sum(_aligned(t.numel() * t.element_size()) for _n, _k, t in sources if t.device.type == "cpu")
+        got = self.pool.acquire(total) if total else None
+
+        staged = {}
         with torch.cuda.stream(self.stream):
-            for name, _owner, _leaf, _is_param, orig in entry.slots:
-                scale = entry.scales.get(name)
-                tensors[name] = (
-                    orig.to(self.device, non_blocking=True),
-                    scale.to(self.device, non_blocking=True) if scale is not None else None,
-                )
+            offset = 0
+            for name, kind, t  in sources:
+                if t.device.type != "cpu" or got is None:
+                    staged[(name, kind)] = t.to(self.device, non_blocking=True)
+                else:
+                    n = t.numel() * t.element_size()
+                    view = got[1][offset:offset + n].view(t.dtype).reshape(t.shape)
+                    view.copy_(t)
+                    offset += _aligned(n)
+                    staged[(name, kind)] = view.to(self.device, non_blocking=True)
+            
             event = torch.cuda.Event()
             event.record(self.stream)
+        if got is not None:
+            self.pool.release(got[0], event)
+
+        tensors = {name: (staged[(name, 0)], staged.get((name, 1))) for name, *_ in entry.slots}
         entry.staged = (tensors, event)
         self.pending = entry
 
