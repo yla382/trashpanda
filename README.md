@@ -151,17 +151,56 @@ as norms are left alone).
 * **Tested on one setup so far:** a 12B diffusion model (fp8 with scales) on Windows with an RTX 3060 (12 GB) and
   16 GB of RAM. Other models, GPUs and operating systems are not covered yet
 
-## Next steps
+## Roadmap
 
-* planner: measure the activation size automatically (and remember it per model and input size) instead of
-  asking you to run `measure_activation_vram` once
-* planner: take memory held by other loaded models into account, or at least warn about it
-* prefetching, step 2: a small pool of pinned staging buffers (and a background thread) so the copy from RAM to the
+Roughly in the order they are planned. Nothing here is promised or scheduled.
+
+**Speed**
+* prefetching, step 2: a small pool of pinned staging buffers and a background thread, so the copy from RAM to the
   GPU is truly asynchronous
 * prefetching, step 3: read disk blocks ahead of time into the pinned buffers, with a look-ahead of more than one
   block for slow drives
+* a per-tier timer (copy, wait and compute time) behind a debug flag, to see where each step's time goes
+* cheaper expansion: reuse preallocated buffers and fuse the fp8 to bf16 conversion and scaling, instead of
+  creating new tensors for every weight on every pass
 * a cost model that chooses between GPU, RAM and disk from measured disk and PCIe speed
+
+**Planner**
+* measure the activation size automatically (and remember it per model and input size) instead of asking you to run
+  `measure_activation_vram` once
+* take memory held by other loaded models into account, or at least warn about it
+* plan a pipeline in stages (encode, denoise, decode) so memory used by an earlier stage can be released
+* warn when a plan fills almost all of the GPU, since the overflow is silent and slow
+* a KV-cache budget for language models, from the context length you intend to use
+
+**Formats**
+* 4-bit and 8-bit storage (for example NF4 with `bitsandbytes`, or our own implementation), to fit more of the
+  model in RAM and on the GPU and halve the traffic
+* fp8 checkpoints with block-wise scales (the `weight_scale_inv` layout used on the Hugging Face Hub)
+* GGUF models, possibly through `llama-cpp-python` as a separate backend
+
+**Compatibility**
+* `from_pretrained`-style helper for `transformers` models: build on the meta device with real buffers, find the
+  weight files (Hub or local), translate old checkpoint names, plan, load and install the hooks in one call
+* ignore buffers that are not in the checkpoint (rotary tables, position ids) instead of failing
+* make `model.dtype`, `model.device` and `model.to(...)` behave on offloaded models, so `generate()` and
+  `pipeline()` work
+* `diffusers` pipelines: build the large components with `stream_load` and hand them to the pipeline class, so
+  `from_pretrained` does not load everything into RAM first
+* LoRA and other adapters on offloaded blocks
+* compare speed and memory against the offloading built into `diffusers` and `accelerate`
+
+**Larger ideas**
+* compute the RAM tier on the CPU instead of copying it, as llama.cpp does, for token-by-token generation
+* batching for language models, so one weight copy serves many sequences
+* multi-GPU support
+
+**Reliability and project**
 * `release()` / `stage()` helpers for cleaning up between models
+* tests on tiny `transformers` and `diffusers` models on the CPU, in CI
+* tests on more models, GPUs and operating systems (Linux in particular), with benchmarks published here
+* a documentation site (GitHub Pages) with guides and an API reference
+* a final project name, and a contributor agreement before outside code is accepted
 
 ## Development
 
