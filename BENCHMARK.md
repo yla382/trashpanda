@@ -17,6 +17,7 @@ on the machine changes from run to run, so small differences are within the nois
 | Model | a 12B diffusion transformer, fp8 with per-tensor scales |
 | Text encoder / VAE | a 4B text encoder (fp8, streamed with trash-panda) and an image VAE |
 | Image size and steps | 1024 x 1024, 7 steps |
+| Seed | 2219653787 |
 | What is timed | the sampling progress bar only (not model loading, prompt encoding or the VAE decode) |
 
 ## Baseline
