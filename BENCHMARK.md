@@ -13,7 +13,7 @@ on the machine changes from run to run, so small differences are within the nois
 | OS | Windows 11 Home |
 | CPU | AMD Ryzen 7 3700X (8 cores) |
 | PyTorch | 2.5.1 (CUDA 12.1 build) |
-| Python / NVIDIA driver | TODO |
+| Python / NVIDIA driver | Python 3.9.6 / driver 610.88 |
 | Model | a 12B diffusion transformer, fp8 with per-tensor scales |
 | Text encoder / VAE | a 4B text encoder (fp8, streamed with trash-panda) and an image VAE |
 | Image size and steps | 1024 x 1024, 7 steps |
