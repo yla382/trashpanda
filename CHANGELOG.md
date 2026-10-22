@@ -3,6 +3,15 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.0.8] - 2026-10-21
+### Added
+- The copy into the pinned buffers now runs on a background thread, so the main thread keeps launching compute while the next block is being copied. On the same 12B model with all blocks in RAM (5.2 GB of RAM in use at the start) steps took about 9.0 s
+- `handle.remove()` now also stops the background thread and frees the pinned buffers
+
+### Changed
+- `plan()` counts the pinned buffers in the RAM budget (2 buffers, each as large as the largest block that is not on the GPU, about 0.9 GB for a 12B fp8 model) when a GPU is present, so it no longer over-commits RAM
+- Errors in the background copy are printed instead of silently falling back to the plain copy
+
 ## [0.0.7] - 2026-10-20
 ### Added
 - Blocks waiting in RAM are now copied to the GPU through a small pool of pinned (page-locked) buffers, so the transfer is truly asynchronous and overlaps with compute. On a 12B model with all blocks in RAM (RTX 3060 with 12 GB, 16 GB of RAM) steps took about 9.2 to 9.4 s instead of 10.3 to 10.9 s. If pinned memory cannot be allocated, the plain copy is used

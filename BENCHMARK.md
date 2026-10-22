@@ -22,11 +22,12 @@ on the machine changes from run to run, so small differences are within the nois
 
 ## Baseline
 
-Memory in use at the start of the run: about **5.7 GB** of the 16 GB (a clean desktop, no browser or games open).
-The encoder and VAE were loaded before the plan.
+Memory in use at the start of each run: about **5.2 to 5.7 GB** of the 16 GB (a clean desktop, no browser or games
+open). The encoder and VAE were loaded before the plan.
 
 ## Result
 
-| Library version | Plan | Time (7 steps) | Per step |
-|---|---|---|---|
-| 0.0.7 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 1:04 | 9.2 s |
+| Library version | Plan | Memory in use at start | Time (7 steps) | Per step |
+|---|---|---|---|---|
+| 0.0.7 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 5.7 GB | 1:04 | 9.2 s |
+| 0.0.8 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 5.2 GB | 1:02 | 8.95 s |

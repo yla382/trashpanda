@@ -21,6 +21,7 @@ from .hardware import Hardware, detect_hardware
 from .report import fmt_bytes
 
 _GB = 1024 ** 3
+_PINNED_BUFFERS = 2 # how many pinned staging buffers the prefetcher keeps (see hooks._PinnedPool)
 
 def _auto_ram_reserve(hw: Hardware) -> int:
     """RAM kept free for the OS and other program: 8% of the machine's RAM, between 1GB and 4GB"""
@@ -224,7 +225,7 @@ def plan(
     # -- budgets
     activation = parse_bytes(activation_vram)
     if activation is not None:
-        margin = max(int(0.05 * hw.vram_total), _GB // 2) # allocator slack and fragmentation
+        margin   = max(int(0.05 * hw.vram_total), _GB // 2) # allocator slack and fragmentation
         headroom = activation + margin
     else:
         headroom = parse_bytes(headroom_vram) or 0
@@ -272,7 +273,9 @@ def plan(
     else:
         ram_reserve = parse_bytes(min_free_ram) or 0
    
-    ram_budget = (ram_cap if ram_cap is not None else hw.ram_available) - ram_reserve
+    # the prefetcher's pinned staging buffers: page-locked RAM that cannot be paged out, only when there is a GPU
+    pinned = _PINNED_BUFFERS * max((b.stored_bytes for b in blocks[n_res:]), default=0) if hw.vram_total else 0
+    ram_budget = (ram_cap if ram_cap is not None else hw.ram_available) - ram_reserve - pinned
     ram_budget = max(ram_budget, 0)
 
     

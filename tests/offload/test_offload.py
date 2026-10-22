@@ -11,6 +11,7 @@ from trash_panda.offload import (  # noqa: E402
     quantize_fp8,
     stream_load,
 )
+from trash_panda.offload import hooks  # noqa: E402
 from trash_panda.offload.formats import expand  # noqa: E402
 
 needs_fp8 = pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="this torch has no float8")
@@ -168,3 +169,44 @@ def test_quantize_on_load_makes_big_weights_fp8(tmp_path):
     x = torch.randn(3, 128)
     out, expected = model(x), ref(x)
     assert (out - expected).abs().max() < 0.2 * expected.abs().max()   # lossy, but close
+
+
+def test_prefetcher_close_is_safe_without_cuda_and_can_repeat():
+    prefetcher = hooks._Prefetcher(torch.device("cpu"))
+    assert prefetcher.stream is None and prefetcher.worker is None and prefetcher.pool is None
+    prefetcher.close()
+    prefetcher.close()                                          # closing twice does nothing
+    assert prefetcher.stream is None and prefetcher.worker is None and prefetcher.pool is None
+
+
+def test_remove_closes_the_shared_prefetcher_once_and_last(tiny_checkpoint, monkeypatch):
+    _, path = tiny_checkpoint
+    model = meta_model()
+    stream_load(model, path, plan=Plan.manual(compute_dtype="fp32", streamed=ALL), device="cpu")
+    closed = []
+
+    def fake_close(self):
+        closed.append("forward" in model.blocks[0].__dict__)    # was the block still wrapped when close ran?
+
+    monkeypatch.setattr(hooks._Prefetcher, "close", fake_close)
+    handle = install_offload(model)
+    handle.remove()
+    assert closed == [False]                                    # closed exactly once, after the blocks were restored
+
+
+def test_offload_blocks_closes_only_a_prefetcher_it_created(tiny_checkpoint, monkeypatch):
+    _, path = tiny_checkpoint
+    closed = []
+    monkeypatch.setattr(hooks._Prefetcher, "close", lambda self: closed.append(self))
+
+    own = meta_model()
+    stream_load(own, path, offload_prefixes=["blocks."], compute_dtype="fp32", device="cpu")
+    offload_blocks(own.blocks, device="cpu", compute_dtype=torch.float32).remove()
+    assert len(closed) == 1                                     # it made its own prefetcher, so it closes it
+
+    closed.clear()
+    shared = meta_model()
+    stream_load(shared, path, offload_prefixes=["blocks."], compute_dtype="fp32", device="cpu")
+    given = hooks._Prefetcher(torch.device("cpu"))
+    offload_blocks(shared.blocks, device="cpu", compute_dtype=torch.float32, prefetcher=given).remove()
+    assert closed == []                                         # a prefetcher passed in is left to its owner

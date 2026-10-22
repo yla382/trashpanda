@@ -7,6 +7,7 @@ originals back (try/finally), so a failed forward pass cannot leave a block expa
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -15,7 +16,7 @@ import torch.nn as nn
 from .checkpoint import Checkpoint
 from .formats import SCALE_SUFFIX, expand
 from .loader import OffloadState, _navigate
-from .planner import Plan, Tier
+from .planner import Plan, Tier, _PINNED_BUFFERS
 
 
 class OffloadHandle:
@@ -111,10 +112,12 @@ class _Prefetcher:
 
     def __init__(self, device: torch.device):
         self.device  = device
+        self.index   = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
         self.stream  = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.last    = None
         self.pending = None
-        self.pool    = _PinnedPool() if self.stream is not None else None
+        self.pool    = _PinnedPool(_PINNED_BUFFERS) if self.stream is not None else None
+        self.worker  = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not  None else None
 
     def learn(self, entry) -> None:
         if self.last is not None:
@@ -126,7 +129,12 @@ class _Prefetcher:
             return
         if self.pending is not None:
             self.pending.staged = None
+        entry.staged = self.worker.submit(self._stage_job, entry)
+        self.pending = entry
 
+    def _stage_job(self, entry):
+        """Runs on the worker thread: copy the block through a pinned buffer and start the GPU copies."""
+        torch.cuda.set_device(self.index)
         sources = []
 
         for name, _owner, _leaf, _is_param, orig in entry.slots:
@@ -157,8 +165,7 @@ class _Prefetcher:
             self.pool.release(got[0], event)
 
         tensors = {name: (staged[(name, 0)], staged.get((name, 1))) for name, *_ in entry.slots}
-        entry.staged = (tensors, event)
-        self.pending = entry
+        return tensors, event
 
     def take(self, entry):
         """The staged tensors, once their copy has finished, or None if nothing was staged."""
@@ -167,8 +174,13 @@ class _Prefetcher:
             self.pending = None
         if staged is None:
             return None
-        
-        tensors, event = staged
+        try:
+            tensors, event = staged.result()  # wait until the worker has issued the copies
+        except Exception:
+            import traceback
+            traceback.print_exc()             # never hide a failure in the worker
+            return None                       # fall back to the plain copy in bring()
+
         compute = torch.cuda.current_stream(self.device)
         compute.wait_event(event)
 
@@ -177,6 +189,19 @@ class _Prefetcher:
             if scale is not None:
                 scale.record_stream(compute)
         return tensors
+
+    def close(self) -> None:
+        """Stop the woker thread and let go of the pinned buffers and anything still staged."""
+        if self.worker is not None:
+            self.worker.shutdown(wait=True)
+            self.worker = None
+        if self.stream is not None:
+            self.stream.synchronize()
+
+        self.pool    = None
+        self.stream  = None
+        self.pending = None
+        self.last    = None
         
 
 
@@ -207,7 +232,9 @@ def offload_blocks(
     `disk` (advanced) maps a block to a DiskReader when its weights live in the checkpoint file."""
     dev    = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     handle = OffloadHandle()
-    prefetcher = prefetcher or _Prefetcher(dev)
+    if prefetcher is None:
+        prefetcher = _Prefetcher(dev)
+        handle._add(prefetcher.close)
 
     for block in blocks:
         scales = {
@@ -301,6 +328,7 @@ def install_offload(
 
     handle = OffloadHandle()
     pre    = _Prefetcher(torch.device(dev or ("cuda" if torch.cuda.is_available() else "cpu")))
+    handle._add(pre.close) #registered first, so it runs last on remove()
     for b in plan.blocks:
         block = model.get_submodule(b.prefix.rstrip("."))
         reader_factory = None

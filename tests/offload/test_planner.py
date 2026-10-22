@@ -4,7 +4,9 @@ torch = pytest.importorskip("torch")
 
 from .tiny_model import meta_model  # noqa: E402
 from trash_panda.offload.hardware import Hardware  # noqa: E402
-from trash_panda.offload.planner import Plan, Tier, _GB, _auto_ram_reserve, parse_bytes, plan  # noqa: E402
+from trash_panda.offload.planner import (  # noqa: E402
+    Plan, Tier, _GB, _PINNED_BUFFERS, _auto_ram_reserve, parse_bytes, plan,
+)
 
 
 def hw(vram_free, ram_available):
@@ -173,3 +175,24 @@ def test_bigger_activations_leave_fewer_resident_blocks(tiny_checkpoint):
     big = plan(meta_model(), path, compute_dtype="fp32", hardware=hardware, activation_vram=1000 + block, min_free_ram=0)
     assert [b.tier for b in small.blocks] == [Tier.GPU, Tier.GPU, Tier.RAM, Tier.RAM]
     assert [b.tier for b in big.blocks] == [Tier.GPU, Tier.RAM, Tier.RAM, Tier.RAM]
+
+
+def test_pinned_buffers_are_subtracted_from_the_ram_budget(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    largest = max(b.stored_bytes for b in auto(path, hw(0, 10 ** 9)).blocks)
+    hardware = machine(16 * _GB, 10 * _GB, vram_free=1)                # a GPU is present, with almost no room on it
+    p = plan_with(path, hardware, resident_blocks=0, min_free_ram=0)   # every block is off the GPU
+    assert p.ram_budget == 10 * _GB - _PINNED_BUFFERS * largest
+
+
+def test_no_pinned_buffers_without_a_gpu(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    p = plan_with(path, machine(16 * _GB, 10 * _GB, vram_free=0), min_free_ram=0)
+    assert p.ram_budget == 10 * _GB                                    # no CUDA, so no pinned pool
+
+
+def test_no_pinned_buffers_when_every_block_is_on_the_gpu(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    p = plan_with(path, machine(16 * _GB, 10 * _GB, vram_free=1), resident_blocks=4, min_free_ram=0)
+    assert all(b.tier == Tier.GPU for b in p.blocks)
+    assert p.ram_budget == 10 * _GB                                    # nothing to stage, so nothing is pinned

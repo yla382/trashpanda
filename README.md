@@ -122,8 +122,8 @@ as norms are left alone).
   the hooks, drop the weights, empty the GPU cache and report memory before and after). For now, free memory
   yourself: `handle.remove()`, `del model`, `gc.collect()`, `torch.cuda.empty_cache()`; for the strictest cleanup
   (system RAM in particular), run heavy stages in their own process
-* full overlap of copying and computing: blocks waiting in RAM are prefetched through pinned buffers, but the
-  copy into those buffers still runs on the main thread, and disk blocks are not prefetched at all
+* full overlap of copying and computing for disk blocks: blocks waiting in RAM are prefetched through pinned
+  buffers by a background thread, but disk blocks are read one after another with the compute
 * int8 / 4-bit formats (fp8 and ordinary float dtypes only)
 * LoRA/LoKr adapters, multi-GPU, model definitions
 
@@ -156,8 +156,6 @@ as norms are left alone).
 Roughly in the order they are planned. Nothing here is promised or scheduled.
 
 **Speed**
-* prefetching, step 2 (rest): move the copy into the pinned buffers to a background thread, and count the pinned
-  buffers (about 1 GB) in the planner's RAM budget
 * prefetching, step 3: read disk blocks ahead of time into the pinned buffers, with a look-ahead of more than one
   block for slow drives
 * a per-tier timer (copy, wait and compute time) behind a debug flag, to see where each step's time goes
