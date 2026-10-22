@@ -158,6 +158,9 @@ Roughly in the order they are planned. Nothing here is promised or scheduled.
 **Speed**
 * prefetching, step 3: read disk blocks ahead of time into the pinned buffers, with a look-ahead of more than one
   block for slow drives
+* a memory-mapped disk tier as an experiment: map the checkpoint once and let the operating system keep recently
+  used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit
+  read-ahead, because a least-recently-used cache can thrash when the model is read in a cycle
 * a per-tier timer (copy, wait and compute time) behind a debug flag, to see where each step's time goes
 * cheaper expansion: reuse preallocated buffers and fuse the fp8 to bf16 conversion and scaling, instead of
   creating new tensors for every weight on every pass
