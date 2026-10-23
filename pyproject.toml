@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "dumpsterpanda"
-version = "0.0.9"
+version = "0.0.10"
 description = "Run models bigger than your GPU: layer-by-layer weight streaming across GPU, RAM and disk."
 authors = ["yla382"]
 readme = "README.md"

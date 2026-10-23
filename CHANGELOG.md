@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com), versions follow 
 
 ## [Unreleased]
 
+## [0.0.10] - 2026-10-22
+### Changed
+- Documentation only: the README and `BENCHMARK.md` were corrected and extended (the roadmap item on sudden exits, the description of how far ahead disk blocks are read, a result for 0.0.9). No change to the code
+
 ## [0.0.9] - 2026-10-22
 ### Added
 - Disk blocks are now read ahead of time: while one block computes, the background thread reads the next block's tensors from the checkpoint straight into a pinned buffer and starts the copy to the GPU, instead of reading them when the block is needed. The look-ahead is one block, so on a slow drive most of the read time is still not hidden; a deeper look-ahead is planned

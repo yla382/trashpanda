@@ -205,7 +205,7 @@ Roughly in the order they are planned. Nothing here is promised or scheduled.
 * multi-GPU support
 
 **Reliability and project**
-* investigate sudden exits: rarely, and only when RAM is already high (about 8 to 10 GB in use on a 16 GB machine)
+* investigate sudden exits: rarely, and only when RAM is already high (about 12 GB in use on a 16 GB machine)
   before a large model is loaded, the process ends with no Python error, usually while the weights are being
   loaded. It is probably the operating system ending the process or a crash in native code, but this has not been
   confirmed. Next time, record the exit code and run with `PYTHONFAULTHANDLER=1`, and check whether it also happens
