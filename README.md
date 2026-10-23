@@ -113,6 +113,12 @@ By default weights are kept exactly as stored in the file. Optionally, `storage_
 weights down, and `storage_dtype="fp8"` quantizes large 2-D weights to fp8 on load (lossy; small tensors such
 as norms are left alone).
 
+## Benchmarks
+
+Measurements on one machine, and a script to reproduce them with SDXL, are in [BENCHMARK.md](BENCHMARK.md) and
+[examples/](examples/). They are single runs on a Windows desktop whose free memory changes from run to run, so they
+are indicative only, and they do not show that trash-panda is faster than the other tools.
+
 ## What it does not do (yet)
 
 * coordinating memory between several models that are loaded at the same time (for example a text encoder

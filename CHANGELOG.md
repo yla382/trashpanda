@@ -3,6 +3,12 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+### Added
+- `examples/`, a folder that is not part of the package, with an SDXL benchmark as a script and as a notebook. It compares plain `diffusers`, `diffusers` model offloading, `accelerate` and trash-panda on the same prompt and seed, with each mode in its own fresh process, and reports the time, the peak VRAM and the peak RAM
+- `BENCHMARK.md`, with the test machine, a first SDXL comparison, and a section on what the numbers do not show (single runs, memory that shifts between runs, unequal VRAM between tools). The results are indicative only and do not show that trash-panda is faster than the other tools
+- A "Benchmarks" section in the README that points to them
+
 ## [0.0.8] - 2026-10-21
 ### Added
 - The copy into the pinned buffers now runs on a background thread, so the main thread keeps launching compute while the next block is being copied. On the same 12B model with all blocks in RAM (5.2 GB of RAM in use at the start) steps took about 9.0 s

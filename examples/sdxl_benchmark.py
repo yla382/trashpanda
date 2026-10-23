@@ -1,0 +1,267 @@
+"""SDXL benchmark: the same prompt and seed run with plain diffusers, diffusers offloading, accelerate and trash-panda.
+
+Every mode should run in a fresh process, so that memory left behind by one run cannot change the next one.
+`--mode all` does that for you: it starts this script once per mode and prints a table at the end.
+
+    python sdxl_benchmark.py --mode baseline
+    python sdxl_benchmark.py --mode trash-panda --unet-vram 3GB
+    python sdxl_benchmark.py --mode all --unet-vram 3GB
+    python sdxl_benchmark.py --mode clean            # shows the size of the downloaded model; add --yes to delete it
+
+This script is not part of the trash-panda package. It needs its own packages:
+
+    pip install diffusers transformers accelerate huggingface_hub psutil torch dumpsterpanda
+
+The first run downloads the fp16 weights of stabilityai/stable-diffusion-xl-base-1.0 (about 7 GB).
+"""
+
+import argparse
+import gc
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+import psutil
+import torch
+from accelerate import dispatch_model, infer_auto_device_map
+from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel
+from huggingface_hub import hf_hub_download, scan_cache_dir
+from trash_panda import find_blocks, install_offload, plan, stream_load
+
+REPO = "stabilityai/stable-diffusion-xl-base-1.0"
+PROMPT = "a weathered fisherman in a yellow raincoat on a wooden dock at sunrise, holding a lantern, photorealistic"
+MODES = ["baseline", "model-offload", "accelerate", "trash-panda"]
+LABELS = {
+    "baseline": "diffusers, everything on the GPU",
+    "model-offload": "diffusers model offloading",
+    "accelerate": "accelerate device map",
+    "trash-panda": "trash-panda",
+}
+
+
+class PeakRam:
+    """Samples this process's memory in the background and remembers the highest value (GB)."""
+
+    def __init__(self):
+        self.peak = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        proc = psutil.Process(os.getpid())
+        while not self._stop.is_set():
+            self.peak = max(self.peak, proc.memory_info().rss / 1e9)
+            time.sleep(0.05)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join()
+
+
+def generate(pipe, args, label, save=False):
+    """One timed generation. Returns a dict of results."""
+    pipe.vae.enable_tiling()          # decode the image in tiles, so the VAE needs far less memory
+    step_times = []
+
+    def on_step(_pipe, _step, _timestep, kwargs):
+        torch.cuda.synchronize()
+        step_times.append(time.perf_counter())
+        return kwargs
+
+    torch.cuda.reset_peak_memory_stats()
+    generator = torch.Generator("cuda").manual_seed(args.seed)
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    step_times.append(start)
+    with PeakRam() as ram:
+        image = pipe(PROMPT, num_inference_steps=args.steps, height=args.size, width=args.size,
+                     generator=generator, callback_on_step_end=on_step).images[0]
+    torch.cuda.synchronize()
+    total = time.perf_counter() - start
+    steps = [b - a for a, b in zip(step_times, step_times[1:])]
+    if save and args.save_dir:
+        os.makedirs(args.save_dir, exist_ok=True)
+        image.save(os.path.join(args.save_dir, f"sdxl_{label}.png"))
+    return {
+        "mode": label,
+        "total_s": round(total, 1),
+        "per_step_s": round(sum(steps) / len(steps), 2),
+        "other_s": round(total - sum(steps), 1),      # prompt encoding and the VAE decode
+        "peak_vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
+        "peak_ram_gb": round(ram.peak, 2),
+    }
+
+
+def load_pipeline(**kwargs):
+    return StableDiffusionXLPipeline.from_pretrained(
+        REPO, torch_dtype=torch.float16, variant="fp16", use_safetensors=True, **kwargs
+    )
+
+
+def vram_limit(args):
+    """The limit on the UNet's weights in bytes or as a string, or None for no limit."""
+    if args.unet_vram.lower() in ("none", "auto"):
+        return None
+    return args.unet_vram
+
+
+def run_baseline(args):
+    pipe = load_pipeline().to("cuda")
+    return pipe, None
+
+
+def run_model_offload(args):
+    pipe = load_pipeline()
+    pipe.enable_model_cpu_offload()
+    return pipe, None
+
+
+def run_accelerate(args):
+    pipe = load_pipeline()
+    pipe.vae.to("cuda")
+    pipe.text_encoder.to("cuda")
+    pipe.text_encoder_2.to("cuda")
+    limit = vram_limit(args)
+    gpu_room = limit if limit is not None else torch.cuda.mem_get_info()[0]
+    device_map = infer_auto_device_map(
+        pipe.unet,
+        max_memory={0: gpu_room, "cpu": "100GB"},     # the weights are already in RAM; this only has to be big enough
+        no_split_module_classes=getattr(pipe.unet, "_no_split_modules", None),
+    )
+    on_gpu = sum(1 for place in device_map.values() if place == 0)
+    print(f"{on_gpu} of {len(device_map)} parts of the UNet are on the GPU, the rest on the CPU")
+    pipe.unet = dispatch_model(pipe.unet, device_map=device_map, main_device="cuda")
+    return pipe, None
+
+
+def run_trash_panda(args):
+    weights = hf_hub_download(REPO, "unet/diffusion_pytorch_model.fp16.safetensors")
+    unet_config = UNet2DConditionModel.load_config(REPO, subfolder="unet")
+    with torch.device("meta"):
+        unet = UNet2DConditionModel.from_config(unet_config)
+
+    for group in find_blocks(unet):
+        print(f"{len(group.prefixes):3d} blocks, for example {group.prefixes[0]}")
+
+    limit = vram_limit(args)
+    if limit is None:
+        p = plan(unet, weights, compute_dtype="fp16")
+    else:
+        p = plan(unet, weights, compute_dtype="fp16", max_vram=limit, headroom_vram=0)
+    print(p)
+    print(stream_load(unet, weights, plan=p, device="cuda"))
+    handle = install_offload(unet)
+    unet.eval().requires_grad_(False)
+
+    pipe = load_pipeline(unet=unet)
+    pipe.vae.to("cuda")                    # not pipe.to("cuda"): that would move the UNet's weights too
+    pipe.text_encoder.to("cuda")
+    pipe.text_encoder_2.to("cuda")
+    return pipe, handle
+
+
+RUNNERS = {
+    "baseline": run_baseline,
+    "model-offload": run_model_offload,
+    "accelerate": run_accelerate,
+    "trash-panda": run_trash_panda,
+}
+
+
+def run_one(mode, args):
+    """Run one mode in this process and print its result as a line that --mode all can read."""
+    print(f"RAM in use at the start: {psutil.virtual_memory().used / 1e9:.1f} GB")
+    pipe, handle = RUNNERS[mode](args)
+    if not args.no_warmup:
+        generate(pipe, args, "warmup")     # the first run includes one-time CUDA setup, so it is not reported
+    result = generate(pipe, args, mode, save=True)
+    if handle is not None:
+        handle.remove()                    # restores the blocks, stops the copy thread and frees the pinned buffers
+    del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("RESULT " + json.dumps(result))
+
+
+def table(results, start_ram):
+    lines = [
+        "| Setup | Total (s) | Per step (s) | Encode + decode (s) | Peak VRAM (GB) | Peak RAM (GB) |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in results:
+        lines.append(
+            f"| {LABELS.get(r['mode'], r['mode'])} | {r['total_s']} | {r['per_step_s']} | {r['other_s']} | "
+            f"{r['peak_vram_gb']} | {r['peak_ram_gb']} |"
+        )
+    return "\n".join(lines)
+
+
+def run_all(args):
+    """Run every mode in its own fresh process and print a table of the results."""
+    forwarded = ["--unet-vram", args.unet_vram, "--steps", str(args.steps), "--size", str(args.size),
+                 "--seed", str(args.seed)]
+    if args.no_warmup:
+        forwarded.append("--no-warmup")
+    if args.save_dir:
+        forwarded += ["--save-dir", args.save_dir]
+    results = []
+    for mode in MODES:
+        print(f"\n=== {mode} ===  (RAM in use before it starts: {psutil.virtual_memory().used / 1e9:.1f} GB)")
+        done = subprocess.run([sys.executable, os.path.abspath(__file__), "--mode", mode, *forwarded],
+                              capture_output=True, text=True)
+        lines = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
+        if done.returncode == 0 and lines:
+            results.append(json.loads(lines[-1][len("RESULT "):]))
+            print("done")
+        else:
+            print(f"failed (exit code {done.returncode}). Last lines of its output:")
+            print("\n".join((done.stdout + done.stderr).strip().splitlines()[-15:]))
+    print("\n" + table(results, None))
+
+
+def clean(args):
+    """Show the size of the downloaded model in the Hugging Face cache, and delete it with --yes."""
+    cached = next((r for r in scan_cache_dir().repos if r.repo_id == REPO and r.repo_type == "model"), None)
+    if cached is None:
+        print("Nothing to delete: the model is not in the cache.")
+        return
+    print(f"{cached.repo_id}: {cached.size_on_disk_str} in {cached.repo_path}")
+    if args.yes:
+        shutil.rmtree(cached.repo_path)
+        print("Deleted. Other projects that use this model will download it again.")
+    else:
+        print("Nothing was deleted. Add --yes to delete it.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--mode", required=True, choices=[*MODES, "all", "clean"],
+                        help="what to run; 'all' runs every mode in its own process; 'clean' manages the download")
+    parser.add_argument("--unet-vram", default="3GB",
+                        help="limit on the UNet's weights on the GPU for accelerate and trash-panda; 'none' for no limit")
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--size", type=int, default=1024, help="width and height of the image")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--no-warmup", action="store_true", help="skip the warm-up generation")
+    parser.add_argument("--save-dir", default=None, help="save the generated images here (by default nothing is saved)")
+    parser.add_argument("--yes", action="store_true", help="with --mode clean: really delete the downloaded model")
+    args = parser.parse_args()
+
+    if args.mode == "all":
+        run_all(args)
+    elif args.mode == "clean":
+        clean(args)
+    else:
+        run_one(args.mode, args)
+
+
+if __name__ == "__main__":
+    main()
