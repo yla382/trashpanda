@@ -93,3 +93,4 @@ The encoder and VAE were loaded before the plan.
 |---|---|---|---|---|
 | 0.0.7 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 5.7 GB | 1:04 | 9.2 s |
 | 0.0.8 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 5.2 GB | 1:02 | 8.95 s |
+| 0.0.9 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 6.1 GB | 1:04 | 9.26 s |

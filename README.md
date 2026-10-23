@@ -128,8 +128,9 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   the hooks, drop the weights, empty the GPU cache and report memory before and after). For now, free memory
   yourself: `handle.remove()`, `del model`, `gc.collect()`, `torch.cuda.empty_cache()`; for the strictest cleanup
   (system RAM in particular), run heavy stages in their own process
-* full overlap of copying and computing for disk blocks: blocks waiting in RAM are prefetched through pinned
-  buffers by a background thread, but disk blocks are read one after another with the compute
+* full overlap of reading and computing for disk blocks: blocks waiting in RAM and on disk are prefetched through
+  pinned buffers by a background thread, but only one block ahead, which is not enough to hide the reads on a slow
+  drive
 * int8 / 4-bit formats (fp8 and ordinary float dtypes only)
 * LoRA/LoKr adapters, multi-GPU, model definitions
 
@@ -151,9 +152,10 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   and every step becomes several times slower, with no error. Pass a measured `activation_vram`, lower
   `resident_blocks`, or set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" in the NVIDIA Control
   Panel so it fails loudly
-* **Disk blocks are read one after another with the compute.** Nothing overlaps, so each disk block adds its full
-  read time to every step. This is slow on a SATA SSD: with 9 blocks (3.2 GB) on disk, a step took 17.2 s instead of
-  10.9 s, which is about the time to read 3.2 GB at 500 MB/s
+* **Disk blocks are only read one block ahead.** The read of the next disk block overlaps with the compute of the
+  current one, but a read takes much longer than one block's compute on a slow drive, so most of the read time is
+  still added to every step. This is slow on a SATA SSD: with 9 blocks (3.2 GB) on disk, a step took 17.2 s instead
+  of 10.9 s, which is about the time to read 3.2 GB at 500 MB/s
 * **Tested on one setup so far:** a 12B diffusion model (fp8 with scales) on Windows with an RTX 3060 (12 GB) and
   16 GB of RAM. Other models, GPUs and operating systems are not covered yet
 
@@ -162,8 +164,8 @@ are indicative only, and they do not show that trash-panda is faster than the ot
 Roughly in the order they are planned. Nothing here is promised or scheduled.
 
 **Speed**
-* prefetching, step 3: read disk blocks ahead of time into the pinned buffers, with a look-ahead of more than one
-  block for slow drives
+* prefetching, step 3b: a look-ahead of more than one block for disk blocks, so the drive reads continuously while
+  the GPU computes, with a larger pool of pinned buffers counted in the planner's RAM budget
 * a memory-mapped disk tier as an experiment: map the checkpoint once and let the operating system keep recently
   used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit
   read-ahead, because a least-recently-used cache can thrash when the model is read in a cycle
@@ -203,6 +205,11 @@ Roughly in the order they are planned. Nothing here is promised or scheduled.
 * multi-GPU support
 
 **Reliability and project**
+* investigate sudden exits: rarely, and only when RAM is already high (about 8 to 10 GB in use on a 16 GB machine)
+  before a large model is loaded, the process ends with no Python error, usually while the weights are being
+  loaded. It is probably the operating system ending the process or a crash in native code, but this has not been
+  confirmed. Next time, record the exit code and run with `PYTHONFAULTHANDLER=1`, and check whether it also happens
+  from a clean memory state
 * `release()` / `stage()` helpers for cleaning up between models
 * tests on tiny `transformers` and `diffusers` models on the CPU, in CI
 * tests on more models, GPUs and operating systems (Linux in particular), with benchmarks published here

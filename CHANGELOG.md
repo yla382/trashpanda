@@ -4,7 +4,12 @@ All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
+
+## [0.0.9] - 2026-10-22
 ### Added
+- Disk blocks are now read ahead of time: while one block computes, the background thread reads the next block's tensors from the checkpoint straight into a pinned buffer and starts the copy to the GPU, instead of reading them when the block is needed. The look-ahead is one block, so on a slow drive most of the read time is still not hidden; a deeper look-ahead is planned
+- `Checkpoint.read_into()`, which reads a tensor's bytes from the file straight into a buffer you give it, such as a slice of a pinned buffer, with no intermediate copy
+- `DiskReader.specs()`, which lists the key, dtype, shape and size of a disk block's tensors from the checkpoint's header
 - `examples/`, a folder that is not part of the package, with an SDXL benchmark as a script and as a notebook. It compares plain `diffusers`, `diffusers` model offloading, `accelerate` and trash-panda on the same prompt and seed, with each mode in its own fresh process, and reports the time, the peak VRAM and the peak RAM
 - `BENCHMARK.md`, with the test machine, a first SDXL comparison, and a section on what the numbers do not show (single runs, memory that shifts between runs, unequal VRAM between tools). The results are indicative only and do not show that trash-panda is faster than the other tools
 - A "Benchmarks" section in the README that points to them

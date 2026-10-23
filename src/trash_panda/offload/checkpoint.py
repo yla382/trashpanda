@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 import struct
+import ctypes
+import torch
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
-
-import torch
 from safetensors import safe_open
 
 _DTYPE_BYTES = {
@@ -154,6 +154,24 @@ class Checkpoint:
             return handle.get_tensor(key)
         with open(info.file, "rb") as fh:
             return self._read_one(fh, info)
+
+    def read_into(self, key: str, out: torch.Tensor) -> None:
+        """Read a tensor's raw bytes straight from the file into `out`, with no intermediate copy.
+        `out` must be a contiguous uint8 CPU tensor of exactly the tensor's size in bytes,
+        for example a slice of a pinned buffer. The result is the tensor's bytes, so view it as the tensor's dtype afterwards."""
+
+        info = self._index[key]
+        size = info.end - info.start
+        if out.dtype != torch.uint8 or out.device.type != "cpu" or not out.is_contiguous() or out.numel() != size:
+            raise ValueError(f"read_into({key!r}) needs a contiguos uint8 CPU tensor of {size} bytes")
+
+        if size == 0:
+            return
+        target = (ctypes.c_char * size).from_address(out.data_ptr())
+        with open(info.file, "rb") as fh:
+            fh.seek(info.start)
+            if fh.readinto(target) != size:
+                raise OSError(f"unexpected end of file while reading {key!r}")
 
     def read(self, keys: Iterable[str]) -> Dict[str, torch.Tensor]:
         """Read several tensors, opening each file once."""

@@ -55,6 +55,15 @@ class DiskReader:
             for name, (key, skey) in self.entries.items()
         }
 
+    def specs(self):
+        """(name, kind, TensorInfo) for every tensor of the block, read from the checkpoint's header only. kind 0 is the weight, kind 1 is its scale."""
+        out = []
+        for name, (key, skey) in self.entries.items():
+            out.append((name, 0, self.checkpoint.info(key)))
+            if skey:
+                out.append((name, 1, self.checkpoint.info(skey)))
+        return out
+
 
 class _Entry:
     """One wrapped block: what it holds, which block ran after it, and its prefetched tensors."""
@@ -125,7 +134,7 @@ class _Prefetcher:
         self.last = entry
 
     def stage(self, entry) -> None:
-        if self.stream is None or entry is None or entry.reader is not None or entry.staged is not None:
+        if self.stream is None or entry is None or entry.staged is not None:
             return
         if self.pending is not None:
             self.pending.staged = None
@@ -135,6 +144,8 @@ class _Prefetcher:
     def _stage_job(self, entry):
         """Runs on the worker thread: copy the block through a pinned buffer and start the GPU copies."""
         torch.cuda.set_device(self.index)
+        if entry.reader is not None:
+            return self._stage_disk_job(entry)
         sources = []
 
         for name, _owner, _leaf, _is_param, orig in entry.slots:
@@ -165,6 +176,32 @@ class _Prefetcher:
             self.pool.release(got[0], event)
 
         tensors = {name: (staged[(name, 0)], staged.get((name, 1))) for name, *_ in entry.slots}
+        return tensors, event
+
+    def _stage_disk_job(self, entry):
+        """Runs on teh worker thread: read a disk block straight into a pinned buffer and start the GPU copies."""
+        specs = entry.reader.specs()
+        total = sum(_aligned(info.nbytes) for _name, _kind, info in specs)
+        got   = self.pool.acquire(total)
+
+        staged = {}
+        with torch.cuda.stream(self.stream):
+            offset = 0
+            for name, kind, info in specs:
+                if got is None:
+                    part = torch.empty(info.nbytes, dtype=torch.uint8)
+                else:
+                    part = got[1][offset:offset + info.nbytes]
+                    offset += _aligned(info.nbytes)
+                entry.reader.checkpoint.read_into(info.key, part)
+                tensor = part.view(info.torch_dtype).reshape(info.shape)
+                staged[(name, kind)] = tensor.to(self.device, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self.stream)
+        if got is not None:
+            self.pool.release(got[0], event)
+
+        tensors = {name: (staged[(name, 0)], staged.get((name, 1))) for name in entry.reader.entries}
         return tensors, event
 
     def take(self, entry):
@@ -257,13 +294,13 @@ def offload_blocks(
         entry  = _Entry(slots, scales, reader)
 
         def bring(entry=entry):
-            data   = entry.reader.read() if entry.reader is not None else None
-            staged = None
-            if data is None:
+            staged = prefetcher.take(entry)
+            if staged is None:
+                prefetcher.stage(entry)
                 staged = prefetcher.take(entry)
-                if staged is None:
-                    prefetcher.stage(entry)
-                    staged = prefetcher.take(entry)
+            data = None
+            if staged is None and entry.reader is not None:
+                data = entry.reader.read()
             for name, owner, leaf, is_param, orig in entry.slots:
                 if data is not None:
                     raw, scale = data[name]
