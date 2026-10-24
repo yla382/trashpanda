@@ -174,12 +174,21 @@ are indicative only, and they do not show that trash-panda is faster than the ot
 Roughly in the order they are planned. Nothing here is promised or scheduled.
 
 **Speed**
-* next tests, from the prefetch profile (`TRASH_PANDA_PROFILE=1`): (1) show the wait for each pass separately, to
-  check whether the long stalls are all in the first pass, when the RAM tier is read from the file for the first
-  time. If so, read those pages into memory once when the hooks are installed; (2) time how long the worker waits
+* next tests, from the prefetch profile (`TRASH_PANDA_PROFILE=1`): (1) time every step and show the wait for each
+  pass separately. In the profile of an all-RAM plan, 21 of the 140 streamed blocks were late by about 1 s each, which
+  is roughly the time to read one block from the drive, and each of the slowest was late in only 1 of 7 passes. That
+  suggests nearly all the waiting is in the first pass, when the file-backed RAM tier is read from disk on first use.
+  If so, steady steps may be much faster than the average the progress bar shows (about 6 s against 9.3 s), and the
+  first step much slower. This is an inference, not a measurement. If it holds, read those pages into memory once
+  when the hooks are installed; (2) time how long the worker waits
   for a free pinned buffer, to find the roughly 3.7 s per step of a disk-heavy plan in which the worker is idle;
   (3) make the number of pinned buffers an option and try 3 or 4; (4) hand the prefetcher the block order up front,
   so a model that runs one pass (a text encoder) is prefetched from its first block
+* overlap the stages of a pipeline: while the text encoder runs, load as much of the diffusion model as there is
+  spare VRAM and RAM for, then release the encoder and start sampling with what is already loaded while the rest keeps
+  loading; the same for the VAE during sampling. It needs the staged planning above, a plan that predicts the memory
+  that will be free after a stage, and blocks that can change from streamed to resident while running. Preloading
+  would also compete with the encoder for the drive when the encoder reads from disk. An idea, not a design
 * a memory-mapped disk tier as an experiment: map the checkpoint once and let the operating system keep recently
   used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit
   read-ahead, because a least-recently-used cache can thrash when the model is read in a cycle
@@ -188,11 +197,17 @@ Roughly in the order they are planned. Nothing here is promised or scheduled.
 * a cost model that chooses between GPU, RAM and disk from measured disk and PCIe speed
 
 **Planner**
-* measure the activation size automatically (and remember it per model and input size) instead of asking you to run
-  `measure_activation_vram` once
-* take memory held by other loaded models into account, or at least warn about it
-* plan a pipeline in stages (encode, denoise, decode) so memory used by an earlier stage can be released
+In this order, because the silent slowdowns seen so far (GPU memory spilling into shared memory at about 11.6 to
+11.8 GB, a headroom that was too thin, an overflow after sampling at 2K) all come from the planner knowing too little:
 * warn when a plan fills almost all of the GPU, since the overflow is silent and slow
+* measure the activation size automatically (and remember it per model and input size) instead of asking you to run
+  `measure_activation_vram` once, and base the default headroom on it instead of the fixed 1.5 GB guess
+* plan a pipeline in stages (encode, denoise, decode) so memory used by an earlier stage can be released. Resident
+  blocks stay on the GPU until `handle.remove()`, so they are still there while the VAE decodes. First check by
+  hand that releasing the model before the decode removes the overflow; then a smaller step such as
+  `release_gpu()` / `restore_gpu()` on the handle, which moves the resident blocks off the GPU and back while keeping
+  the hooks. The cost of putting them back for each image, and the RAM they need meanwhile, have not been measured
+* take memory held by other loaded models into account, or at least warn about it
 * a KV-cache budget for language models, from the context length you intend to use
 
 **Formats**
