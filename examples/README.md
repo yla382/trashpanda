@@ -6,7 +6,6 @@ packages it needs.
 | File | What it does |
 |---|---|
 | [sdxl_benchmark.py](sdxl_benchmark.py) | Compares ways of running SDXL on one GPU, each in its own fresh process: time per step, peak VRAM and peak RAM |
-| [sdxl_benchmark.ipynb](sdxl_benchmark.ipynb) | The same comparison as a notebook |
 
 ## SDXL benchmark
 

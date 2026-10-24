@@ -1,4 +1,5 @@
 import contextlib
+from concurrent.futures import Future
 
 import pytest
 
@@ -305,3 +306,239 @@ def test_ram_job_copies_a_blocks_tensors_through_the_buffer(tiny_checkpoint, cpu
     for name, (weight, scale) in tensors.items():
         assert scale is None
         assert torch.equal(weight, ref.state_dict()["blocks.1." + name])
+
+
+class _RecordingWorker:
+    """Stands in for the worker thread: remembers which blocks were submitted and leaves their futures pending."""
+
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, _job, entry):
+        self.submitted.append(entry)
+        return Future()
+
+
+def _queue_entry(name, on_cpu=True):
+    """An entry whose weights wait in CPU memory (needs a copy) or are 'already on the GPU' (a meta tensor here)."""
+    weight = torch.zeros(1) if on_cpu else torch.zeros(1, device="meta")
+    return hooks._Entry([(name, None, None, True, weight)], {}, None)
+
+
+def _chain(*entries):
+    for here, after in zip(entries, entries[1:]):
+        here.next = after
+    return entries
+
+
+def _queue(lookahead):
+    prefetcher = object.__new__(hooks._Prefetcher)
+    prefetcher.device, prefetcher.stream, prefetcher.lookahead = torch.device("cpu"), object(), lookahead
+    prefetcher.window, prefetcher.worker = [], _RecordingWorker()
+    return prefetcher
+
+
+def test_stage_ahead_stages_the_next_blocks_in_order():
+    a, b, c, d = _chain(*[_queue_entry(n) for n in "abcd"])
+    queue = _queue(lookahead=2)
+    queue.stage_ahead(a)
+    assert queue.worker.submitted == [b, c]
+    assert queue.window == [b, c]
+    assert d.staged is None
+
+
+def test_blocks_already_on_the_gpu_do_not_use_up_the_window():
+    a, r1, r2, b, c = _chain(_queue_entry("a"), _queue_entry("r1", False), _queue_entry("r2", False),
+                             _queue_entry("b"), _queue_entry("c"))
+    queue = _queue(lookahead=2)
+    queue.stage_ahead(a)
+    assert queue.worker.submitted == [b, c]             # the resident blocks in between are skipped
+
+
+def test_stage_ahead_does_not_stage_a_block_twice():
+    a, b, c = _chain(*[_queue_entry(n) for n in "abc"])
+    queue = _queue(lookahead=2)
+    queue.stage_ahead(a)
+    queue.stage_ahead(a)
+    assert queue.worker.submitted == [b, c]
+
+
+def test_a_changed_order_drops_the_blocks_that_are_no_longer_coming():
+    a, b, c = _chain(*[_queue_entry(n) for n in "abc"])
+    x, d = _chain(_queue_entry("x"), _queue_entry("d"))
+    queue = _queue(lookahead=2)
+    queue.stage_ahead(a)
+    stale = [b.staged, c.staged]
+    queue.stage_ahead(x)                                # the model ran in a different order than we had learned
+    assert queue.window == [d]
+    assert b.staged is None and c.staged is None
+    assert all(future.cancelled() for future in stale)  # their jobs had not started, so they were cancelled
+
+
+def test_a_ring_of_blocks_does_not_loop_forever():
+    a, b, c = _chain(*[_queue_entry(n) for n in "abc"])
+    c.next = a                                          # the order wraps around to the first block
+    queue = _queue(lookahead=5)
+    queue.stage_ahead(a)
+    assert queue.worker.submitted == [b, c]             # it stops when it comes back to the current block
+
+
+def test_lookahead_zero_stages_nothing():
+    a, b = _chain(*[_queue_entry(n) for n in "ab"])
+    queue = _queue(lookahead=0)
+    queue.stage_ahead(a)
+    assert queue.worker.submitted == [] and queue.window == []
+
+
+def test_lookahead_reaches_the_prefetcher(tiny_checkpoint, monkeypatch):
+    _, path = tiny_checkpoint
+    seen = []
+    original_init = hooks._Prefetcher.__init__
+
+    def recording_init(self, device, lookahead=2, profile=None):
+        seen.append(lookahead)
+        original_init(self, device, lookahead, profile)
+
+    monkeypatch.setattr(hooks._Prefetcher, "__init__", recording_init)
+
+    model = meta_model()
+    stream_load(model, path, plan=Plan.manual(compute_dtype="fp32", streamed=ALL), device="cpu")
+    install_offload(model).remove()                                          # the default
+    install_offload(model, lookahead=5).remove()
+    offload_blocks(model.blocks, device="cpu", compute_dtype=torch.float32, lookahead=3).remove()
+    assert seen == [2, 5, 3]
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 3])
+def test_outputs_match_the_reference_for_any_lookahead(tiny_checkpoint, lookahead):
+    ref, path = tiny_checkpoint
+    model = meta_model()
+    stream_load(model, path, plan=Plan.manual(compute_dtype="fp32", resident=ALL[:1], streamed=ALL[1:3], disk=ALL[3:]),
+                device="cpu")
+    handle = install_offload(model, lookahead=lookahead)
+    x = torch.randn(3, 16)
+    assert torch.allclose(model(x), ref(x), atol=1e-6)
+    assert torch.allclose(model(x), ref(x), atol=1e-6)                        # and again, once the order is learned
+    handle.remove()
+
+
+class _SyncEvent:
+    """A stand-in for a CUDA event that remembers whether the host waited for it."""
+
+    def __init__(self):
+        self.synchronized = False
+
+    def record(self, stream=None):
+        pass
+
+    def synchronize(self):
+        self.synchronized = True
+
+
+class _FakeStream:
+    def synchronize(self):
+        pass
+
+
+def _throttled(lookahead, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "Event", _SyncEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: object())
+    prefetcher = object.__new__(hooks._Prefetcher)
+    prefetcher.device, prefetcher.stream, prefetcher.lookahead = torch.device("cpu"), _FakeStream(), lookahead
+    prefetcher.in_flight = hooks.deque()
+    return prefetcher
+
+
+def test_the_gpu_is_not_allowed_to_fall_more_than_two_blocks_behind(monkeypatch):
+    prefetcher = _throttled(2, monkeypatch)
+    events = []
+    for _ in range(4):
+        prefetcher.wait_for_room()                       # what runs before each block starts
+        prefetcher.block_done()                          # and after it
+        events.append(prefetcher.in_flight[-1])
+        assert len(prefetcher.in_flight) <= 2            # never more than two blocks in flight
+    assert [e.synchronized for e in events] == [True, True, False, False]   # the oldest ones were waited for
+
+
+def test_waiting_for_room_does_nothing_when_prefetching_is_off(monkeypatch):
+    prefetcher = _throttled(0, monkeypatch)
+    for _ in range(5):
+        prefetcher.wait_for_room()
+        prefetcher.block_done()
+    assert len(prefetcher.in_flight) == 0                # nothing recorded, nothing waited for
+
+
+def test_close_forgets_the_blocks_in_flight(monkeypatch):
+    prefetcher = _throttled(2, monkeypatch)
+    prefetcher.block_done()
+    prefetcher.worker, prefetcher.pool, prefetcher.window, prefetcher.last = None, None, [], None
+    prefetcher.close()
+    assert len(prefetcher.in_flight) == 0
+
+
+def test_install_offload_follows_the_plans_lookahead_unless_told_otherwise(tiny_checkpoint, monkeypatch):
+    _, path = tiny_checkpoint
+    seen = []
+    original_init = hooks._Prefetcher.__init__
+
+    def recording_init(self, device, lookahead=2, profile=None):
+        seen.append(lookahead)
+        original_init(self, device, lookahead, profile)
+
+    monkeypatch.setattr(hooks._Prefetcher, "__init__", recording_init)
+    p = Plan.manual(compute_dtype="fp32", streamed=ALL)
+    p.lookahead = 4
+    model = meta_model()
+    stream_load(model, path, plan=p, device="cpu")
+    install_offload(model).remove()                       # follows the plan
+    install_offload(model, lookahead=1).remove()          # an explicit value wins
+    assert seen == [4, 1]
+
+
+def test_profiling_is_off_unless_asked_for(monkeypatch):
+    monkeypatch.delenv("TRASH_PANDA_PROFILE", raising=False)
+    assert hooks._Prefetcher(torch.device("cpu")).profile is False
+    monkeypatch.setenv("TRASH_PANDA_PROFILE", "1")
+    assert hooks._Prefetcher(torch.device("cpu")).profile is True
+    assert hooks._Prefetcher(torch.device("cpu"), profile=False).profile is False
+
+
+def test_learn_counts_a_pass_each_time_the_first_block_comes_round():
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    a, b = _chain(*[_queue_entry(n) for n in "ab"])
+    for entry in (a, b, a, b, a):
+        prefetcher.learn(entry)
+    assert prefetcher.stats["passes"] == 3
+
+
+def test_report_summarises_the_stats_once():
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    prefetcher.stats.update(passes=2, disk_read_s=4.0, disk_read_gb=2.0, disk_blocks=10,
+                            wait_staged_s=1.0, takes=8, takes_ready=6, wait_gpu_s=0.5)
+    text = prefetcher.report()
+    assert "disk reads: 1.00 GB in 2.00 s (500 MB/s), 5 blocks" in text
+    assert "6 of 8 were ready at once" in text
+    assert "waited for the GPU to catch up: 0.25 s" in text
+    assert prefetcher.report() == ""                      # printed once only
+
+
+def test_report_says_nothing_when_profiling_is_off():
+    assert hooks._Prefetcher(torch.device("cpu"), profile=False).report() == ""
+
+
+def test_learn_gives_each_block_a_position_in_the_pass():
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    a, b, c = _chain(*[_queue_entry(n) for n in "abc"])
+    for entry in (a, b, c, a, b, c):
+        prefetcher.learn(entry)
+    assert [prefetcher.where[id(e)] for e in (a, b, c)] == [0, 1, 2]
+
+
+def test_report_lists_the_slowest_waits_by_block_position():
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    prefetcher.stats.update(passes=2, takes=4, takes_ready=2, wait_staged_s=3.0)
+    prefetcher.block_wait.update({0: 2.0, 7: 0.5, 3: 0.5})
+    prefetcher.block_late.update({0: 2, 7: 1, 3: 0})
+    text = prefetcher.report()
+    assert "block 0: 1.00 s, late in 2 of 2" in text
+    assert text.index("block 0") < text.index("block 7")

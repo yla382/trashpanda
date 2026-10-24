@@ -129,8 +129,8 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   yourself: `handle.remove()`, `del model`, `gc.collect()`, `torch.cuda.empty_cache()`; for the strictest cleanup
   (system RAM in particular), run heavy stages in their own process
 * full overlap of reading and computing for disk blocks: blocks waiting in RAM and on disk are prefetched through
-  pinned buffers by a background thread, but only one block ahead, which is not enough to hide the reads on a slow
-  drive
+  pinned buffers by a background thread, two blocks ahead by default, but the drive's speed sets a floor that no
+  amount of prefetching removes (see "Known issues")
 * int8 / 4-bit formats (fp8 and ordinary float dtypes only)
 * LoRA/LoKr adapters, multi-GPU, model definitions
 
@@ -152,10 +152,15 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   and every step becomes several times slower, with no error. Pass a measured `activation_vram`, lower
   `resident_blocks`, or set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" in the NVIDIA Control
   Panel so it fails loudly
-* **Disk blocks are only read one block ahead.** The read of the next disk block overlaps with the compute of the
-  current one, but a read takes much longer than one block's compute on a slow drive, so most of the read time is
-  still added to every step. This is slow on a SATA SSD: with 9 blocks (3.2 GB) on disk, a step took 17.2 s instead
-  of 10.9 s, which is about the time to read 3.2 GB at 500 MB/s
+* **Disk blocks are limited by the speed of the drive.** Blocks on disk are read ahead of time (two blocks ahead by
+  default, `lookahead=`), which hid about a third of the read time in our tests, but a read takes much longer than
+  one block's compute on a slow drive. On the test machine's SATA SSD (about 400 MB/s measured, with 1, 2, 4 or 8
+  reader threads alike) a plan with 11 blocks (4.1 GB) on disk took about 16 s per step, against about 9.3 s with
+  every streamed block in RAM. A deeper look-ahead (4) was no better and uses more VRAM. These are single runs
+* **The first use of a RAM-tier block may be slow.** The RAM tier is mapped from the checkpoint file, so Windows may
+  read a block from disk the first time it is used. In one profiled run a few blocks made the main thread wait
+  1 to 3 s each, and a text encoder that runs once copied its blocks at about disk speed. The cause is not
+  confirmed yet (see the roadmap)
 * **Tested on one setup so far:** a 12B diffusion model (fp8 with scales) on Windows with an RTX 3060 (12 GB) and
   16 GB of RAM. Other models, GPUs and operating systems are not covered yet
 
@@ -164,12 +169,15 @@ are indicative only, and they do not show that trash-panda is faster than the ot
 Roughly in the order they are planned. Nothing here is promised or scheduled.
 
 **Speed**
-* prefetching, step 3b: a look-ahead of more than one block for disk blocks, so the drive reads continuously while
-  the GPU computes, with a larger pool of pinned buffers counted in the planner's RAM budget
+* next tests, from the prefetch profile (`TRASH_PANDA_PROFILE=1`): (1) show the wait for each pass separately, to
+  check whether the long stalls are all in the first pass, when the RAM tier is read from the file for the first
+  time. If so, read those pages into memory once when the hooks are installed; (2) time how long the worker waits
+  for a free pinned buffer, to find the roughly 3.7 s per step of a disk-heavy plan in which the worker is idle;
+  (3) make the number of pinned buffers an option and try 3 or 4; (4) hand the prefetcher the block order up front,
+  so a model that runs one pass (a text encoder) is prefetched from its first block
 * a memory-mapped disk tier as an experiment: map the checkpoint once and let the operating system keep recently
   used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit
   read-ahead, because a least-recently-used cache can thrash when the model is read in a cycle
-* a per-tier timer (copy, wait and compute time) behind a debug flag, to see where each step's time goes
 * cheaper expansion: reuse preallocated buffers and fuse the fp8 to bf16 conversion and scaling, instead of
   creating new tensors for every weight on every pass
 * a cost model that chooses between GPU, RAM and disk from measured disk and PCIe speed
@@ -210,6 +218,11 @@ Roughly in the order they are planned. Nothing here is promised or scheduled.
   loaded. It is probably the operating system ending the process or a crash in native code, but this has not been
   confirmed. Next time, record the exit code and run with `PYTHONFAULTHANDLER=1`, and check whether it also happens
   from a clean memory state
+* find out where a sudden exit goes wrong: when a run ends without a Python error, check the exit code right
+  afterwards (`$LASTEXITCODE` in PowerShell) and run with `PYTHONFAULTHANDLER=1`. A large negative code such as
+  `-1073741819` is a crash in native code, while a normal code points to the process being ended by the system. Also
+  print the memory in use and the available commit (RAM plus page file) before loading, so a failed run shows what
+  the machine had left
 * `release()` / `stage()` helpers for cleaning up between models
 * tests on tiny `transformers` and `diffusers` models on the CPU, in CI
 * tests on more models, GPUs and operating systems (Linux in particular), with benchmarks published here

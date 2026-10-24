@@ -7,6 +7,10 @@ originals back (try/finally), so a failed forward pass cannot leave a block expa
 
 from __future__ import annotations
 
+import atexit
+import os
+import time
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -75,6 +79,10 @@ class _Entry:
         self.next   = None
         self.staged = None
 
+    def needs_copy(self) -> bool:
+        """True if the block's weights are on disk or in CPU memory, so they must be copied to the GPU."""
+        return self.reader is not None or any(slot[4].device.type == "cpu" for slot in self.slots)
+
 
 _ALIGN = 256
 
@@ -119,27 +127,84 @@ class _PinnedPool:
 class _Prefetcher:
     """Copies the next block's compact tensors to the device on a second CUDA stream"""
 
-    def __init__(self, device: torch.device):
-        self.device  = device
-        self.index   = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
-        self.stream  = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-        self.last    = None
-        self.pending = None
-        self.pool    = _PinnedPool(_PINNED_BUFFERS) if self.stream is not None else None
-        self.worker  = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not  None else None
+    profile = False
+
+    def __init__(self, device: torch.device, lookahead: int = 2, profile: Optional[bool] = None):
+        self.device    = device
+        self.lookahead = lookahead
+        self.index     = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
+        self.stream    = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self.last      = None
+        self.window    = []
+        self.in_flight = deque()
+        self.pool      = _PinnedPool(_PINNED_BUFFERS) if self.stream is not None else None
+        self.worker    = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not None else None
+        # profiling: where does the time go? Off by default; on with profile=True or TRASH_PANDA_PROFILE=1
+        self.profile   = (os.environ.get("TRASH_PANDA_PROFILE") == "1") if profile is None else bool(profile)
+        self.stats     = defaultdict(float)
+        self.first     = None
+        self.where     = {}                        # id(entry) -> its position in the pass, in the order first seen
+        self.block_wait = defaultdict(float)       # position -> seconds the main thread waited for that block
+        self.block_late = defaultdict(int)         # position -> times it was not ready when asked for
+        self._reported = False
+        if self.profile:
+            atexit.register(self.report)
 
     def learn(self, entry) -> None:
+        if self.profile:
+            if self.first is None:
+                self.first = entry
+            if entry is self.first:
+                self.stats["passes"] += 1               # the first block starts a new pass through the model
+            self.where.setdefault(id(entry), len(self.where))
         if self.last is not None:
             self.last.next = entry
         self.last = entry
 
     def stage(self, entry) -> None:
-        if self.stream is None or entry is None or entry.staged is not None:
+        if self.stream is None or entry is  None or entry.staged is not None:
             return
-        if self.pending is not None:
-            self.pending.staged = None
         entry.staged = self.worker.submit(self._stage_job, entry)
-        self.pending = entry
+
+    def stage_ahead(self, entry) -> None:
+        """Stage the next `lookahead` blocks that need a copy, following the order learned so far."""
+        if self.stream is None or self.lookahead <= 0:
+            return
+        wanted , seen, nxt = [], {id(entry)}, entry.next
+        while nxt is not None and id(nxt) not in seen and len(wanted) < self.lookahead:
+            seen.add(id(nxt))
+            if nxt.needs_copy():
+                wanted.append(nxt)
+            nxt = nxt.next
+        for old in self.window:
+            if old not in wanted:
+                self._drop(old)
+        for item in wanted:
+            self.stage(item)
+        self.window = wanted
+
+    def _drop(self, entry) -> None:
+        future, entry.staged = entry.staged, None
+        if future is not None:
+            future.cancel()
+
+    def wait_for_room(self, limit: int = 2) -> None:
+        """Let the GPU catch up, so that at most `limit - 1` earlier blocks are still running."""
+        if self.stream is None or self.lookahead <= 0:
+            return
+        started = time.perf_counter() if self.profile else 0.0
+        while len(self.in_flight) >= limit:
+            self.in_flight.popleft().synchronize()
+        if self.profile:
+            self.stats["wait_gpu_s"] += time.perf_counter() - started
+
+    def block_done(self) -> None:
+        """Mark the end of a block's work on the ocmpute stream."""
+        if self.stream is None or self.lookahead <= 0:
+            return
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.device))
+        self.in_flight.append(event)
 
     def _stage_job(self, entry):
         """Runs on the worker thread: copy the block through a pinned buffer and start the GPU copies."""
@@ -166,7 +231,11 @@ class _Prefetcher:
                 else:
                     n = t.numel() * t.element_size()
                     view = got[1][offset:offset + n].view(t.dtype).reshape(t.shape)
+                    started = time.perf_counter() if self.profile else 0.0
                     view.copy_(t)
+                    if self.profile:
+                        self.stats["ram_copy_s"] += time.perf_counter() - started
+                        self.stats["ram_copy_gb"] += n / 1e9
                     offset += _aligned(n)
                     staged[(name, kind)] = view.to(self.device, non_blocking=True)
             
@@ -181,6 +250,8 @@ class _Prefetcher:
     def _stage_disk_job(self, entry):
         """Runs on teh worker thread: read a disk block straight into a pinned buffer and start the GPU copies."""
         specs = entry.reader.specs()
+        if self.profile:
+            self.stats["disk_blocks"] += 1
         total = sum(_aligned(info.nbytes) for _name, _kind, info in specs)
         got   = self.pool.acquire(total)
 
@@ -193,7 +264,11 @@ class _Prefetcher:
                 else:
                     part = got[1][offset:offset + info.nbytes]
                     offset += _aligned(info.nbytes)
+                started = time.perf_counter() if self.profile else 0.0
                 entry.reader.checkpoint.read_into(info.key, part)
+                if self.profile:
+                    self.stats["disk_read_s"] += time.perf_counter() - started
+                    self.stats["disk_read_gb"] += info.nbytes / 1e9
                 tensor = part.view(info.torch_dtype).reshape(info.shape)
                 staged[(name, kind)] = tensor.to(self.device, non_blocking=True)
             event = torch.cuda.Event()
@@ -207,16 +282,27 @@ class _Prefetcher:
     def take(self, entry):
         """The staged tensors, once their copy has finished, or None if nothing was staged."""
         staged, entry.staged = entry.staged, None
-        if self.pending is entry:
-            self.pending = None
+        if entry in self.window:
+            self.window.remove(entry)
         if staged is None:
             return None
+        ready = staged.done()
+        started = time.perf_counter() if self.profile else 0.0
         try:
             tensors, event = staged.result()  # wait until the worker has issued the copies
         except Exception:
             import traceback
             traceback.print_exc()             # never hide a failure in the worker
             return None                       # fall back to the plain copy in bring()
+        if self.profile:
+            waited = time.perf_counter() - started
+            self.stats["wait_staged_s"] += waited
+            position = self.where.get(id(entry))
+            if position is not None:
+                self.block_wait[position] += waited
+                self.block_late[position] += 0 if ready else 1
+            self.stats["takes"] += 1
+            self.stats["takes_ready"] += 1 if ready else 0
 
         compute = torch.cuda.current_stream(self.device)
         compute.wait_event(event)
@@ -227,18 +313,53 @@ class _Prefetcher:
                 scale.record_stream(compute)
         return tensors
 
+    def report(self) -> str:
+        """A short summary of where the prefetching spent its time. Printed at exit when profiling is on."""
+        if not self.profile or self._reported or not self.stats:
+            return ""
+        s = self.stats
+        self._reported = True
+        passes = max(int(s["passes"]), 1)
+        lines = [f"trash-panda prefetch profile ({passes} passes through the blocks, figures are per pass)"]
+        if s["disk_read_s"]:
+            lines.append(
+                f"  worker, disk reads: {s['disk_read_gb'] / passes:.2f} GB in {s['disk_read_s'] / passes:.2f} s "
+                f"({s['disk_read_gb'] * 1000 / s['disk_read_s']:.0f} MB/s), {int(s['disk_blocks'] / passes)} blocks"
+            )
+        if s["ram_copy_s"]:
+            lines.append(
+                f"  worker, RAM copies into the pinned buffers: {s['ram_copy_gb'] / passes:.2f} GB in "
+                f"{s['ram_copy_s'] / passes:.2f} s ({s['ram_copy_gb'] / s['ram_copy_s']:.1f} GB/s)"
+            )
+        if s["takes"]:
+            lines.append(
+                f"  main thread waited for staged blocks: {s['wait_staged_s'] / passes:.2f} s "
+                f"({int(s['takes_ready'])} of {int(s['takes'])} were ready at once)"
+            )
+        slowest = sorted(self.block_wait, key=self.block_wait.get, reverse=True)[:5]
+        if slowest:
+            lines.append("  slowest waits (block position in the pass, seconds per pass, passes it was late):")
+            for position in slowest:
+                lines.append(f"    block {position}: {self.block_wait[position] / passes:.2f} s, late in {self.block_late[position]} of {passes}")
+        lines.append(f"  main thread waited for the GPU to catch up: {s['wait_gpu_s'] / passes:.2f} s")
+        text = "\n".join(lines)
+        print(text)
+        return text
+
     def close(self) -> None:
-        """Stop the woker thread and let go of the pinned buffers and anything still staged."""
+        """Stop the worker thread and let go of the pinned buffers and anything still staged."""
+        self.report()
         if self.worker is not None:
             self.worker.shutdown(wait=True)
             self.worker = None
         if self.stream is not None:
             self.stream.synchronize()
 
-        self.pool    = None
-        self.stream  = None
-        self.pending = None
-        self.last    = None
+        self.pool   = None
+        self.stream = None
+        self.last   = None
+        self.window = []
+        self.in_flight.clear()
         
 
 
@@ -261,16 +382,19 @@ def offload_blocks(
     device: Union[str, torch.device, None] = None,
     compute_dtype: torch.dtype = torch.bfloat16,
     disk: Optional[Callable[[nn.Module], Optional[DiskReader]]] = None,
-    prefetcher: Optional["_Prefetcher"] = None
+    prefetcher: Optional["_Prefetcher"] = None,
+    lookahead: int = 2,
+    profile: Optional[bool] = None,
 ) -> OffloadHandle:
     """Low-level: wrap each block so its weights are expanded on `device` only while it runs.
 
     Blocks whose weights are already on the device in the compute dtype are left untouched.
-    `disk` (advanced) maps a block to a DiskReader when its weights live in the checkpoint file."""
+    `disk` (advanced) maps a block to a DiskReader when its weights live in the checkpoint file.
+    `lookahead` is how many blocks ahead the next weights are copied (0turns prefetching off)."""
     dev    = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     handle = OffloadHandle()
     if prefetcher is None:
-        prefetcher = _Prefetcher(dev)
+        prefetcher = _Prefetcher(dev, lookahead, profile)
         handle._add(prefetcher.close)
 
     for block in blocks:
@@ -295,7 +419,7 @@ def offload_blocks(
 
         def bring(entry=entry):
             staged = prefetcher.take(entry)
-            if staged is None:
+            if staged is None and prefetcher.lookahead > 0 and entry.needs_copy():
                 prefetcher.stage(entry)
                 staged = prefetcher.take(entry)
             data = None
@@ -326,13 +450,15 @@ def offload_blocks(
 
         def wrapped(*args, _orig=original_forward, _bring=bring, _restore=restore, _entry=entry, **kwargs):
             prefetcher.learn(_entry)
+            prefetcher.wait_for_room()
             _bring()
-            prefetcher.stage(_entry.next)
+            prefetcher.stage_ahead(_entry)
 
             try:
                 return _orig(*args, **kwargs)
             finally:
                 _restore()
+                prefetcher.block_done()
 
         def undo(block=block, restore=restore, entry=entry):
             restore()
@@ -351,6 +477,8 @@ def install_offload(
     *,
     device: Union[str, torch.device, None] = None,
     compute_dtype: Optional[torch.dtype] = None,
+    lookahead: Optional[int] = None,
+    profile: Optional[bool] = None,
 ) -> OffloadHandle:
     """Install the offload hooks for every block in the plan (defaults to the plan used by stream_load)."""
     state: Optional[OffloadState] = getattr(model, "_trash_panda_state", None)
@@ -362,9 +490,10 @@ def install_offload(
         )
     dev = device or (state.device if state is not None else None)
     cdt = compute_dtype or (state.compute_dtype if state is not None else plan.compute_dtype)
+    lookahead = plan.lookahead if lookahead is None else lookahead
 
     handle = OffloadHandle()
-    pre    = _Prefetcher(torch.device(dev or ("cuda" if torch.cuda.is_available() else "cpu")))
+    pre    = _Prefetcher(torch.device(dev or ("cuda" if torch.cuda.is_available() else "cpu")), lookahead, profile)
     handle._add(pre.close) #registered first, so it runs last on remove()
     for b in plan.blocks:
         block = model.get_submodule(b.prefix.rstrip("."))

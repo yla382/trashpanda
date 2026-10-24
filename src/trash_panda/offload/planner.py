@@ -51,6 +51,8 @@ class Plan:
     storage_dtype: Optional[torch.dtype] = None
     other_bytes: int = 0                 # weights outside any block (kept expanded on the device)
     stream_buffer_bytes: int = 0         # room for one expanded streamed block (+ temporaries)
+    staging_bytes: int = 0               # room for the blocks staged on the device ahead of time
+    lookahead: int = 2                   # how many blocks ahead they are staged
     vram_budget: int = 0
     ram_budget: int = 0
     warnings: List[str] = field(default_factory=list)
@@ -127,6 +129,8 @@ class Plan:
             lines.append(f"  weights outside blocks (on the device): {fmt_bytes(self.other_bytes)}")
         if self.stream_buffer_bytes:
             lines.append(f"  room reserved for one streamed block: {fmt_bytes(self.stream_buffer_bytes)}")
+        if self.staging_bytes:
+            lines.append(f"  room reserved for blocks staged ahead (look-ahead {self.lookahead}): {fmt_bytes(self.staging_bytes)}")
         if self.vram_budget:
             lines.append(f"  VRAM budget: {fmt_bytes(self.vram_budget)}   RAM budget: {fmt_bytes(self.ram_budget)}")
         for w in self.warnings:
@@ -162,6 +166,17 @@ def parse_bytes(value: Union[None, int, float, str]) -> Optional[int]:
 def _is_scale_key(key: str, ck: Checkpoint) -> bool:
     return key.endswith("_scale") and key[: -len("_scale")] in ck
 
+def _spread_disk_blocks(rest: List[BlockPlan], ram_budget: int) -> set:
+    """Choose which of the blocks outside the GPU go to disk: as few as it takes for the others to fit in `ram_budget`, 
+    spared evenly so that each disk read has other blocks' compute next to it to hide behind."""
+    total = sum(b.stored_bytes for b in rest)
+    m     = len(rest)
+    for k in range(m + 1):
+        chosen = {int((i + 0.5) * m / k) for i in range(k)} if k else set()
+        if total - sum(rest[i].stored_bytes for i in chosen) <= ram_budget:
+            return chosen
+    return set(range(m))
+
 
 def plan(
     model: nn.Module,
@@ -176,6 +191,8 @@ def plan(
     max_ram: Union[None, int, str] = None,
     min_free_ram: Union[int, str] = "auto",
     allow_disk: bool = True,
+    lookahead: int = 2,
+    spread_disk: bool = True,
     hardware: Optional[Hardware] = None,
     groups: Optional[List[BlockGroup]] = None,
 ) -> Plan:
@@ -188,6 +205,8 @@ def plan(
     max_ram          RAM to use for streamed blocks (default: what is available right now)
     min_free_ram     RAM kept free for the operating system and other programs ("auto": 8% of the machine's RAM, 1 to 4GB)
     allow_disk       blocks that do not fit in RAM stay in the checkpoint file (slow) instead of RAM
+    lookahead        how many blocks ahead the next weights are staged on the GPU(0 turns prefetching off); the plan leaves room for them
+    spread_disk      put the disk blocks evenly among the others instead of at the end, so reads can overlap with compute
     """
     cdt = parse_dtype(compute_dtype) or torch.bfloat16
     sdt = parse_dtype(storage_dtype)
@@ -236,7 +255,8 @@ def plan(
     if hw.vram_total == 0 and vram_cap is None:
         warnings.append("No CUDA GPU detected and no max_vram given: nothing can be placed on the GPU.")
 
-    buffer = int(max((b.expanded_bytes for b in blocks), default=0) * 1.3)   # expanded copy + temporaries
+    buffer  = int(max((b.expanded_bytes for b in blocks), default=0) * 1.3)   # expanded copy + temporaries
+    staging = max(int(lookahead), 0) * max((b.stored_bytes for b in blocks), default=0) # blocks waiting on the gPU
     needs_expand = any(b.stored_bytes != b.expanded_bytes for b in blocks)
 
     # -- GPU-resident blocks
@@ -248,7 +268,7 @@ def plan(
         if everything <= vram_budget:
             n_res = n
         else:
-            room = vram_budget - other - buffer
+            room = vram_budget - other - buffer - staging
             n_res = 0
             for b in blocks:
                 if b.stored_bytes <= room:
@@ -260,9 +280,10 @@ def plan(
         b.tier = Tier.GPU if i < n_res else Tier.RAM
 
     resident_bytes = sum(b.stored_bytes for b in blocks[:n_res])
-    if other + resident_bytes + (buffer if n_res < n or needs_expand else 0) > vram_budget:
+    reserved = (buffer + staging) if n_res < n else (buffer if needs_expand else 0)
+    if other + resident_bytes + reserved > vram_budget:
         warnings.append(
-            f"The GPU part of the plan needs {fmt_bytes(other + resident_bytes + buffer)} but the VRAM budget is "
+            f"The GPU part of the plan needs {fmt_bytes(other + resident_bytes + reserved)} but the VRAM budget is "
             f"{fmt_bytes(vram_budget)}; expect out-of-memory errors or slow spilling into shared memory."
         )
 
@@ -274,21 +295,26 @@ def plan(
         ram_reserve = parse_bytes(min_free_ram) or 0
    
     # the prefetcher's pinned staging buffers: page-locked RAM that cannot be paged out, only when there is a GPU
-    pinned = _PINNED_BUFFERS * max((b.stored_bytes for b in blocks[n_res:]), default=0) if hw.vram_total else 0
+    pinned     = _PINNED_BUFFERS * max((b.stored_bytes for b in blocks[n_res:]), default=0) if hw.vram_total else 0
     ram_budget = (ram_cap if ram_cap is not None else hw.ram_available) - ram_reserve - pinned
     ram_budget = max(ram_budget, 0)
-
     
-    ram_left = ram_budget
-    for b in blocks[n_res:]:
-        if b.stored_bytes <= ram_left:
-            b.tier = Tier.RAM
-            ram_left -= b.stored_bytes
-        elif allow_disk:
-            b.tier = Tier.DISK
-        else:
-            b.tier = Tier.RAM
-            warnings.append(f"Block '{b.prefix}' does not fit in the RAM budget and disk is not allowed.")
+    rest = blocks[n_res:]
+    if spread_disk and allow_disk:
+        on_disk = _spread_disk_blocks(rest, ram_budget)
+        for i, b in enumerate(rest):
+            b.tier = Tier.DISK if i in on_disk else Tier.RAM
+    else:
+        ram_left = ram_budget
+        for b in rest:
+            if b.stored_bytes <= ram_left:
+                b.tier = Tier.RAM
+                ram_left -= b.stored_bytes
+            elif allow_disk:
+                b.tier = Tier.DISK
+            else:
+                b.tier = Tier.RAM
+                warnings.append(f"Block '{b.prefix}' does not fit in the RAM budget and disk is not allowed.")
 
     n_disk = sum(1 for b in blocks if b.tier == Tier.DISK)
     if n_disk:
@@ -310,6 +336,8 @@ def plan(
         storage_dtype=sdt,
         other_bytes=other,
         stream_buffer_bytes=buffer,
+        staging_bytes=staging if n_res < n else 0,
+        lookahead=lookahead,
         vram_budget=vram_budget,
         ram_budget=ram_budget,
         warnings=warnings,
