@@ -13,6 +13,14 @@ This script is not part of the trash-panda package. It needs its own packages:
     pip install diffusers transformers accelerate huggingface_hub psutil torch dumpsterpanda
 
 The first run downloads the fp16 weights of stabilityai/stable-diffusion-xl-base-1.0 (about 7 GB).
+
+Without an NVIDIA GPU (a Mac, for example) the script uses the Apple GPU (mps) if there is one, and the CPU otherwise.
+Only the "baseline" and "trash-panda" modes run there, the peak VRAM is not measured, and trash-panda's prefetching is
+CUDA-only, so those numbers say whether it works, not how fast it is. This path is untested. Use a smaller image,
+for example:
+
+    python sdxl_benchmark.py --mode baseline --size 512 --steps 10
+    python sdxl_benchmark.py --mode trash-panda --size 512 --steps 10
 """
 
 import argparse
@@ -34,7 +42,17 @@ from trash_panda import find_blocks, install_offload, plan, stream_load
 
 REPO = "stabilityai/stable-diffusion-xl-base-1.0"
 PROMPT = "a weathered fisherman in a yellow raincoat on a wooden dock at sunrise, holding a lantern, photorealistic"
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+DTYPE = torch.float32 if DEVICE == "cpu" else torch.float16
+COMPUTE_DTYPE = "fp32" if DEVICE == "cpu" else "fp16"
+
 MODES = ["baseline", "model-offload", "accelerate", "trash-panda"]
+AVAILABLE = MODES if DEVICE == "cuda" else ["baseline", "trash-panda"]    # the other two need a CUDA GPU
 LABELS = {
     "baseline": "diffusers, everything on the GPU",
     "model-offload": "diffusers model offloading",
@@ -66,25 +84,40 @@ class PeakRam:
         self._thread.join()
 
 
+def sync():
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    elif DEVICE == "mps":
+        torch.mps.synchronize()
+
+
+def free_cache():
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+    elif DEVICE == "mps":
+        torch.mps.empty_cache()
+
+
 def generate(pipe, args, label, save=False):
     """One timed generation. Returns a dict of results."""
     pipe.vae.enable_tiling()          # decode the image in tiles, so the VAE needs far less memory
     step_times = []
 
     def on_step(_pipe, _step, _timestep, kwargs):
-        torch.cuda.synchronize()
+        sync()
         step_times.append(time.perf_counter())
         return kwargs
 
-    torch.cuda.reset_peak_memory_stats()
-    generator = torch.Generator("cuda").manual_seed(args.seed)
-    torch.cuda.synchronize()
+    if DEVICE == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    generator = torch.Generator("cuda" if DEVICE == "cuda" else "cpu").manual_seed(args.seed)
+    sync()
     start = time.perf_counter()
     step_times.append(start)
     with PeakRam() as ram:
         image = pipe(PROMPT, num_inference_steps=args.steps, height=args.size, width=args.size,
                      generator=generator, callback_on_step_end=on_step).images[0]
-    torch.cuda.synchronize()
+    sync()
     total = time.perf_counter() - start
     steps = [b - a for a, b in zip(step_times, step_times[1:])]
     if save and args.save_dir:
@@ -95,14 +128,14 @@ def generate(pipe, args, label, save=False):
         "total_s": round(total, 1),
         "per_step_s": round(sum(steps) / len(steps), 2),
         "other_s": round(total - sum(steps), 1),      # prompt encoding and the VAE decode
-        "peak_vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
+        "peak_vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2) if DEVICE == "cuda" else None,
         "peak_ram_gb": round(ram.peak, 2),
     }
 
 
 def load_pipeline(**kwargs):
     return StableDiffusionXLPipeline.from_pretrained(
-        REPO, torch_dtype=torch.float16, variant="fp16", use_safetensors=True, **kwargs
+        REPO, torch_dtype=DTYPE, variant="fp16", use_safetensors=True, **kwargs
     )
 
 
@@ -114,7 +147,7 @@ def vram_limit(args):
 
 
 def run_baseline(args):
-    pipe = load_pipeline().to("cuda")
+    pipe = load_pipeline().to(DEVICE)
     return pipe, None
 
 
@@ -151,20 +184,20 @@ def run_trash_panda(args):
     for group in find_blocks(unet):
         print(f"{len(group.prefixes):3d} blocks, for example {group.prefixes[0]}")
 
-    limit = vram_limit(args)
+    limit = vram_limit(args) if DEVICE == "cuda" else None      # the limit is only used on a CUDA GPU
     if limit is None:
-        p = plan(unet, weights, compute_dtype="fp16")
+        p = plan(unet, weights, compute_dtype=COMPUTE_DTYPE)
     else:
-        p = plan(unet, weights, compute_dtype="fp16", max_vram=limit, headroom_vram=0)
+        p = plan(unet, weights, compute_dtype=COMPUTE_DTYPE, max_vram=limit, headroom_vram=0)
     print(p)
-    print(stream_load(unet, weights, plan=p, device="cuda"))
+    print(stream_load(unet, weights, plan=p, device=DEVICE))
     handle = install_offload(unet)
     unet.eval().requires_grad_(False)
 
     pipe = load_pipeline(unet=unet)
-    pipe.vae.to("cuda")                    # not pipe.to("cuda"): that would move the UNet's weights too
-    pipe.text_encoder.to("cuda")
-    pipe.text_encoder_2.to("cuda")
+    pipe.vae.to(DEVICE)                    # not pipe.to(DEVICE): that would move the UNet's weights too
+    pipe.text_encoder.to(DEVICE)
+    pipe.text_encoder_2.to(DEVICE)
     return pipe, handle
 
 
@@ -187,7 +220,7 @@ def run_one(mode, args):
         handle.remove()                    # restores the blocks, stops the copy thread and frees the pinned buffers
     del pipe
     gc.collect()
-    torch.cuda.empty_cache()
+    free_cache()
     print("RESULT " + json.dumps(result))
 
 
@@ -199,7 +232,7 @@ def table(results, start_ram):
     for r in results:
         lines.append(
             f"| {LABELS.get(r['mode'], r['mode'])} | {r['total_s']} | {r['per_step_s']} | {r['other_s']} | "
-            f"{r['peak_vram_gb']} | {r['peak_ram_gb']} |"
+            f"{'n/a' if r['peak_vram_gb'] is None else r['peak_vram_gb']} | {r['peak_ram_gb']} |"
         )
     return "\n".join(lines)
 
@@ -213,7 +246,7 @@ def run_all(args):
     if args.save_dir:
         forwarded += ["--save-dir", args.save_dir]
     results = []
-    for mode in MODES:
+    for mode in AVAILABLE:
         print(f"\n=== {mode} ===  (RAM in use before it starts: {psutil.virtual_memory().used / 1e9:.1f} GB)")
         done = subprocess.run([sys.executable, os.path.abspath(__file__), "--mode", mode, *forwarded],
                               capture_output=True, text=True)
@@ -254,6 +287,8 @@ def main():
     parser.add_argument("--save-dir", default=None, help="save the generated images here (by default nothing is saved)")
     parser.add_argument("--yes", action="store_true", help="with --mode clean: really delete the downloaded model")
     args = parser.parse_args()
+    if args.mode in MODES and args.mode not in AVAILABLE:
+        parser.error(f"--mode {args.mode} needs a CUDA GPU; on this machine ({DEVICE}) use one of: {', '.join(AVAILABLE)}")
 
     if args.mode == "all":
         run_all(args)

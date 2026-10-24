@@ -131,6 +131,10 @@ are indicative only, and they do not show that trash-panda is faster than the ot
 * full overlap of reading and computing for disk blocks: blocks waiting in RAM and on disk are prefetched through
   pinned buffers by a background thread, two blocks ahead by default, but the drive's speed sets a floor that no
   amount of prefetching removes (see "Known issues")
+* Macs and other non-NVIDIA GPUs: the prefetching (a second CUDA stream, events and pinned buffers) is CUDA-only.
+  On a Mac the library should fall back to the CPU, with plain copies and no prefetching, but this has not been tested
+  on a Mac yet, and the Apple GPU (`mps`) has not been tried at all. A Mac's CPU and GPU also share one memory pool,
+  so splitting a model between "GPU" and "RAM" does not free anything there
 * int8 / 4-bit formats (fp8 and ordinary float dtypes only)
 * LoRA/LoKr adapters, multi-GPU, model definitions
 
@@ -162,7 +166,8 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   1 to 3 s each, and a text encoder that runs once copied its blocks at about disk speed. The cause is not
   confirmed yet (see the roadmap)
 * **Tested on one setup so far:** a 12B diffusion model (fp8 with scales) on Windows with an RTX 3060 (12 GB) and
-  16 GB of RAM. Other models, GPUs and operating systems are not covered yet
+  16 GB of RAM. Other models, GPUs and operating systems are not covered yet. The unit tests run on the CPU, and
+  `examples/sdxl_benchmark.py` has a path for machines without CUDA (the Apple GPU or the CPU) that is untested
 
 ## Roadmap
 
@@ -225,7 +230,10 @@ Roughly in the order they are planned. Nothing here is promised or scheduled.
   the machine had left
 * `release()` / `stage()` helpers for cleaning up between models
 * tests on tiny `transformers` and `diffusers` models on the CPU, in CI
-* tests on more models, GPUs and operating systems (Linux in particular), with benchmarks published here
+* tests on more models, GPUs and operating systems (Linux in particular), with benchmarks published here. A first
+  test on a Mac is planned: the unit tests and `examples/sdxl_benchmark.py --size 512 --steps 10` in the baseline and
+  trash-panda modes, to see whether it installs and runs on the CPU or the Apple GPU. Real Mac support, if there is
+  demand, would be a separate piece of work (`mps`, unified memory, fp8 on the Apple GPU)
 * a documentation site (GitHub Pages) with guides and an API reference
 * a final project name, and a contributor agreement before outside code is accepted
 

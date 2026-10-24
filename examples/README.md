@@ -35,6 +35,16 @@ pip install diffusers transformers accelerate huggingface_hub psutil dumpsterpan
 The first run downloads the fp16 weights of `stabilityai/stable-diffusion-xl-base-1.0` (about 7 GB) from the
 Hugging Face Hub. This model is not gated, so no account or login is needed.
 
+**On a Mac, or any machine without an NVIDIA GPU:** a plain `pip install torch` is enough. The script uses the Apple
+GPU (`mps`) if there is one and the CPU otherwise. Only the `baseline` and `trash-panda` modes run there, the peak
+VRAM shows as `n/a`, and trash-panda's prefetching is CUDA-only, so the numbers say whether it works, not how fast it
+is. This path has not been tested yet. Use a small image so it finishes in reasonable time:
+
+```
+python sdxl_benchmark.py --mode baseline --size 512 --steps 10
+python sdxl_benchmark.py --mode trash-panda --size 512 --steps 10
+```
+
 ### Run
 
 From this folder:
