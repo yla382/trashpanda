@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch.nn as nn
+
+from . import config
 
 
 @dataclass
@@ -23,11 +25,15 @@ def module_nbytes(module: nn.Module) -> int:
     return total
 
 
-def find_blocks(model: nn.Module, *, min_fraction: float = 0.01, min_blocks: int = 2) -> List[BlockGroup]:
+def find_blocks(model: nn.Module, *, min_fraction: Optional[float] = None, min_blocks: Optional[int] = None) -> List[BlockGroup]:
     """Find groups of repeated blocks: ModuleList / Sequential containers whose children all have the
-    same class and that hold at least `min_fraction` of the model's bytes.
+    same class and that hold at least `min_fraction` of the model's bytes (default 0.01) in at least `min_blocks`
+    blocks (default 2). The defaults come from config.
 
     Outermost groups win (a list nested inside a chosen block is not reported separately)."""
+    cfg = config.current()
+    min_fraction = cfg.find_blocks_min_fraction if min_fraction is None else min_fraction
+    min_blocks   = cfg.find_blocks_min_blocks if min_blocks is None else min_blocks
     total = module_nbytes(model)
     groups: List[BlockGroup] = []
     for name, mod in model.named_modules():

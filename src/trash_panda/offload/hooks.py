@@ -8,7 +8,6 @@ originals back (try/finally), so a failed forward pass cannot leave a block expa
 from __future__ import annotations
 
 import atexit
-import os
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -17,10 +16,11 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from . import config
 from .checkpoint import Checkpoint
 from .formats import SCALE_SUFFIX, expand
 from .loader import OffloadState, _navigate
-from .planner import Plan, Tier, _PINNED_BUFFERS
+from .planner import Plan, Tier
 
 
 class OffloadHandle:
@@ -97,7 +97,8 @@ class _PinnedPool:
     Only these buffers are pinned, not the whole RAM tier. A buffer is reused only after the GPU copy that
     read from it has finished."""
 
-    def __init__(self, count: int = 2) -> None:
+    def __init__(self, count: Optional[int] = None) -> None:
+        count = config.current().pinned_buffers if count is None else count
         self.buffers = [None] * count #uint8 tensors, grown when a bigger block shows up
         self.events  = [None] * count  #the GPU copy that last read from each buffer
         self.cursor  = 0
@@ -129,18 +130,19 @@ class _Prefetcher:
 
     profile = False
 
-    def __init__(self, device: torch.device, lookahead: int = 2, profile: Optional[bool] = None):
+    def __init__(self, device: torch.device, lookahead: Optional[int] = None, profile: Optional[bool] = None):
+        cfg = config.current()
         self.device    = device
-        self.lookahead = lookahead
+        self.lookahead = cfg.lookahead if lookahead is None else lookahead
         self.index     = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
         self.stream    = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.last      = None
         self.window    = []
         self.in_flight = deque()
-        self.pool      = _PinnedPool(_PINNED_BUFFERS) if self.stream is not None else None
+        self.pool      = _PinnedPool(cfg.pinned_buffers) if self.stream is not None else None
         self.worker    = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not None else None
         # profiling: where does the time go? Off by default; on with profile=True or TRASH_PANDA_PROFILE=1
-        self.profile   = (os.environ.get("TRASH_PANDA_PROFILE") == "1") if profile is None else bool(profile)
+        self.profile   = cfg.profile if profile is None else bool(profile)
         self.stats     = defaultdict(float)
         self.first     = None
         self.where     = {}                        # id(entry) -> its position in the pass, in the order first seen
@@ -188,10 +190,11 @@ class _Prefetcher:
         if future is not None:
             future.cancel()
 
-    def wait_for_room(self, limit: int = 2) -> None:
-        """Let the GPU catch up, so that at most `limit - 1` earlier blocks are still running."""
+    def wait_for_room(self, limit: Optional[int] = None) -> None:
+        """Let the GPU catch up, so that at most `limit - 1` earlier blocks are still running (default from config)."""
         if self.stream is None or self.lookahead <= 0:
             return
+        limit = config.current().blocks_in_flight if limit is None else limit
         started = time.perf_counter() if self.profile else 0.0
         while len(self.in_flight) >= limit:
             self.in_flight.popleft().synchronize()
@@ -383,14 +386,15 @@ def offload_blocks(
     compute_dtype: torch.dtype = torch.bfloat16,
     disk: Optional[Callable[[nn.Module], Optional[DiskReader]]] = None,
     prefetcher: Optional["_Prefetcher"] = None,
-    lookahead: int = 2,
+    lookahead: Optional[int] = None,
     profile: Optional[bool] = None,
 ) -> OffloadHandle:
     """Low-level: wrap each block so its weights are expanded on `device` only while it runs.
 
     Blocks whose weights are already on the device in the compute dtype are left untouched.
     `disk` (advanced) maps a block to a DiskReader when its weights live in the checkpoint file.
-    `lookahead` is how many blocks ahead the next weights are copied (0turns prefetching off)."""
+    `lookahead` is how many blocks ahead the next weights are copied (0 turns prefetching off; the default comes
+    from config)."""
     dev    = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     handle = OffloadHandle()
     if prefetcher is None:

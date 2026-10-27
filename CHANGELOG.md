@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
+### Added
+- `trash_panda.offload.config`, which holds the default values of the tuning settings in one place: the look-ahead depth, the number of pinned buffers, how far the GPU may lag behind the copies, the VRAM headroom and the working-area factor, the automatic RAM reserve, the margin around a measured activation size, the commit-limit warning, the thresholds for finding blocks, and the profiling switch. Each can be overridden with an environment variable named `TRASH_PANDA_<SETTING>` (for example `TRASH_PANDA_LOOKAHEAD=0`). An argument passed to a function still wins over the environment, and the environment over the shipped default
+
+### Changed
+- `plan()`, `find_blocks()` and the prefetcher now take their defaults from the config when an argument is left out (`None`). The default values themselves are unchanged
 
 ## [0.0.11] - 2026-10-23
 ### Added

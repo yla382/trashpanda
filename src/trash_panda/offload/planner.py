@@ -14,6 +14,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 
+from . import config
 from .blocks import BlockGroup, find_blocks
 from .checkpoint import Checkpoint
 from .formats import expanded_nbytes, parse_dtype, stored_nbytes
@@ -21,13 +22,15 @@ from .hardware import Hardware, detect_hardware
 from .report import fmt_bytes
 
 _GB = 1024 ** 3
-_PINNED_BUFFERS = 2 # how many pinned staging buffers the prefetcher keeps (see hooks._PinnedPool)
+_PINNED_BUFFERS = config.DEFAULTS.pinned_buffers   # kept for older imports; plan() reads config.current()
 
-def _auto_ram_reserve(hw: Hardware) -> int:
-    """RAM kept free for the OS and other program: 8% of the machine's RAM, between 1GB and 4GB"""
+def _auto_ram_reserve(hw: Hardware, cfg: Optional[config.Defaults] = None) -> int:
+    """RAM kept free for the OS and other programs: a share of the machine's RAM, within a lower and an upper limit
+    (8%, between 1 and 4 GB by default, see config)"""
+    cfg = cfg or config.current()
     if not hw.ram_total:
-        return 2 * _GB
-    return int(min(max(0.08 * hw.ram_total, 1 * _GB), 4 * _GB))
+        return int(cfg.ram_reserve_unknown_gb * _GB)
+    return int(min(max(cfg.ram_reserve_fraction * hw.ram_total, cfg.ram_reserve_min_gb * _GB), cfg.ram_reserve_max_gb * _GB))
 
 
 class Tier(str, Enum):
@@ -52,7 +55,7 @@ class Plan:
     other_bytes: int = 0                 # weights outside any block (kept expanded on the device)
     stream_buffer_bytes: int = 0         # room for one expanded streamed block (+ temporaries)
     staging_bytes: int = 0               # room for the blocks staged on the device ahead of time
-    lookahead: int = 2                   # how many blocks ahead they are staged
+    lookahead: int = field(default_factory=lambda: config.current().lookahead)   # how many blocks ahead they are staged
     vram_budget: int = 0
     ram_budget: int = 0
     warnings: List[str] = field(default_factory=list)
@@ -186,21 +189,23 @@ def plan(
     storage_dtype: Union[None, str, torch.dtype] = "auto",
     resident_blocks: Optional[int] = None,
     max_vram: Union[None, int, str] = None,
-    headroom_vram: Union[int, str] = "1.5GB",
+    headroom_vram: Union[None, int, str] = None,
     activation_vram: Union[None, int, str] = None,
     max_ram: Union[None, int, str] = None,
-    min_free_ram: Union[int, str] = "auto",
+    min_free_ram: Union[None, int, str] = None,
     allow_disk: bool = True,
-    lookahead: int = 2,
+    lookahead: Optional[int] = None,
     spread_disk: bool = True,
     hardware: Optional[Hardware] = None,
     groups: Optional[List[BlockGroup]] = None,
 ) -> Plan:
     """Decide where each block lives. Every argument that is set explicitly overrides the automatic choice.
+    Arguments left as None take their default from config (see config.py, which also lists the TRASH_PANDA_<NAME>
+    environment overrides).
 
     resident_blocks  force this many blocks (from the start) to be GPU-resident instead of "as many as fit"
     max_vram         VRAM to use (default: what is free right now)
-    headroom_vram    VRAM kept free for activations, the CUDA context and other programs
+    headroom_vram    VRAM kept free for activations, the CUDA context and other programs (default "1.5GB")
     activation_vram  measured GPU memory the activations need (see measure_activation_vram); replaces headroom_cram
     max_ram          RAM to use for streamed blocks (default: what is available right now)
     min_free_ram     RAM kept free for the operating system and other programs ("auto": 8% of the machine's RAM, 1 to 4GB)
@@ -208,11 +213,15 @@ def plan(
     lookahead        how many blocks ahead the next weights are staged on the GPU(0 turns prefetching off); the plan leaves room for them
     spread_disk      put the disk blocks evenly among the others instead of at the end, so reads can overlap with compute
     """
+    cfg = config.current()
+    headroom_vram = cfg.headroom_vram if headroom_vram is None else headroom_vram
+    min_free_ram  = cfg.min_free_ram if min_free_ram is None else min_free_ram
+    lookahead     = cfg.lookahead if lookahead is None else lookahead
     cdt = parse_dtype(compute_dtype) or torch.bfloat16
     sdt = parse_dtype(storage_dtype)
     ck = checkpoint if isinstance(checkpoint, Checkpoint) else Checkpoint(checkpoint)
     hw = hardware if hardware is not None else detect_hardware()
-    found = list(groups) if groups is not None else find_blocks(model)
+    found = list(groups) if groups is not None else find_blocks(model)    # its thresholds also come from config
     warnings: List[str] = []
     if not found:
         warnings.append("No repeating blocks found in the model; nothing can be offloaded.")
@@ -244,7 +253,7 @@ def plan(
     # -- budgets
     activation = parse_bytes(activation_vram)
     if activation is not None:
-        margin   = max(int(0.05 * hw.vram_total), _GB // 2) # allocator slack and fragmentation
+        margin   = max(int(cfg.activation_margin_fraction * hw.vram_total), int(cfg.activation_margin_min_gb * _GB)) # allocator slack and fragmentation
         headroom = activation + margin
     else:
         headroom = parse_bytes(headroom_vram) or 0
@@ -255,7 +264,7 @@ def plan(
     if hw.vram_total == 0 and vram_cap is None:
         warnings.append("No CUDA GPU detected and no max_vram given: nothing can be placed on the GPU.")
 
-    buffer  = int(max((b.expanded_bytes for b in blocks), default=0) * 1.3)   # expanded copy + temporaries
+    buffer  = int(max((b.expanded_bytes for b in blocks), default=0) * cfg.stream_buffer_factor)   # expanded copy + temporaries
     staging = max(int(lookahead), 0) * max((b.stored_bytes for b in blocks), default=0) # blocks waiting on the gPU
     needs_expand = any(b.stored_bytes != b.expanded_bytes for b in blocks)
 
@@ -290,12 +299,12 @@ def plan(
     # -- RAM vs disk for the rest
     ram_cap = parse_bytes(max_ram)
     if isinstance(min_free_ram, str) and min_free_ram.strip().lower() == "auto":
-        ram_reserve  = _auto_ram_reserve(hw)
+        ram_reserve  = _auto_ram_reserve(hw, cfg)
     else:
         ram_reserve = parse_bytes(min_free_ram) or 0
    
     # the prefetcher's pinned staging buffers: page-locked RAM that cannot be paged out, only when there is a GPU
-    pinned     = _PINNED_BUFFERS * max((b.stored_bytes for b in blocks[n_res:]), default=0) if hw.vram_total else 0
+    pinned     = cfg.pinned_buffers * max((b.stored_bytes for b in blocks[n_res:]), default=0) if hw.vram_total else 0
     ram_budget = (ram_cap if ram_cap is not None else hw.ram_available) - ram_reserve - pinned
     ram_budget = max(ram_budget, 0)
     
@@ -324,7 +333,7 @@ def plan(
         if sdt is not None:
             warnings.append("storage_dtype is not applied to disk blocks: they are read as stored in the file.")
     ram_used = sum(b.stored_bytes for b in blocks if b.tier == Tier.RAM)
-    if hw.commit_available is not None and ram_used > 0.9 * hw.commit_available:
+    if hw.commit_available is not None and ram_used > cfg.commit_warn_fraction * hw.commit_available:
         warnings.append(
             f"Streamed blocks need {fmt_bytes(ram_used)} but only {fmt_bytes(hw.commit_available)} can still be "
             "committed (RAM + page file); loading may fail with 'paging file too small'."
