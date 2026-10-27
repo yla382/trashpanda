@@ -174,16 +174,18 @@ are indicative only, and they do not show that trash-panda is faster than the ot
 Roughly in the order they are planned. Nothing here is promised or scheduled.
 
 **Speed**
-* next tests, from the prefetch profile (`TRASH_PANDA_PROFILE=1`): (1) time every step and show the wait for each
-  pass separately. In the profile of an all-RAM plan, 21 of the 140 streamed blocks were late by about 1 s each, which
-  is roughly the time to read one block from the drive, and each of the slowest was late in only 1 of 7 passes. That
-  suggests nearly all the waiting is in the first pass, when the file-backed RAM tier is read from disk on first use.
-  If so, steady steps may be much faster than the average the progress bar shows (about 6 s against 9.3 s), and the
-  first step much slower. This is an inference, not a measurement. If it holds, read those pages into memory once
-  when the hooks are installed; (2) time how long the worker waits
-  for a free pinned buffer, to find the roughly 3.7 s per step of a disk-heavy plan in which the worker is idle;
-  (3) make the number of pinned buffers an option and try 3 or 4; (4) hand the prefetcher the block order up front,
-  so a model that runs one pass (a text encoder) is prefetched from its first block
+* read the RAM tier into memory ahead of use. In the profile of an all-RAM plan, 21 of the 140 streamed blocks were
+  late by about 1 s each, which is roughly the time to read one block from the drive, and each of the slowest was late
+  in only 1 of 7 passes. That suggests nearly all the waiting is in the first pass, when the file-backed RAM tier is
+  read from disk on first use. If so, steady steps may be much faster than the average the progress bar shows (about
+  6 s against 9.3 s) and the first step much slower. This is an inference, not a measurement: the profile now lists
+  the time and the waiting of every pass (`TRASH_PANDA_PROFILE=1`), which will confirm or reject it. If it holds, a
+  background thread would touch the RAM-tier pages once when the hooks are installed, keeping the tier file-backed
+* prefetch models that run a single pass (a text encoder, a VAE) from their first block: the prefetcher learns the
+  block order during the first pass, so a one-pass model is not prefetched at all. Hand it the order of the blocks
+  when the hooks are installed, and let the order seen at run time correct it
+* the number of pinned buffers as a tested option (`TRASH_PANDA_PINNED_BUFFERS`, 3 or 4 instead of 2), if the
+  profile's "worker waited for a free pinned buffer" line shows the worker is held up by them
 * overlap the stages of a pipeline: while the text encoder runs, load as much of the diffusion model as there is
   spare VRAM and RAM for, then release the encoder and start sampling with what is already loaded while the rest keeps
   loading; the same for the VAE during sampling. It needs the staged planning above, a plan that predicts the memory

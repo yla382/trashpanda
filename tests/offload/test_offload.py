@@ -542,3 +542,111 @@ def test_report_lists_the_slowest_waits_by_block_position():
     text = prefetcher.report()
     assert "block 0: 1.00 s, late in 2 of 2" in text
     assert text.index("block 0") < text.index("block 7")
+
+
+class _WaitingEvent:
+    """A stand-in for a CUDA event whose synchronize() takes a known time on a fake clock."""
+
+    def __init__(self, clock, seconds):
+        self.clock, self.seconds = clock, seconds
+
+    def synchronize(self):
+        self.clock[0] += self.seconds
+
+
+def test_each_pass_is_timed_and_its_waiting_recorded(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(hooks.time, "perf_counter", lambda: clock[0])
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    a, b = _chain(*[_queue_entry(n) for n in "ab"])
+
+    clock[0] = 10.0
+    prefetcher.learn(a)                                   # pass 1 starts
+    clock[0] = 11.0
+    prefetcher.learn(b)
+    prefetcher.stats["wait_staged_s"] += 2.0              # the main thread waited 2 s for staged blocks
+    clock[0] = 14.0
+    prefetcher.block_done()                               # pass 1 ends here
+    clock[0] = 20.0
+    prefetcher.learn(a)                                   # pass 2 starts, pass 1 is closed
+    assert prefetcher.pass_log == [(4.0, 2.0)]
+    prefetcher.stats["wait_staged_s"] += 0.5
+    clock[0] = 23.0
+    prefetcher.block_done()
+
+    text = prefetcher.report()                            # closes pass 2
+    assert prefetcher.pass_log == [(4.0, 2.0), (3.0, 0.5)]
+    assert "pass 1: 4.00 s, waited 2.00 s" in text
+    assert "pass 2: 3.00 s, waited 0.50 s" in text
+
+
+def test_a_long_run_shows_only_the_first_and_last_passes(monkeypatch):
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    prefetcher.stats["passes"] = 12
+    prefetcher.pass_log = [(1.0 * n, 0.1 * n) for n in range(1, 13)]
+    text = prefetcher.report()
+    assert "pass 5:" in text and "pass 6:" not in text and "pass 11:" in text and "pass 12:" in text
+    assert "    ..." in text
+
+
+@pytest.mark.filterwarnings("ignore:trash-panda")
+def test_the_wait_for_a_free_pinned_buffer_is_timed(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(hooks.time, "perf_counter", lambda: clock[0])
+    pool = hooks._PinnedPool(2)
+    pool.events[0] = _WaitingEvent(clock, 1.5)            # the buffer is still being read by the GPU
+    pool.acquire(10)                                      # pinning fails on the CPU and returns None, after the wait
+    assert pool.wait_s == 1.5
+    assert pool.events[0] is None                         # the pool must survive the wait (it once overwrote self)
+    pool.events[1] = _WaitingEvent(clock, 0.5)
+    pool.acquire(10)
+    assert pool.wait_s == 2.0
+
+
+def test_the_report_shows_the_pinned_buffer_wait_per_pass():
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    prefetcher.stats["passes"] = 2
+    prefetcher.pool = hooks._PinnedPool(2)
+    prefetcher.pool.wait_s = 3.0
+    assert "worker waited for a free pinned buffer: 1.50 s" in prefetcher.report()
+
+
+def test_the_report_has_no_buffer_line_without_a_pool():
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)       # on the CPU there is no pool
+    prefetcher.stats["passes"] = 1
+    assert "pinned buffer" not in prefetcher.report()
+
+
+def _refuse_pinned_memory(monkeypatch):
+    """Make torch.empty(pin_memory=True) fail the way it does when pinned memory cannot be allocated."""
+    real_empty = torch.empty
+
+    def empty(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            raise RuntimeError("no pinned memory")
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+
+
+def test_failing_to_pin_memory_warns_once_and_falls_back(monkeypatch):
+    _refuse_pinned_memory(monkeypatch)
+    pool = hooks._PinnedPool(2)
+    with pytest.warns(RuntimeWarning, match="pinned") as seen:
+        assert pool.acquire(10 ** 6) is None                  # the caller then copies through ordinary memory
+        assert pool.acquire(10 ** 6) is None
+        assert pool.acquire(10 ** 6) is None
+    assert len(seen) == 1                                     # one warning per pool, not one per block
+    assert "no pinned memory" in str(seen[0].message)
+    assert "ordinary memory" in str(seen[0].message)
+
+
+def test_no_warning_when_pinning_works(monkeypatch):
+    real_empty = torch.empty
+    monkeypatch.setattr(torch, "empty", lambda *a, **k: real_empty(*a, **{**k, "pin_memory": False}))
+    pool = hooks._PinnedPool(2)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                        # any warning would fail the test
+        index, buffer = pool.acquire(100)
+    assert index == 0 and buffer.numel() == 100

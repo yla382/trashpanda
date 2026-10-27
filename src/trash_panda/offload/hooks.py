@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import atexit
 import time
+import warnings
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -102,19 +103,30 @@ class _PinnedPool:
         self.buffers = [None] * count #uint8 tensors, grown when a bigger block shows up
         self.events  = [None] * count  #the GPU copy that last read from each buffer
         self.cursor  = 0
+        self.wait_s  = 0.0             #seconds the worker spent waiting for a buffer's last GPU copy to finish
+        self._warned = False
 
     def acquire(self, nbytes: int):
         """(index, buffer) with room for nbytes, or None if pinned memory could not be allocated."""
         i = self.cursor
         self.cursor = (i + 1) % len(self.buffers)
         if self.events[i] is not None:
+            started = time.perf_counter()
             self.events[i].synchronize()
+            self.wait_s += time.perf_counter() - started
             self.events[i] = None
         buf = self.buffers[i]
         if buf is None or buf.numel() < nbytes:
             try:
                 buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-            except RuntimeError: # pinning failed (not enough memory, or no CUDA)
+            except RuntimeError as err: # pinning failed (not enough memory, or no CUDA)
+                if not self._warned:
+                    self._warned = True
+                    warnings.warn(
+                        f"trash-panda: could not allocate {nbytes / 1e9:.2f} GB of pinned (page-locked) memory ({err}). "
+                        "Blocks will be copied through ordinary memory, which is slower and does not overlap with compute.",
+                        RuntimeWarning,
+                    )
                 return None
             self.buffers[i] = buf
         return i, buf
@@ -132,23 +144,27 @@ class _Prefetcher:
 
     def __init__(self, device: torch.device, lookahead: Optional[int] = None, profile: Optional[bool] = None):
         cfg = config.current()
-        self.device    = device
-        self.lookahead = cfg.lookahead if lookahead is None else lookahead
-        self.index     = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
-        self.stream    = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-        self.last      = None
-        self.window    = []
-        self.in_flight = deque()
-        self.pool      = _PinnedPool(cfg.pinned_buffers) if self.stream is not None else None
-        self.worker    = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not None else None
+        self.device      = device
+        self.lookahead   = cfg.lookahead if lookahead is None else lookahead
+        self.index       = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
+        self.stream      = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self.last        = None
+        self.window      = []
+        self.in_flight   = deque()
+        self.pool        = _PinnedPool(cfg.pinned_buffers) if self.stream is not None else None
+        self.worker      = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not None else None
         # profiling: where does the time go? Off by default; on with profile=True or TRASH_PANDA_PROFILE=1
-        self.profile   = cfg.profile if profile is None else bool(profile)
-        self.stats     = defaultdict(float)
-        self.first     = None
-        self.where     = {}                        # id(entry) -> its position in the pass, in the order first seen
-        self.block_wait = defaultdict(float)       # position -> seconds the main thread waited for that block
-        self.block_late = defaultdict(int)         # position -> times it was not ready when asked for
-        self._reported = False
+        self.profile     = cfg.profile if profile is None else bool(profile)
+        self.stats       = defaultdict(float)
+        self.first       = None
+        self.where       = {}                        # id(entry) -> its position in the pass, in the order first seen
+        self.block_wait  = defaultdict(float)       # position -> seconds the main thread waited for that block
+        self.block_late  = defaultdict(int)         # position -> times it was not ready when asked for
+        self.pass_log    = []                       # per finished pass: (seconds it took, seconds spent waiting for staged blocks)
+        self._pass_start = None
+        self._pass_end   = None
+        self._pass_wait0 = 0.0
+        self._reported   = False
         if self.profile:
             atexit.register(self.report)
 
@@ -157,11 +173,21 @@ class _Prefetcher:
             if self.first is None:
                 self.first = entry
             if entry is self.first:
+                self._end_pass()
                 self.stats["passes"] += 1               # the first block starts a new pass through the model
+                self._pass_start = time.perf_counter()
+                self._pass_wait0 = self.stats["wait_staged_s"]
             self.where.setdefault(id(entry), len(self.where))
         if self.last is not None:
             self.last.next = entry
         self.last = entry
+
+    def _end_pass(self) -> None:
+        """Close the pass in progress: how long it took (until its last block finished) and how long the main thread waited for staged blocks during it."""
+        if self._pass_start is None or self._pass_end is None:
+            return
+        self.pass_log.append((self._pass_end - self._pass_start, self.stats["wait_staged_s"] - self._pass_wait0))
+        self._pass_start = None
 
     def stage(self, entry) -> None:
         if self.stream is None or entry is  None or entry.staged is not None:
@@ -203,6 +229,8 @@ class _Prefetcher:
 
     def block_done(self) -> None:
         """Mark the end of a block's work on the ocmpute stream."""
+        if self.profile:
+            self._pass_end = time.perf_counter()
         if self.stream is None or self.lookahead <= 0:
             return
         event = torch.cuda.Event()
@@ -321,6 +349,7 @@ class _Prefetcher:
         if not self.profile or self._reported or not self.stats:
             return ""
         s = self.stats
+        self._end_pass()
         self._reported = True
         passes = max(int(s["passes"]), 1)
         lines = [f"trash-panda prefetch profile ({passes} passes through the blocks, figures are per pass)"]
@@ -339,11 +368,25 @@ class _Prefetcher:
                 f"  main thread waited for staged blocks: {s['wait_staged_s'] / passes:.2f} s "
                 f"({int(s['takes_ready'])} of {int(s['takes'])} were ready at once)"
             )
+        if self.pass_log:
+            lines.append("  per pass (time, of which the main thread waited for staged blocks):")
+            shown = list(enumerate(self.pass_log, 1))
+            if len(shown) > 10:
+                shown = shown[:5] + [None] + shown[-2:]
+            for item in shown:
+                if item is None:
+                    lines.append("    ...")
+                else:
+                    n, (took, waited) = item
+                    lines.append(f"    pass {n}: {took:.2f} s, waited {waited:.2f} s")
+
         slowest = sorted(self.block_wait, key=self.block_wait.get, reverse=True)[:5]
         if slowest:
             lines.append("  slowest waits (block position in the pass, seconds per pass, passes it was late):")
             for position in slowest:
                 lines.append(f"    block {position}: {self.block_wait[position] / passes:.2f} s, late in {self.block_late[position]} of {passes}")
+        if self.pool is not None:
+            lines.append(f"  worker waited for a free pinned buffer: {self.pool.wait_s / passes:.2f} s")
         lines.append(f"  main thread waited for the GPU to catch up: {s['wait_gpu_s'] / passes:.2f} s")
         text = "\n".join(lines)
         print(text)

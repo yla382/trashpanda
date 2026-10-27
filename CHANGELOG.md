@@ -3,13 +3,17 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.0.12] - 2026-10-26
 ### Added
+- A warning (once per run) when pinned memory cannot be allocated. The library then copies blocks through ordinary memory, which is slower and no longer overlaps with compute; before, this happened silently
+- `plan()` warns when the GPU part of the plan fills more than 90% of the free VRAM (`vram_fill_warn_fraction` in the config), because a GPU that runs out of memory silently spills into shared memory on Windows and every step becomes much slower. A plan that exceeds the VRAM budget still gets the existing, stronger warning, and only that one
+- The prefetch profile now shows the time of each pass through the blocks and how much of it the main thread spent waiting for staged blocks (the first five and the last two passes when there are more than ten), and how long the worker waited for a free pinned buffer. The per-pass lines show whether the waiting is concentrated in the first pass
 - `trash_panda.offload.config`, which holds the default values of the tuning settings in one place: the look-ahead depth, the number of pinned buffers, how far the GPU may lag behind the copies, the VRAM headroom and the working-area factor, the automatic RAM reserve, the margin around a measured activation size, the commit-limit warning, the thresholds for finding blocks, and the profiling switch. Each can be overridden with an environment variable named `TRASH_PANDA_<SETTING>` (for example `TRASH_PANDA_LOOKAHEAD=0`). An argument passed to a function still wins over the environment, and the environment over the shipped default
+- `examples/sdxl_benchmark.py` takes a `--lookahead` option and prints the look-ahead it used, and it runs on machines without CUDA (the Apple GPU or the CPU; only the baseline and trash-panda modes, with no peak VRAM). The path without CUDA is untested
+- `docs/pipeline-design.md`, which records the measurements and the proposals for coordinating memory and I/O across a pipeline (releasing finished stages, reading the RAM tier ahead of use, prefetching single-pass models)
 
 ### Changed
 - `plan()`, `find_blocks()` and the prefetcher now take their defaults from the config when an argument is left out (`None`). The default values themselves are unchanged
-
 ## [0.0.11] - 2026-10-23
 ### Added
 - A look-ahead queue for prefetching: the background thread now stages the next `lookahead` blocks that need a copy (default 2), not just the next one, and disk blocks are read ahead the same way. `install_offload(..., lookahead=)` and `plan(..., lookahead=)` set it; `0` turns prefetching off. A depth of 4 was no better than 2 in testing and uses more VRAM
@@ -19,7 +23,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com), versions follow 
 - `examples/disk_threads_test.py`, which measures how many MB/s a drive gives with 1, 2, 4 and 8 reader threads
 
 ### Changed
-- Blocks that are already on the GPU are no longer sent through the background thread when they run, so they cannot queue behind copies that are still waiting. This did not change the step time in our test (9.39 s to 9.26 s, within the run-to-run variation)
+- Blocks that are already on the GPU are no longer sent through the background thread when they run, so they cannot queue behind copies that are still waiting. This did not change the step time in testing (9.39 s to 9.26 s, within the run-to-run variation)
 
 ### Notes
 - On the test machine (RTX 3060, 16 GB RAM, SATA SSD) the profile shows that with 11 blocks on disk the drive's speed (about 400 MB/s) sets the floor of the step time, and more reader threads did not help

@@ -22,6 +22,7 @@ def test_the_shipped_defaults_are_the_values_the_library_used_before_the_config_
     assert (d.lookahead, d.pinned_buffers, d.blocks_in_flight) == (2, 2, 2)
     assert (d.headroom_vram, d.stream_buffer_factor) == ("1.5GB", 1.3)
     assert (d.activation_margin_fraction, d.activation_margin_min_gb) == (0.05, 0.5)
+    assert d.vram_fill_warn_fraction == 0.9
     assert (d.min_free_ram, d.ram_reserve_fraction) == ("auto", 0.08)
     assert (d.ram_reserve_min_gb, d.ram_reserve_max_gb, d.ram_reserve_unknown_gb) == (1.0, 4.0, 2.0)
     assert d.commit_warn_fraction == 0.9

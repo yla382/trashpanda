@@ -33,6 +33,7 @@ class Defaults:
     stream_buffer_factor: float = 1.3           # working area for a streamed block, as a multiple of its expanded size
     activation_margin_fraction: float = 0.05    # margin added to a measured activation size: this share of VRAM ...
     activation_margin_min_gb: float = 0.5       # ... but at least this many GiB
+    vram_fill_warn_fraction: float = 0.9        # warn when the planned GPU use in above this share of the free VRAM
 
     # RAM
     min_free_ram: str = "auto"                  # RAM kept free for the system: "auto" (below) or a size such as "2GB"

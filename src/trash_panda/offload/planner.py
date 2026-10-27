@@ -290,10 +290,18 @@ def plan(
 
     resident_bytes = sum(b.stored_bytes for b in blocks[:n_res])
     reserved = (buffer + staging) if n_res < n else (buffer if needs_expand else 0)
-    if other + resident_bytes + reserved > vram_budget:
+    planned = other + resident_bytes + reserved
+    if planned > vram_budget:
         warnings.append(
-            f"The GPU part of the plan needs {fmt_bytes(other + resident_bytes + reserved)} but the VRAM budget is "
+            f"The GPU part of the plan needs {fmt_bytes(planned)} but the VRAM budget is "
             f"{fmt_bytes(vram_budget)}; expect out-of-memory errors or slow spilling into shared memory."
+        )
+    elif hw.vram_free and planned > cfg.vram_fill_warn_fraction * hw.vram_free:
+        warnings.append(
+            f"The GPU part of the plan fills {100 * planned / hw.vram_free:.0f}% of the free VRAM "
+            f"({fmt_bytes(planned)} of {fmt_bytes(hw.vram_free)}), which leaves little room for activations. If the GPU "
+            "runs out of memory, Windows silently moves the overflow to shared memory and every step becomes much slower. "
+            "Lower resident_blocks, raise headroom_vram, or pass a measured activation_vram."
         )
 
     # -- RAM vs disk for the rest

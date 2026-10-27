@@ -266,3 +266,34 @@ def test_the_helper_counts_the_real_sizes_of_the_blocks():
     rest = [BlockPlan(f"b{i}.", stored_bytes=s) for i, s in enumerate(sizes)]
     chosen = _spread_disk_blocks(rest, 5)
     assert sum(s for i, s in enumerate(sizes) if i not in chosen) <= 5     # what stays in RAM fits the budget
+
+
+def _gpu_warnings(p):
+    return [w for w in p.warnings if "GPU part of the plan" in w]
+
+
+def test_a_plan_that_leaves_plenty_of_vram_free_does_not_warn(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    p = auto(path, hw(10 ** 9, 10 ** 9))                      # the tiny model uses a sliver of the card
+    assert _gpu_warnings(p) == []
+
+
+def test_a_plan_that_fills_the_free_vram_warns(tiny_checkpoint, monkeypatch):
+    _, path = tiny_checkpoint
+    monkeypatch.setenv("TRASH_PANDA_VRAM_FILL_WARN_FRACTION", "0.0")      # any use of the card counts as filling it
+    p = auto(path, hw(10 ** 9, 10 ** 9))
+    found = _gpu_warnings(p)
+    assert len(found) == 1 and "fills" in found[0] and "little room for activations" in found[0]
+
+
+def test_the_fill_warning_follows_the_configured_share(tiny_checkpoint, monkeypatch):
+    _, path = tiny_checkpoint
+    monkeypatch.setenv("TRASH_PANDA_VRAM_FILL_WARN_FRACTION", "2.0")      # never reached
+    assert _gpu_warnings(auto(path, hw(10 ** 9, 10 ** 9))) == []
+
+
+def test_a_plan_over_the_budget_gets_one_warning_not_two(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    p = auto(path, hw(1000, 10 ** 9), resident_blocks=4)                  # forced onto a card that cannot hold them
+    found = _gpu_warnings(p)
+    assert len(found) == 1 and "needs" in found[0] and "budget" in found[0]
