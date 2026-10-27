@@ -157,7 +157,7 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   `resident_blocks`, or set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" in the NVIDIA Control
   Panel so it fails loudly
 * **Disk blocks are limited by the speed of the drive.** Blocks on disk are read ahead of time (two blocks ahead by
-  default, `lookahead=`), which hid about a third of the read time in our tests, but a read takes much longer than
+  default, `lookahead=`), which hid about a third of the read time in testing, but a read takes much longer than
   one block's compute on a slow drive. On the test machine's SATA SSD (about 400 MB/s measured, with 1, 2, 4 or 8
   reader threads alike) a plan with 11 blocks (4.1 GB) on disk took about 16 s per step, against about 9.3 s with
   every streamed block in RAM. A deeper look-ahead (4) was no better and uses more VRAM. These are single runs

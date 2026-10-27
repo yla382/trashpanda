@@ -185,11 +185,13 @@ def run_trash_panda(args):
         print(f"{len(group.prefixes):3d} blocks, for example {group.prefixes[0]}")
 
     limit = vram_limit(args) if DEVICE == "cuda" else None      # the limit is only used on a CUDA GPU
+    extra = {} if args.lookahead is None else {"lookahead": args.lookahead}    # otherwise the library's default
     if limit is None:
-        p = plan(unet, weights, compute_dtype=COMPUTE_DTYPE)
+        p = plan(unet, weights, compute_dtype=COMPUTE_DTYPE, **extra)
     else:
-        p = plan(unet, weights, compute_dtype=COMPUTE_DTYPE, max_vram=limit, headroom_vram=0)
+        p = plan(unet, weights, compute_dtype=COMPUTE_DTYPE, max_vram=limit, headroom_vram=0, **extra)
     print(p)
+    print(f"look-ahead: {p.lookahead}")
     print(stream_load(unet, weights, plan=p, device=DEVICE))
     handle = install_offload(unet)
     unet.eval().requires_grad_(False)
@@ -241,6 +243,8 @@ def run_all(args):
     """Run every mode in its own fresh process and print a table of the results."""
     forwarded = ["--unet-vram", args.unet_vram, "--steps", str(args.steps), "--size", str(args.size),
                  "--seed", str(args.seed)]
+    if args.lookahead is not None:
+        forwarded += ["--lookahead", str(args.lookahead)]
     if args.no_warmup:
         forwarded.append("--no-warmup")
     if args.save_dir:
@@ -280,6 +284,8 @@ def main():
                         help="what to run; 'all' runs every mode in its own process; 'clean' manages the download")
     parser.add_argument("--unet-vram", default="3GB",
                         help="limit on the UNet's weights on the GPU for accelerate and trash-panda; 'none' for no limit")
+    parser.add_argument("--lookahead", type=int, default=None,
+                        help="trash-panda only: how many blocks ahead to copy (0 turns prefetching off); default is the library's")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--size", type=int, default=1024, help="width and height of the image")
     parser.add_argument("--seed", type=int, default=1234)

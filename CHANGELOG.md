@@ -7,7 +7,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com), versions follow 
 
 ## [0.0.11] - 2026-10-23
 ### Added
-- A look-ahead queue for prefetching: the background thread now stages the next `lookahead` blocks that need a copy (default 2), not just the next one, and disk blocks are read ahead the same way. `install_offload(..., lookahead=)` and `plan(..., lookahead=)` set it; `0` turns prefetching off. A depth of 4 was no better than 2 in our tests and uses more VRAM
+- A look-ahead queue for prefetching: the background thread now stages the next `lookahead` blocks that need a copy (default 2), not just the next one, and disk blocks are read ahead the same way. `install_offload(..., lookahead=)` and `plan(..., lookahead=)` set it; `0` turns prefetching off. A depth of 4 was no better than 2 in testing and uses more VRAM
 - Back-pressure: the GPU is not allowed to fall more than two blocks behind the copies, so staged blocks cannot pile up in VRAM
 - `plan()` reserves VRAM for the blocks staged ahead (`Plan.staging_bytes`, `Plan.lookahead`) and lists it in the summary, and spreads the disk blocks evenly through the model (`spread_disk=True`) so reads are not bunched together
 - Opt-in prefetch profiling: `install_offload(..., profile=True)` or `TRASH_PANDA_PROFILE=1` prints, at exit, how long the worker spent on disk reads and RAM copies, how long the main thread waited for staged blocks (with how many were ready at once and the five slowest waits by block position) and for the GPU

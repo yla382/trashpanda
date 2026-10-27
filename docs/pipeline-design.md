@@ -1,310 +1,348 @@
-# Pipeline coordination: design notes
+# Pipeline coordination
 
-Status: **ideas and measurements, not a design that is built.** Written after the 0.0.11 session so we can come back
-to it. Everything marked *measured* comes from runs on one machine (see below). Everything marked *hypothesis* has
-not been checked. Nothing here is promised or scheduled.
+**Status:** draft. Proposals and measurements; nothing in sections 7 and 8 is implemented.
+**Applies to:** trash-panda 0.0.11.
+**Conventions:** *Measured* means taken from instrumented runs on the machine in section 3. *Observed* means seen
+during repeated runs but not timed. *Hypothesis* means not yet verified. All measurements are single runs unless stated.
 
-## 1. Why this document exists
+## 1. Summary
 
-trash-panda plans and runs **one model at a time**. Real pipelines have several large models in a row (text encoder,
-diffusion model, VAE), and the memory and the drive are shared between them. Most of the problems we found in the
-last session sit **between** the stages, not inside the copy path:
+trash-panda currently plans, loads and runs one model at a time. Image and video pipelines run several large models in
+sequence (text encoder, diffusion model, VAE) that share the same GPU memory, system RAM and drive. Profiling the
+0.0.11 prefetcher showed that the largest remaining costs are not in the per-block copy path. They are at the
+boundaries between stages: cold reads on first use, memory held by finished models, and overflow of GPU memory during
+the decode.
 
-- GPU memory spilling into shared system memory (11.6 to 11.8 GB used) and a headroom default that was too thin.
-- A shared-memory overflow after sampling at 2K, probably during the VAE decode.
-- An encoder that is read at disk speed once per prompt, with nothing prefetched.
-- Idle resident blocks and an idle encoder holding memory that the next stage could use.
+This document records the current behavior, the measurements, and a set of proposals to coordinate memory and I/O across
+a pipeline: release finished stages, overlap loading with computation, and plan each stage from the memory that will
+actually be free.
 
-The idea: plan the whole pipeline together, release what is done, and overlap loading one stage with running another.
+## 2. Problem statement
 
-How the prefetching and read-ahead work today is described in Appendix A.
+The following problems occur in a Krea2 pipeline (12B diffusion transformer, 4B text encoder, VAE) on a 12 GB GPU:
 
-## 2. The test machine and the model
+1. **The first sampling step is much slower than the rest.** Step 1 takes about 20 to 30 s while later steps are
+   faster (observed). GPU utilization is low during most of step 1 (observed).
+2. **A single-pass model is not prefetched.** The text encoder is copied at about disk speed (0.4 GB/s) with no block
+   ready in advance (measured).
+3. **Finished stages keep their memory.** Nothing releases a model when its stage ends. Resident blocks of the
+   diffusion model stay on the GPU during the VAE decode (by design), and the encoder keeps its RAM and VRAM during
+   sampling.
+4. **GPU memory overflows into shared memory after sampling at 2K** (observed). The cause is not confirmed.
+5. **The planner sees one model.** It reads the memory that is free at the moment `plan()` is called and has no
+   knowledge of other models, so the result depends on the order in which models are loaded and released.
+
+## 3. Test setup
 
 | | |
 |---|---|
 | GPU | NVIDIA GeForce RTX 3060, 12 GB |
 | RAM | 16 GB |
-| Storage | SATA SSD, about 400 MB/s measured (500 MB/s on paper) |
+| Storage | SATA SSD, about 400 MB/s measured (500 MB/s nominal) |
 | OS | Windows 11 Home |
 | CPU / Python / PyTorch | Ryzen 7 3700X / 3.9.6 / 2.5.1 (CUDA 12.1) |
 
-Krea2 pipeline (sizes are approximate, taken from the plan summaries):
-
 | Model | Size | Notes |
 |---|---|---|
-| Diffusion transformer, 12B, fp8 with scales | about 13 GB | 32 blocks. Uncapped plan: 12 resident (5.2 GB), 20 streamed from RAM (7.3 GB), 0.6 GB outside the blocks |
-| Text encoder, 4B, fp8 | about 4 GB | 36 blocks, 3.63 GB per pass, runs once per prompt |
-| VAE | well under 1 GB (a guess) | decodes once |
-| Total | about 17 GB | more than the 16 GB of RAM, more than the 12 GB of VRAM |
+| Diffusion transformer, 12B, fp8 with scales | about 13 GB | 32 blocks. Auto plan: 12 resident (5.2 GB), 20 streamed from RAM (7.3 GB), 0.6 GB outside the blocks |
+| Text encoder, 4B, fp8 | about 4 GB | 36 blocks, 3.63 GB per pass, one pass per prompt |
+| VAE | under 1 GB (estimate) | one decode per image |
+| Total | about 17 GB | exceeds both the 16 GB of RAM and the 12 GB of VRAM |
 
-## 3. What we measured (0.0.11, single runs, so indicative only)
+## 4. Measurements
 
-Run-to-run variation is about 0.5 s per step, because the free RAM at the start differs between runs (5.6 to 6.6 GB).
-Do not read differences under that into anything.
+Step-time variation between nominally identical runs is about 0.5 s, because the free RAM at the start differs (5.6 to
+6.6 GB). Differences smaller than that are not significant.
 
-**Look-ahead depth (RAM and disk blocks):**
+### 4.1 Look-ahead depth
 
 | Plan | Look-ahead | Step time |
 |---|---|---|
-| Same plan, all streamed blocks in RAM | 0 / 2 | 10.50 s / 9.15 s (about 13% faster) |
-| 13 resident, `max_ram="5.3GB"`, 11 blocks (4.1 GB) on disk | 0 | 18.97 s |
-| the same | 2 | 15.83 s |
-| the same | 4 | 16.47 s and 16.24 s |
+| All streamed blocks in RAM | 0 / 2 | 10.50 s / 9.15 s (13% faster) |
+| 13 resident, RAM capped at 5.3 GB, 11 blocks (4.1 GB) on disk | 0 | 18.97 s |
+| same | 2 | 15.83 s |
+| same | 4 | 16.47 s, 16.24 s |
 
-**Profile of the capped plan (look-ahead 4), per step of 16.24 s:**
+### 4.2 Profile, capped plan (look-ahead 4), 16.24 s per step
 
-- Worker, disk reads: 4.10 GB in 10.99 s (374 MB/s).
-- Worker, RAM copies: 2.80 GB in 1.48 s.
-- Main thread waited for staged blocks: 10.32 s. Only 54 of 224 were ready (224 counted resident blocks too; see below).
-- Main thread waited for the GPU: 0.17 s.
-- The worker's own work adds up to about 12.5 s, so it was idle about 3.7 s per step. **Cause unknown.**
+| Quantity | Value |
+|---|---|
+| Worker, disk reads | 4.10 GB in 10.99 s (374 MB/s) |
+| Worker, RAM copies | 2.80 GB in 1.48 s |
+| Main thread waiting for staged blocks | 10.32 s per step |
+| Main thread waiting for the GPU | 0.17 s per step |
+| Worker busy time (reads plus copies) | about 12.5 s; idle about 3.7 s. Cause unknown |
 
-**Profile of the uncapped plan (look-ahead 2), 9.26 to 9.83 s per step:**
+### 4.3 Profile, auto plan (look-ahead 2), 9.26 to 9.83 s per step
 
-- RAM copies: 7.34 GB per step in 3.5 to 3.9 s (1.9 to 2.1 GB/s).
-- Main thread waited 2.8 to 3.1 s per step. 119 of 140 streamed takes were ready (85%).
-- The slowest waits were scattered through the pass (blocks 16, 17, 25, 27, 28), each late in only 1 of 7 passes, so each
-  was a stall of roughly 1 to 3 s. A RAM copy takes about 0.11 s, so these are not normal copies.
-- **Inference (not measured):** 21 of the 140 streamed takes were late, and the main thread waited 21.6 s in total, so
-  about 1 s per late take. A cold read of one 0.37 GB block at 400 MB/s takes about 0.9 s. With 20 streamed blocks and
-  each slow block late in exactly 1 of 7 passes, this fits the first pass reading the file-backed RAM tier from disk on
-  first use. If so, nearly all the waiting is in step 1: a steady step would be about 6.2 s and the first about 28 s,
-  and the 9.3 s average hides both. A per-step timer would settle it.
+| Quantity | Value |
+|---|---|
+| Worker, RAM copies | 7.34 GB per step in 3.5 to 3.9 s (1.9 to 2.1 GB/s) |
+| Main thread waiting for staged blocks | 2.8 to 3.1 s per step; 119 of 140 streamed blocks ready |
+| Slowest waits | blocks 16, 17, 25, 27, 28; each late in 1 of 7 passes; 1 to 3 s each |
 
-**Drive speed (`examples/disk_threads_test.py`, cold slices of a 9.6 GB file):** 429, 397, 395, 412 and 384 MB/s for
-1, 2, 4, 8 and 1 threads. More reader threads do not help. The library's 374 MB/s is about 93% of the drive.
+A RAM copy of one block takes about 0.11 s, so the late blocks are not ordinary copies. 21 streamed blocks were late and
+the main thread waited 21.6 s in total, which is about 1 s per late block. Reading one 0.37 GB block cold from the drive
+takes about 0.9 s. With 20 streamed blocks, each slow block late in exactly one pass, and step 1 observed at 20 to
+30 s, the data is consistent with the first pass reading the file-backed RAM tier from disk (section 7.7). If that holds,
+a steady-state step is about 6.2 s and the first about 28 s. This is an inference; a per-step timer would confirm it.
 
-**Text encoder, one pass:** 3.63 GB copied in 8.6 to 9.6 s (0.4 GB/s), 0 of 36 blocks ready, main thread waited 8.7 to
-9.7 s. This is about disk speed, though the blocks are meant to be in RAM.
+### 4.4 Drive throughput
 
-**Resident blocks went through the worker queue** (a bug found by the profile: 224 takes per run instead of 140). Fixing
-it was correct, but the step time did not change (9.39 s to 9.26 s, within the variation).
+Cold slices of a 9.6 GB file read with 1, 2, 4, 8 and 1 threads: 429, 397, 395, 412 and 384 MB/s. Additional reader
+threads do not increase throughput. The prefetcher reaches about 93% of this rate.
 
-**Observed, not measured:** at 2K images, shared GPU memory sometimes overflows after sampling is done.
+### 4.5 Text encoder
 
-## 4. What the measurements say
+One pass: 3.63 GB copied in 8.6 to 9.6 s (0.4 GB/s), 0 of 36 blocks ready when requested, 8.7 to 9.7 s spent waiting.
+This is the rate of the drive, although the blocks are assigned to the RAM tier.
 
-1. With blocks on disk, the **drive's speed sets the floor**. Reading 4.1 GB at about 400 MB/s is 10 to 11 s, and no
-   amount of prefetching or threading goes below it. Look-ahead 2 hides about a third of the read time.
-2. Look-ahead 4 is no better than 2 and costs about 1.1 GB more VRAM. Depth 2 stays the default.
-3. With every streamed block in RAM, the GPU does about 6 s of work per step and waits 2.8 to 3.1 s. The profile cannot
-   say why.
-4. The step time is not the whole story. Model loading, prompt encoding and the decode are not in the timed bar.
+### 4.6 Other results
 
-## 5. Ideas
+- Blocks already on the GPU were being routed through the prefetch queue. Removing this reduced the number of staged
+  takes from 224 to 140 per run. Step time was unchanged (9.39 s to 9.26 s, within variation).
+- At 2K output, shared GPU memory sometimes overflows after sampling finishes (observed, not measured).
 
-### A. Release a stage when it is done (by hand first)
+## 5. Analysis
 
-Today nothing releases a model for you. `handle.remove()` removes the hooks and frees the pinned buffers, and you have
-to `del` the model and call `gc.collect()` and `torch.cuda.empty_cache()` yourself. The planner only sees the memory
-that is free at the moment you call `plan()`, and does not know other models exist.
+1. With blocks on disk, drive throughput sets a floor. Reading 4.1 GB at about 400 MB/s takes 10 to 11 s per step, and
+   prefetching or additional threads cannot reduce it. Look-ahead 2 hides about one third of the read time.
+2. Look-ahead 4 is not faster than 2 and reserves about 1.1 GB more VRAM. The default stays at 2.
+3. In the auto plan the GPU computes for about 6 s per step. The remaining 2.8 to 3.1 s of the average is waiting that
+   is concentrated in a few late blocks, not spread across all of them.
+4. The timed sampling bar excludes model loading, prompt encoding and decoding, so step time understates the cost of a
+   cold run.
 
-Test by hand before building anything: encode the prompt, release the encoder, then plan the diffusion model.
-Compare the plan summary, step time and wait line against keeping the encoder, on a tight-RAM plan.
+## 6. Design principles
 
-*Limit:* a Python process often keeps memory after `del`, so the release may not give everything back on Windows.
-A reload costs a cold read of the encoder (about 9 s) if the prompts change.
+**Single-pass versus looped models.** An encoder or VAE uses each layer once, so a layer can be released as soon as it
+has computed. A diffusion model or a language model reuses every block on each step or token, so an evicted block is
+fetched again each time. The value of keeping a block resident grows with the number of repetitions: with 7 steps a
+resident block saves 7 copies per image, with 30 steps it saves 30.
 
-### B. `release_gpu()` / `restore_gpu()` on the handle
+**Location of the weights bounds what overlap can achieve.** From RAM, 7 GB crosses PCIe in about a second, so there is
+little to hide. From disk, 13 GB takes about 33 s at 400 MB/s, while the compute that can overlap with it (encoder, first
+sampling step) is a few seconds.
 
-Move the resident blocks off the GPU but keep the hooks, and move them back before the next generation. Loop:
-sample, release, decode, restore. Costs not yet measured: the time to put 5.2 GB back for each image, and the RAM the
-blocks need while they are off the GPU. The planner would have to count that RAM.
+**The drive is a single shared resource.** Loading one model while another streams from disk divides the same
+bandwidth. When the drive is the limit, reading further ahead only consumes memory.
 
-### C. Release during the last pass
+**Compute never runs on missing weights.** When the GPU is ahead of the loading, the main thread blocks until the
+staged copy has been issued and the compute stream waits for its completion event. The scheduling decisions are the
+order of reads (needed-first), which blocks stay resident, and the read-ahead depth.
 
-On the last sampling step each block is used for the last time, so it can be freed as soon as it finishes. The VRAM is
-then already free when the VAE decode starts (the VAE needs the final latent, so it cannot start earlier), which is
-the fix for the 2K overflow without a pause between the stages. The library does not know which pass is last. The
-sampler would have to say so (`handle.final_pass()` or a call from the step callback; `diffusers` has
-`callback_on_step_end`). A second image needs the blocks restored (see B).
+## 7. Proposals
 
-### D. Prefetch single-pass models from the first block
+### 7.1 Release a stage when it finishes
 
-The prefetcher learns the block order during the first pass. A text encoder or VAE has one pass, so nothing is
-prefetched. Give the prefetcher the block order up front. Then a single-pass model is read ahead like a disk-tier
-model. Gain: total time becomes about `max(read, compute)` instead of `read + compute`. Reading is bound by the drive,
-so the gain is small for a small encoder and larger for a big one.
+*Current behavior.* `handle.remove()` removes the hooks and frees the pinned buffers. Releasing memory also requires
+deleting the model and calling `gc.collect()` and `torch.cuda.empty_cache()`. The planner reads only the memory that is
+free when `plan()` runs.
 
-### E. Overlap stages (preload the next model)
+*Proposal.* Run the stages in order (encode, release, plan and load the diffusion model, sample, release, decode) and
+plan each stage from the memory that is free at that point. First validate by hand, then provide a helper that performs
+the sequence and reports memory before and after.
 
-While the encoder runs, load as much of the diffusion model as there is spare VRAM and RAM for. When the encoder is
-done, release it and start sampling with what has arrived while the rest keeps loading. The same for the VAE during
-sampling. This needs:
+*Risks.* A Python process often retains memory after `del`, so the release may not return all of it on Windows. If
+prompts change between images, a released encoder must be read again cold (about 9 s).
 
-- staged planning (A to C),
-- a plan that **predicts** the memory that will be free after a stage,
-- blocks that can change from streamed to resident while running (today a block's tier is fixed at load time),
-- care about the drive, which is shared: preloading competes with an encoder that reads from disk.
+*Validation.* On a RAM-constrained plan, compare plan summary, step time and wait time with and without releasing the
+encoder before planning.
 
-### F. A cost model and a smarter planner
+### 7.2 `release_gpu()` and `restore_gpu()`
 
-Choose depth, residency and the order of reads from measured disk speed, PCIe speed and compute time per block.
-Planner items, in the order we think they pay off (they are also in the README roadmap):
+*Proposal.* Move the resident blocks off the GPU while keeping the hooks installed, and move them back before the next
+generation: sample, release, decode, restore.
+
+*Unknowns.* The time to restore 5.2 GB per image and the RAM the blocks occupy while off the GPU, which the planner
+would have to account for.
+
+### 7.3 Release during the last pass
+
+*Proposal.* On the final sampling step each block is used for the last time and can be freed as soon as it finishes, so
+the VRAM is available when the decode starts (the decode needs the final latent and cannot start earlier). This removes
+the pause between stages and is the expected fix for the 2K overflow.
+
+*Interface.* The sampler owns the step count, so the library cannot detect the last pass. A call such as
+`handle.final_pass()` from the step callback would signal it; `diffusers` provides `callback_on_step_end`. Generating a
+second image requires the blocks to be restored (7.2).
+
+### 7.4 Prefetch single-pass models from the first block
+
+*Current behavior.* The prefetcher learns the block order during the first pass. A single-pass model never benefits.
+
+*Proposal.* Supply the block order when the hooks are installed, so a single-pass model is read ahead like a disk-tier
+model. Total time becomes approximately `max(read, compute)` instead of `read + compute`. Because reading is bound by
+the drive, the gain is small for a small encoder and larger for an encoder of several billion parameters.
+
+### 7.5 Overlap stages
+
+*Proposal.* While the encoder runs, load the part of the diffusion model that fits in spare VRAM and RAM. When the
+encoder finishes, release it and begin sampling with the blocks already present while loading continues. Overlap the
+VAE with the final sampling steps in the same way.
+
+*Requirements.* Staged planning (7.1 to 7.3); a plan that predicts the memory that will be free after each stage;
+blocks that change from streamed to resident while running (a block's tier is currently fixed at load time); and
+scheduling that accounts for the encoder and the preload sharing the drive.
+
+*Bound.* The reads happen once and take about 43 s for 17 GB at 400 MB/s. Overlap can hide only the compute that runs
+during that period: the encoder (a few seconds) and the first sampling step (about 6 s). From step 2 onward all blocks
+are already in memory, so no further reads remain to overlap. The expected saving is roughly 10 to 15 s of a cold run of
+about 110 s, and close to nothing on a warm run.
+
+### 7.6 Cost model and planner changes
+
+Choose read-ahead depth, residency and the order of reads from measured drive speed, PCIe speed and per-block compute
+time. Planner work in priority order:
 
 1. Warn when a plan fills almost all of the GPU (the overflow is silent and slow).
-2. Measure the activation size automatically and base the default headroom on it (1.5 GB is too thin).
-3. Plan in stages (A to C).
-4. Take memory held by other loaded models into account, or warn.
-5. A KV-cache budget for language models.
+2. Measure the activation size automatically and derive the default headroom from it (the fixed 1.5 GB is too small at
+   larger resolutions).
+3. Staged planning (7.1 to 7.3).
+4. Account for memory held by other loaded models, or warn.
+5. KV-cache budget for language models.
 
-### G. First-use stalls on the RAM tier
+### 7.7 First-use reads of the RAM tier
 
-*Hypothesis:* the RAM tier is mapped from the checkpoint file, so Windows reads a block from disk the first time it is
-touched. That would put the long stalls in the first pass and explain the encoder's 0.4 GB/s. If so, read those pages
-into memory once when the hooks are installed. Test: show the wait for each pass separately.
+*Hypothesis.* The RAM tier is mapped from the checkpoint file, so a block's pages are read from disk the first time it
+is used. This would place the long waits in the first pass, explain the observed slow first step, and explain the
+encoder's 0.4 GB/s.
 
-### H. More pinned buffers
+*Proposal.* Touch the RAM-tier pages once in a background thread when the hooks are installed. This moves the cost
+before sampling and overlaps it with whatever else the program does; it does not remove it. The tier should remain
+file-backed: copying it into ordinary memory would restore the "paging file too small" failure that file-backed mapping
+avoids.
 
-There are two pinned buffers. *Hypothesis:* the idle worker in the capped plan is waiting for a free buffer. Test: time
-the wait for a buffer; then make the count an option and try 3 or 4 (about 0.4 GB of RAM each).
+*Validation.* Record the time of every step and the prefetch wait per pass. If pass 1 holds nearly all of the wait, the
+hypothesis is confirmed.
 
-## 6. Rules that fell out of the discussion
+### 7.8 Number of pinned buffers
 
-- **Single pass versus loop.** An encoder or VAE runs each layer once, so a layer can be dropped right after it
-  computes. The diffusion model runs the same blocks every step, so what is evicted is paid for again every step.
-  Keep as many blocks resident as fit and stream only the rest. The value of a resident block grows with the number of
-  steps (7 steps means 7 copies saved per image, 30 steps means 30). Language models behave like the loop.
-- **Where the weights live decides what overlap can do.** From RAM, moving 7 GB over PCIe takes about a second, so
-  there is little to hide. From disk, 13 GB takes about 33 s at 400 MB/s, and the encoder's few seconds of compute hide
-  only a small part of it.
-- **The drive is one shared resource.** Loading and streaming must share it. When the drive is the limit, reading
-  further ahead only uses memory.
-- **What if the GPU is faster than the loading?** It already waits: `take` blocks until the copy is done, and the
-  compute stream waits for the copy's event, so a layer never runs on missing weights. The scheduling question is the
-  order of reads (needed-first), which blocks stay resident, and how deep to read ahead (depth does not matter when
-  the drive is the limit).
+The pool has a fixed size of 2, while the VRAM staging area scales with the look-ahead. *Hypothesis:* the idle time of
+the worker in the capped plan (section 4.2) is spent waiting for a free buffer. *Validation:* time the wait for a
+buffer, then make the count configurable and test 3 and 4 (about 0.4 GB of RAM each).
 
-## 7. The Krea2 scenario
+## 8. Scenario: cold Krea2 run
 
-Cold run (nothing cached), at the drive's real 400 MB/s, rough numbers:
+Estimated at the measured drive rate of 400 MB/s (not measured end to end):
 
-| Stage | Roughly |
+| Stage | Duration |
 |---|---|
-| Read the encoder (4 GB) | 10 s |
-| Encode the prompt | a few s |
-| Read the transformer (13 GB) | 33 s |
+| Read the encoder (4 GB) | about 10 s |
+| Encode the prompt | a few seconds |
+| Read the transformer (13 GB) | about 33 s |
 | Sampling, 7 steps | about 65 s |
-| VAE load and decode | a few s |
+| VAE load and decode | a few seconds |
 | **Total** | **about 110 to 115 s** |
 
-- The reads (17 GB, about 43 s) are bound by the drive. Overlap cannot shorten them.
-- Overlap can hide the compute beside them: the encoder's few seconds and the first sampling step (about 6 s).
-  Estimate: 10 to 15 s, about 10% of a cold run, and almost nothing on a warm one.
-- The larger effect is on the memory side: freeing the encoder lets the transformer have more resident blocks, which
-  avoids a copy on every step, and avoids the decode overflow.
-- A bigger encoder (several billion parameters, as in some recent pipelines; sizes from memory, check them) would
-  raise the share that overlap can hide, and is the right scenario to test the idea on.
+- The 17 GB of reads (about 43 s) are bound by the drive.
+- Overlap saves roughly 10 to 15 s (7.5).
+- Freeing the encoder lets the transformer keep more blocks resident, which avoids a copy per block on every step, and
+  removes the cause of the decode overflow. These memory effects are expected to matter more than overlap.
+- A larger encoder (some current pipelines use text encoders of several billion parameters; sizes to be verified for
+  the models of interest) increases the share that can be overlapped and is the appropriate case for validating 7.4
+  and 7.5.
 
-The user's proposal, in short: with 12 GB of VRAM, load the 4 GB encoder and run it; as each layer finishes, free it and
-load transformer blocks into the space; once the encoder is done, sample with what has arrived while the rest keeps
-loading; do the same for the VAE during sampling. It is sound, with two corrections: only single-pass models are
-evicted layer by layer, and the encoder's compute is too short to hide a disk load.
+## 9. Validation plan
 
-## 8. Experiments, in order
+Each step provides evidence for the next.
 
-Each step gives evidence before the next.
+1. **Per-step timing and per-pass wait.** Record the time of every step (the first separately) and the prefetch wait per
+   pass. Confirms or rejects 7.7 and changes the interpretation of the other averages.
+2. **Stage timeline.** Time each stage of a complete run: load encoder, encode, plan and load the transformer, sampling,
+   VAE load and decode. Gives the first whole-pipeline number.
+3. **Manual release.** Release the encoder before planning on a RAM-constrained plan (7.1), and release the transformer
+   before the decode at 2K (7.3 by hand). Check whether the overflow disappears.
+4. **Pinned buffer wait.** Time the wait for a buffer and test 3 and 4 buffers (7.8).
+5. **Decide the implementation** from the results: a release helper (7.2, 7.3), block order up front (7.4), or both.
 
-0. **Time every step** (the first step apart from the rest) and show the profile's wait for each pass. This is the
-   cheapest test and may change the reading of every other number here (see the inference in section 3).
-1. **Time the stages** of one Krea2 run (load encoder, encode, plan and load the transformer, sampling, VAE
-   load and decode) with `time.perf_counter()` around each, and the profile on. This gives the first whole-pipeline
-   number.
-2. **Release by hand** between the stages on a tight-RAM plan (A), and after sampling before the decode at 2K (C by
-   hand). Does the shared-memory overflow go away?
-3. **Add a wait line per pass** to the profile (G). Are the long stalls all in pass 1?
-4. **Time the worker's wait for a free pinned buffer** (H), then make the buffer count an option.
-5. **Then decide** what to build: a release helper (B, C), the block order up front for single-pass models (D), or both.
+The benchmark method should be extended in parallel: record per-step times, fix the plan and change one variable per
+comparison, repeat each setting three times in alternating order and report the median, and label cold and warm cache
+runs. A script in `examples/` that works with any model would serve this purpose.
 
-A better benchmark method belongs here too: record the time of every step (first step apart from the rest), fix the
-plan and change one thing per comparison, repeat each setting three times in alternating order and report the median,
-and label cold and warm cache runs. It could be a small script in `examples/` that works for any model.
+## 10. Open questions and risks
 
-## 9. Open questions and risks
+- How much memory does a released model return on Windows?
+- What is the cost of restoring the resident blocks for each image, and of keeping them in RAM meanwhile?
+- Can a block change tier while running without invalidating the hooks and the plan?
+- Does preloading help when the encoder itself reads from disk, or do the two compete for the drive?
+- More concurrent activity may increase the likelihood of the unexplained process exits seen at high RAM usage.
+- Is the 2K overflow caused by the decode running while the resident blocks are still on the GPU? Not confirmed.
+- The prefetching is CUDA-only. On a machine with unified memory (Apple silicon) splitting a model between GPU and
+  RAM frees nothing. Untested.
 
-- How much RAM does a released model really give back on Windows?
-- What does restoring 5.2 GB of resident blocks cost per image, and how much RAM does keeping them cost?
-- Can a block change tier while running without breaking the hooks and the plan?
-- Does preloading help when the encoder reads from disk, or do they just fight for the drive?
-- More things moving at once may make the unexplained silent exits at high RAM more likely.
-- Is the 2K overflow really the VAE decode with the resident blocks still on the GPU? Not confirmed.
-- Other devices: the prefetching is CUDA-only. A Mac has unified memory, so splitting a model between GPU and RAM
-  frees nothing there. Untested.
+## 11. Limits of the evidence
 
-## 10. What is not claimed
+- None of the proposals is implemented, and none has a measured gain. The scenario figures are estimates.
+- Section 4 consists of single runs on one machine; differences under about 0.5 s per step are within the variation.
+- Look-ahead 2 against 0 is a 13% to 17% gain in the test runs. Compared with the earlier 0.0.8 on the all-RAM plan
+  there was no change, because that plan was already close to its limit.
 
-- None of the ideas above is built, and none has a measured gain. The Krea2 scenario numbers are estimates.
-- The numbers in section 3 are single runs on one machine. A gap under about 0.5 s per step is within the variation.
-- Look-ahead 2 against 0 is a 13% to 17% gain in our runs. Against the earlier 0.0.8 on the all-RAM plan there was no
-  change, because that plan was already near its limit.
+## Appendix A. Prefetching and read-ahead in 0.0.11
 
-## Appendix A. How prefetching and read-ahead work today
+Prefetching (blocks in RAM) and read-ahead (blocks on disk) are one mechanism with two ways of filling the same staging
+buffer.
 
-Prefetching (blocks in RAM) and read-ahead (blocks on disk) are one mechanism with two ways of filling the same
-staging buffer. This describes version 0.0.11.
+### A.1 Tiers
 
-### A.1 The three tiers
+- **GPU tier.** The first blocks of the model, as many as the VRAM budget allows. Their compact weights (fp8 and
+  scales) stay on the GPU. They are still wrapped by the hooks because every use expands fp8 to the compute dtype.
+  Resident means compact on the GPU, not ready to use.
+- **RAM tier.** Compact weights in CPU memory, file-backed (mapped from the checkpoint), so the operating system may
+  drop them and read them again from the file instead of writing them to the page file.
+- **Disk tier.** Not loaded. A reader reads the block's tensors from the checkpoint on every use.
+- The planner selects as few disk blocks as are needed for the remaining blocks to fit the RAM budget and spaces them
+  evenly among the streamed blocks, so each read has other blocks' compute beside it.
 
-- **GPU tier.** The first blocks of the model, as many as the VRAM budget allows. Their compact weights (fp8 plus
-  scales) stay on the GPU permanently. They are still wrapped by the hooks, because every use has to expand fp8 to the
-  compute dtype. "Resident" means compact on the GPU, not ready to use.
-- **RAM tier.** Compact weights in CPU memory. They stay file-backed (mapped from the checkpoint), so Windows may drop
-  them and read them again from the file instead of writing them to the page file.
-- **Disk tier.** Not loaded at all. A reader reads the block's tensors from the checkpoint file each time.
-- The planner chooses as few disk blocks as it takes for the remaining blocks to fit the RAM budget, and spaces them
-  evenly among the streamed blocks, so each disk read has other blocks' compute next to it to hide behind.
+### A.2 Execution of a wrapped block
 
-### A.2 What happens when a wrapped block runs
-
-1. The block is linked to the one that ran before it, which builds the order of execution.
-2. The hook waits if two earlier blocks are still running on the GPU, so work cannot pile up.
+1. The block is linked to the block that ran before it, which builds the execution order.
+2. The hook waits if two earlier blocks are still running on the GPU, to prevent work from accumulating.
 3. The block's weights are taken from the staging queue, waiting for the background thread if they are not ready. If
-   nothing was staged and the block needs a copy, it is staged on the spot. The compact weights are then expanded to
-   the compute dtype and placed in the module's parameters.
+   nothing was staged and the block needs a copy, it is staged immediately. The compact weights are expanded to the
+   compute dtype and placed in the module's parameters.
 4. The next blocks that need a copy (as many as the look-ahead) are queued for staging.
-5. The block's real forward runs.
-6. In every case, the compact originals are put back, which frees the expanded copy, and an event marks the end of the
+5. The block's forward runs.
+6. In all cases the compact originals are restored, which frees the expanded copy, and an event marks the end of the
    block's work on the compute stream.
 
-### A.3 The prefetcher
+### A.3 Prefetcher
 
-- **One background thread** runs the staging jobs in the order they were queued.
-  - A RAM job copies each of the block's tensors into a pinned buffer, then starts an asynchronous copy to the GPU on
-    a second CUDA stream.
-  - A disk job reads the file straight into the pinned buffer, then starts the same copy.
-- The data always travels disk, then a pinned RAM buffer, then VRAM. The buffer is a short stop and is reused; a disk
-  block does not become a RAM-tier block.
-- Taking a staged block has two waits: for the thread to finish *issuing* the job (the memory copy or the file read),
-  then for the compute stream to wait for the GPU copy's event.
-- **The pinned pool** has 2 buffers, handed out in turn. A buffer is reused only after the GPU copy that read from it
-  has finished. If pinned memory cannot be allocated, the job falls back to unpinned memory, which is not truly
-  asynchronous. With prefetching off, or on a device without CUDA, a disk block is simply read when it is needed.
-- Blocks that are already on the GPU never go through the thread.
+- One background thread executes staging jobs in the order they were queued.
+  - A RAM job copies each tensor of the block into a pinned buffer and starts an asynchronous copy to the GPU on a
+    second CUDA stream.
+  - A disk job reads the file directly into the pinned buffer and starts the same copy.
+- Data always moves disk, then a pinned RAM buffer, then VRAM. The buffer is a reused waypoint; a disk block does not
+  become a RAM-tier block.
+- Taking a staged block involves two waits: for the thread to finish issuing the job (the memory copy or the file
+  read), and for the compute stream to wait for the GPU copy's completion event.
+- The pinned pool holds 2 buffers, used in turn. A buffer is reused only after the GPU copy that read from it has
+  finished. If pinned memory cannot be allocated, the job falls back to unpinned memory, which is not fully
+  asynchronous. With prefetching disabled, or without CUDA, a disk block is read when it is needed.
+- Blocks already on the GPU do not pass through the thread.
 
-### A.4 What the planner reserves for this
+### A.4 Memory reserved by the planner
 
 | Where | Reserve | Size |
 |---|---|---|
-| VRAM | working area for the block that is computing (the expanded copy) | 1.3 x the largest expanded block (1.13 GB in the Krea2 plan) |
+| VRAM | working area for the executing block (expanded copy) | 1.3 x the largest expanded block (1.13 GB in the Krea2 plan) |
 | VRAM | staging area for blocks copied ahead | look-ahead x the largest compact block (868 MB at depth 2) |
-| VRAM | headroom for activations and everything else | 1.5 GB by default, or a measured activation size plus a margin |
-| RAM | pinned buffers | 2 x the largest block outside the GPU, counted in the RAM budget |
+| VRAM | headroom for activations and other use | 1.5 GB by default, or a measured activation size plus a margin |
+| RAM | pinned buffers | 2 x the largest block outside the GPU, deducted from the RAM budget |
 | RAM | system reserve | 8% of RAM, between 1 and 4 GB by default |
 
-The VRAM staging scales with the look-ahead, but the number of pinned buffers is fixed at 2, whatever the depth.
+VRAM staging scales with the look-ahead; the number of pinned buffers is fixed at 2 for every depth.
 
-### A.5 What follows from this
+### A.5 Consequences
 
-1. **The order of blocks matters.** Resident blocks come first, then the streamed ones. Queueing the next streamed blocks
-   skips blocks that need no copy, so from the first block of a pass the first streamed blocks are already being
-   staged, with all the resident compute as cover. The start of a pass is therefore not where the stalls are.
-2. **Resident blocks pay the expansion on every step.** Expanding fp8 to the compute dtype happens on the compute
-   stream and is not overlapped with anything.
-3. **Later streamed blocks have little cover.** Each block after the first two is queued only about two blocks of
-   compute (about 0.4 s) before it is needed. That is enough for a RAM copy (about 0.11 s) and not for a disk read
-   (about 1 s).
-4. **One thread serves everything in order,** so a slow disk read in front delays the RAM blocks behind it.
-5. **The first use of a RAM-tier block may read the file.** Because the RAM tier is file-backed, the memory copy of a
-   block that is not resident in memory becomes a disk read. This is the likely cause of the late blocks in the all-RAM
-   profile (see the inference in section 3).
+1. **Block order.** Resident blocks come first and streamed blocks follow. Queueing skips blocks that need no copy, so
+   from the first block of a pass the first streamed blocks are already staged, with all the resident compute as
+   cover. The boundary between passes is therefore not where the waits occur.
+2. **Expansion cost.** Resident blocks pay the fp8 expansion on every step. It runs on the compute stream and is not
+   overlapped with anything.
+3. **Limited cover for later blocks.** Each streamed block after the first two is queued about two blocks of compute
+   (roughly 0.4 s) before it is needed. That covers a RAM copy (about 0.11 s) but not a disk read (about 1 s).
+4. **Head-of-line blocking.** A single thread serves all jobs in order, so a slow disk read delays the RAM blocks
+   queued behind it.
+5. **First-use reads.** Because the RAM tier is file-backed, copying a block whose pages are not in memory becomes a
+   disk read. This is the probable cause of the late blocks in section 4.3.
