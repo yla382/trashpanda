@@ -20,7 +20,8 @@ Modes:
 | `model-offload` | `diffusers` model offloading (`enable_model_cpu_offload()`) |
 | `accelerate` | an `accelerate` device map that limits how much of the UNet's weights may sit on the GPU |
 | `trash-panda` | trash-panda with the same limit on the UNet's weights |
-| `all` | every mode above, each in its own fresh process, followed by a table of the results |
+| `trash-panda-release` | like `trash-panda`, but the UNet is released with `trash_panda.release()` after the run; the memory table at the end shows how much RAM and VRAM comes back. Not part of `all` |
+| `all` | every mode above except `trash-panda-release`, each in its own fresh process, followed by a table of the results |
 | `clean` | shows the size of the downloaded model in the Hugging Face cache; add `--yes` to delete it |
 
 ### Install
@@ -54,8 +55,15 @@ python sdxl_benchmark.py --mode baseline
 python sdxl_benchmark.py --mode model-offload
 python sdxl_benchmark.py --mode accelerate --unet-vram 3GB
 python sdxl_benchmark.py --mode trash-panda --unet-vram 3GB
+python sdxl_benchmark.py --mode trash-panda-release --unet-vram 3GB
 python sdxl_benchmark.py --mode all --unet-vram 3GB
 ```
+
+Each single-mode run ends with a table of the RAM (and VRAM) that the whole system has free at several points: at the
+start, after the pipeline is loaded, after the run, after cleaning up and after the pipeline is deleted. A third pair of
+columns shows the RAM held by the script's own process (its working set), which tells memory the script holds apart
+from memory that other programs or the system hold. Run
+`trash-panda` and `trash-panda-release` one after the other to compare `handle.remove()` with `release()`.
 
 Options:
 

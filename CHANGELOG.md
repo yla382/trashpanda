@@ -3,6 +3,18 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.0.13] - 2026-10-27
+### Added
+- `release(model, handle=None)`, which gives back the memory a model holds once it is no longer needed: it removes the offload hooks (when the handle from `install_offload()` or `offload_blocks()` is passed), replaces every weight and buffer with an empty tensor on the meta device, and empties the GPU cache and PyTorch's cache of pinned memory. The model cannot be run afterwards, and calling it twice is harmless. `handle.remove()` alone restores the blocks but frees nothing, because the weights stay alive. This makes it possible to run a pipeline in stages (for example text encoder, then UNet, then VAE) and give back each stage's RAM and VRAM before the next one is planned or loaded
+- `examples/sdxl_benchmark.py` has a `trash-panda-release` mode and ends every single-mode run with a table of the RAM and VRAM that the whole system has free at several points, together with the memory held by the script's own process. When the process still holds more than 0.5 GB above its starting level, the script runs a probe in a fresh process (`--mode probe`) that shows what the CUDA libraries and pinned buffers hold; `--no-probe` skips it
+
+### Changed
+- The prefetcher no longer keeps a reference to the first block it saw once it is closed, so that block's weights can be freed
+
+### Notes
+- On the test machine (RTX 3060, 16 GB RAM) with the SDXL UNet streamed under a 3 GB limit, `release()` returned between 4.4 and 6.6 GB of RAM and about 9.5 GB of VRAM at once, while the rest of the pipeline was still loaded. Removing the handle with `handle.remove()` returned none of it
+- PyTorch keeps freed pinned memory for reuse, and `torch.cuda.empty_cache()` does not release it. In the same test about 1.5 to 2 GB of RAM stayed in use after the release until the pinned cache was emptied, which `release()` now does when PyTorch provides the call
+
 ## [0.0.12] - 2026-10-26
 ### Added
 - A warning (once per run) when pinned memory cannot be allocated. The library then copies blocks through ordinary memory, which is slower and no longer overlaps with compute; before, this happened silently

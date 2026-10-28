@@ -222,6 +222,74 @@ The pool has a fixed size of 2, while the VRAM staging area scales with the look
 the worker in the capped plan (section 4.2) is spent waiting for a free buffer. *Validation:* time the wait for a
 buffer, then make the count configurable and test 3 and 4 (about 0.4 GB of RAM each).
 
+### 7.9 Consume mode for single-pass models
+
+*Proposal.* For a model that runs a single pass (a text encoder, a VAE), drop each layer's weights as soon as the layer
+has computed, including its source copy and not only the working copy on the GPU. Streamed blocks already release
+their working copy after each use; what is retained today is the RAM-tier weights, which a single-pass model never
+reads again. In consume mode a layer is read from the checkpoint into a pinned buffer, copied to the GPU, used and
+discarded. This is the disk-tier path with the read-ahead of 7.4, so the memory footprint is the pinned buffers and one
+or two layers, independent of the model's size.
+
+*Default.* The mode is an explicit option (for example `single_pass=True`), and the default is to keep the weights. The
+library cannot know in advance whether a model will run again. If it dropped the weights by default and the model
+looped, every pass would read the file again, a slowdown that nothing reports and that falls on the largest models.
+Keeping by default costs only memory held longer, which is visible and recoverable.
+
+*Trade-off.* A repeated run reads the model from the drive again (about 9 s cold for a 4B encoder) unless the operating
+system's file cache still holds it. The mode suits restricted hardware and single images; with enough memory, keeping
+the weights is faster.
+
+*Depends on.* 7.4 (block order up front) and 7.1 (release).
+
+### 7.10 Stage-major execution for batches
+
+*Observation.* The text encoder runs once per distinct prompt, not once per image. Images generated from the same prompt
+need the encoder once, and its embeddings can be reused (in `diffusers` through `prompt_embeds`).
+
+*Proposal.* For a batch, run the pipeline stage by stage instead of image by image: encode all prompts with the encoder
+loaded once, release it, sample every image with the transformer loaded once, release it, then decode every image with
+the VAE loaded once. Only small objects are kept between the stages (the embeddings, in megabytes, and the latents, a
+few megabytes per image). Each model is loaded once per batch, so the reload cost of consume mode (7.9) is paid once
+and not once per image.
+
+*Scope.* Applicable when the whole batch is known in advance. It does not apply to interactive use, where prompts
+arrive one at a time and the stages cannot be reordered (7.11).
+
+### 7.11 Read-ahead into idle drive time
+
+*Observation.* While the transformer samples with its streamed blocks in RAM, the drive is idle. On the reference
+pipeline this lasts about 65 s per image, enough to read the 4 GB encoder several times.
+
+*Proposal.* In a cyclic, one-image-at-a-time workload (encode, sample, decode, encode again), start reading the weights
+the next stage will need while the current stage runs. This requires a prefetcher shared across models, so that the
+block chain continues from the last block of one model to the first block of the next, and a per-stage memory policy:
+keep the model, drop it after use, or drop it and read it back ahead of time. Where there is no room to hold the
+data, the read can target only the operating system's file cache, whose pages count as available memory and are
+reclaimed on demand.
+
+*Limits.* The saving is bounded by the time of the reads that are hidden (about 10 s per image for a 4B encoder). On
+very restricted RAM the cached pages may be evicted before use. 7.10 removes most of this cost for batches.
+
+### 7.12 Release during the last pass, with the next stage preloaded
+
+*Proposal.* Extends 7.3. On the final sampling step the sampler signals the last pass (for example
+`handle.final_pass()` from the step callback; the library cannot detect it, because the sampler owns the step count).
+As each block finishes in that pass, its weights are released, and the VRAM freed this way is available for the next
+stage when the pass ends. Weights of the next stage load into that space in the background.
+
+*What it gains.* For the decoder the weights are small, so the saving in load time is minor. The main effect is the room
+for the decoder's activations, which is the suspected cause of the overflow at 2K. For an interactive loop, the encoder
+of the next image can be preloaded in the same way.
+
+*Safety.* A block's weights must not be freed while the GPU is still using them. Releasing the reference after the
+block's work has been enqueued on the compute stream is safe in PyTorch's allocator, and the staged tensors already use
+`record_stream` for this purpose. A test must show that the output of a run with the final-pass release is identical to
+a normal run.
+
+*Cost.* A further image requires the released blocks to be restored (7.2), a cost that has not been measured, so the
+signal is optional.
+
 ## 8. Scenario: cold Krea2 run
 
 Estimated at the measured drive rate of 400 MB/s (not measured end to end):
@@ -254,7 +322,12 @@ Each step provides evidence for the next.
 3. **Manual release.** Release the encoder before planning on a RAM-constrained plan (7.1), and release the transformer
    before the decode at 2K (7.3 by hand). Check whether the overflow disappears.
 4. **Pinned buffer wait.** Time the wait for a buffer and test 3 and 4 buffers (7.8).
-5. **Decide the implementation** from the results: a release helper (7.2, 7.3), block order up front (7.4), or both.
+5. **Staged run with a release helper.** Implement the helper of 7.1, which reports free RAM and VRAM before and after,
+   and run the pipeline stage by stage on a constrained plan and at 2K. Compare the plan summary, the pass times, the
+   memory reports and the total time with the unstaged run. This measures how much memory a release returns and
+   decides whether 7.9 to 7.12 are worth building.
+6. **Decide the implementation** from the results: a release helper (7.2, 7.3), block order up front (7.4), consume
+   mode (7.9), or a combination.
 
 The benchmark method should be extended in parallel: record per-step times, fix the plan and change one variable per
 comparison, repeat each setting three times in alternating order and report the median, and label cold and warm cache
@@ -268,6 +341,10 @@ runs. A script in `examples/` that works with any model would serve this purpose
 - Does preloading help when the encoder itself reads from disk, or do the two compete for the drive?
 - More concurrent activity may increase the likelihood of the unexplained process exits seen at high RAM usage.
 - Is the 2K overflow caused by the decode running while the resident blocks are still on the GPU? Not confirmed.
+- In consume mode (7.9), how often does a repeated run find the model still in the operating system's file cache?
+- Can the embeddings and latents of a batch (7.10) always be passed between stages without loading the models they
+  came from, for the pipelines of interest?
+- Can the file cache be filled ahead of time (7.11) without raising the memory pressure that evicts it again?
 - The prefetching is CUDA-only. On a machine with unified memory (Apple silicon) splitting a model between GPU and
   RAM frees nothing. Untested.
 

@@ -86,8 +86,10 @@ split between the GPU and RAM.
 | Seed | 2219653787 |
 | What is timed | the sampling progress bar only (not model loading, prompt encoding or the VAE decode) |
 
-Memory in use at the start of each run: about 5.2 to 5.7 GB of the 16 GB (a clean desktop, no browser or games open).
-The encoder and VAE were loaded before the plan.
+Memory in use at the start of each run: about 5.2 to 6.1 GB of the 16 GB (a clean desktop, no browser or games open).
+Up to 0.0.11 the encoder and VAE were loaded before the plan and stayed loaded during the sampling. In the 0.0.13 run
+the stages run one after another: the encoder encodes the prompt and is released with `release()` before the UNet is
+planned, and the VAE is built only after the sampling, once the UNet has been released.
 
 | Library version | Plan | Memory in use at start | Time (7 steps) | Per step |
 |---|---|---|---|---|
@@ -95,3 +97,46 @@ The encoder and VAE were loaded before the plan.
 | 0.0.8 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 5.2 GB | 1:02 | 8.95 s |
 | 0.0.9 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 6.1 GB | 1:04 | 9.26 s |
 | 0.0.11 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 5.2 GB | 1:04 | 9.20 s |
+| 0.0.13 | 12 blocks on the GPU, 20 streamed from RAM, none on disk | 5.4 GB | 1:03 | 9.06 s |
+
+With this much free memory the plan is the same as in the earlier rows, and the sampling time is unchanged within the
+run-to-run variation (9.06 s against 9.20 s per step is a 1.5 percent difference from single runs). Releasing the
+encoder before the plan does not make the sampling faster when the plan already fits in RAM. What it changes is the
+memory: in the 0.0.13 run the encoder's release gave back 4.7 GB of RAM and 1.6 GB of VRAM before the UNet was planned,
+and the release of the UNet gave back 10.3 GB of RAM and 10.4 GB of VRAM before the VAE was built. The RAM left free at
+the end of the sampling was only 0.3 GB, because this run used `min_free_ram="0"` and no cap on the RAM tier.
+
+### When memory is tight
+
+The release matters more when less memory is free at the start, because the plan then has to leave blocks on disk, and
+the drive (about 400 MB/s) sets the speed of each pass. Two runs started with about 8 GB in use:
+
+| Flow | Plan | Time (7 steps) | Per step |
+|---|---|---|---|
+| Before: encoder and VAE stay loaded | 13 blocks on the GPU, 8 from RAM, 11 from disk | 1:35 | 13.7 s |
+| After: encoder released before the plan | 12 blocks on the GPU, 18 from RAM, 2 from disk | 1:07 | 9.7 s |
+
+**This is not a controlled comparison.** The two runs differ in more than the release: the plan arguments (a RAM cap of
+5.3 GB in the first, none in the second, which also reserved no free RAM), the look-ahead (4 in the first, 2 in the
+second) and the starting memory. It shows that the planner gives the UNet more RAM once the encoder has been released
+(a RAM budget of 6.5 GB against 3.1 GB), not how much of the speed-up comes from the release.
+
+### A wider image (2048 x 1024)
+
+The same model and seed, with the image twice as wide, in the staged flow of 0.0.13. Memory in use at the start: 6.6 GB.
+The plan was again 12 blocks on the GPU and 20 streamed from RAM, none on disk.
+
+| Stage | Time |
+|---|---|
+| Sampling, 7 steps | 1:44 (14.9 s per step) |
+| Building the VAE | 3.8 s |
+| Decoding | 3.1 s |
+
+The UNet was released before the VAE was built, so the decode had the whole card. The decode took 3.1 s, and the shared
+GPU memory in Windows' Task Manager did not rise noticeably during the run (watched by eye, not logged). In earlier
+runs at this size with the encoder, the UNet and the VAE all loaded at once, the shared GPU memory rose sharply and the
+decode took minutes (also watched by eye, over several runs, not logged). The free VRAM after the decode read 0.00 GB.
+That reading can include PyTorch's cached memory, and the peak memory the decode needed was not measured, so it shows
+only that the decode filled the card, and a taller image may not fit.
+
+This is one run, and the old flow was not run at this size, so there is no comparison here.

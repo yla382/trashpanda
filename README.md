@@ -107,6 +107,28 @@ p = plan(model, path, activation_vram="2.6GB")                   # next time: fi
 
 The value is per model and per input size, so measure again if you change the resolution.
 
+### Releasing a model
+
+When a model is done, `release()` gives its memory back, so the next stage can be planned and loaded with it. Pass the
+handle that `install_offload()` (or `offload_blocks()`) returned:
+
+```python
+from trash_panda import install_offload, plan, release, stream_load
+
+p = plan(encoder, "encoder.safetensors")
+stream_load(encoder, "encoder.safetensors", plan=p)
+handle = install_offload(encoder)
+embeddings = encoder(tokens)
+
+release(encoder, handle)                         # its RAM and VRAM are free again
+
+p = plan(unet, "unet.safetensors")               # this plan sees the memory the encoder gave back
+```
+
+`release()` removes the hooks, replaces every weight with an empty tensor on the meta device, and empties the GPU cache
+and PyTorch's cache of pinned memory. The model cannot be run afterwards. `handle.remove()` alone does not do this: it
+restores the blocks, but the weights stay in memory.
+
 ### Storage dtype
 
 By default weights are kept exactly as stored in the file. Optionally, `storage_dtype="bf16"` casts waiting
@@ -204,11 +226,15 @@ In this order, because the silent slowdowns seen so far (GPU memory spilling int
 * warn when a plan fills almost all of the GPU, since the overflow is silent and slow
 * measure the activation size automatically (and remember it per model and input size) instead of asking you to run
   `measure_activation_vram` once, and base the default headroom on it instead of the fixed 1.5 GB guess
-* plan a pipeline in stages (encode, denoise, decode) so memory used by an earlier stage can be released. Resident
-  blocks stay on the GPU until `handle.remove()`, so they are still there while the VAE decodes. First check by
-  hand that releasing the model before the decode removes the overflow; then a smaller step such as
-  `release_gpu()` / `restore_gpu()` on the handle, which moves the resident blocks off the GPU and back while keeping
-  the hooks. The cost of putting them back for each image, and the RAM they need meanwhile, have not been measured
+* plan a pipeline in stages (encode, denoise, decode) so memory used by an earlier stage can be released.
+  `release()` does the releasing by hand now. In single runs, releasing the text encoder before the diffusion model was
+  planned gave the planner several GB more RAM, and releasing the diffusion model before the VAE was built stopped the
+  decode of a 2048 x 1024 image from spilling into shared GPU memory (watched by eye, not logged). What is left is a
+  helper that runs the stages in order, and a smaller step such as `release_gpu()` / `restore_gpu()` on the handle,
+  which moves the resident blocks off the GPU and back while keeping the hooks. The cost of putting them back for each
+  image, and the RAM they need meanwhile, have not been measured
+* count the pinned buffers at the size PyTorch gives them: it appears to round each pinned allocation up to the next
+  power of two (two buffers of 0.7 GB took 2.15 GB), so the RAM the planner counts for them can be too low
 * take memory held by other loaded models into account, or at least warn about it
 * a KV-cache budget for language models, from the context length you intend to use
 
@@ -245,7 +271,7 @@ In this order, because the silent slowdowns seen so far (GPU memory spilling int
   `-1073741819` is a crash in native code, while a normal code points to the process being ended by the system. Also
   print the memory in use and the available commit (RAM plus page file) before loading, so a failed run shows what
   the machine had left
-* `release()` / `stage()` helpers for cleaning up between models
+* a `stage()` helper that runs a pipeline's stages in turn and releases each one (`release()` itself is done)
 * tests on tiny `transformers` and `diffusers` models on the CPU, in CI
 * tests on more models, GPUs and operating systems (Linux in particular), with benchmarks published here. A first
   test on a Mac is planned: the unit tests and `examples/sdxl_benchmark.py --size 512 --steps 10` in the baseline and

@@ -8,6 +8,7 @@ originals back (try/finally), so a failed forward pass cannot leave a block expa
 from __future__ import annotations
 
 import atexit
+import gc
 import time
 import warnings
 from collections import defaultdict, deque
@@ -404,6 +405,7 @@ class _Prefetcher:
         self.pool   = None
         self.stream = None
         self.last   = None
+        self.first  = None
         self.window = []
         self.in_flight.clear()
         
@@ -551,3 +553,34 @@ def install_offload(
             reader_factory = lambda _blk, p=b.prefix: DiskReader(state.checkpoint, state.disk_keys, p)
         handle.extend(offload_blocks([block], device=dev, compute_dtype=cdt, disk=reader_factory, prefetcher=pre))
     return handle
+
+
+def release(model: nn.Module, handle: Optional[OffloadHandle] = None) -> None:
+    """Give back the memory a model holds: remove the offload hooks, drop every weight, free the GPU cache and
+    PyTorch's cache of pinned memory.
+
+    Pass the handle that install_offload() / offload_blocks() returned; without it the hooks keep the weights alive.
+    The model ends up on the meta device and cannot run again. Safe to call twice."""
+    if handle is not None:
+        handle.remove()
+    model.__dict__.pop("_trash_panda_state", None)
+
+    for module in model.modules():
+        for name in list(module._parameters):
+            p = module._parameters[name]
+            if p is not None and not p.is_meta:
+                module._parameters[name] = nn.Parameter(torch.empty_like(p, device="meta"), requires_grad=False)
+        for name in list(module._buffers):
+            b = module._buffers[name]
+            if b is not None and not b.is_meta:
+                module._buffers[name] = torch.empty_like(b, device="meta")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # PyTorch keeps freed pinned (page-locked) memory for reuse, and empty_cache() does not touch it. Measured
+        # on the test machine, the pinned buffers stayed in RAM until this call. It is a private function of
+        # PyTorch, so it is only called when it exists.
+        empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+        if empty_host_cache is not None:
+            empty_host_cache()
