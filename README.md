@@ -1,7 +1,7 @@
 # trash-panda
 
 <p align="left">
-  <img src="assets/raccoon_1.png" width="260" alt="A raccoon holding a circuit board in a trash can">
+  <img src="https://raw.githubusercontent.com/yla382/trashpanda/main/assets/raccoon_1.png" width="260" alt="A raccoon holding a circuit board in a trash can">
 </p>
 
 Run models bigger than your GPU: stream weights layer by layer across GPU, RAM and disk.
