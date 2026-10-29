@@ -3,6 +3,10 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.0.14] - 2026-10-28
+### Changed
+- `plan()` now counts each pinned buffer at the size PyTorch gives it. PyTorch rounds every pinned allocation up to the next power of two (measured on PyTorch 2.5.1: two buffers of 0.7 GB took 2.15 GB), so the RAM the planner reserved for the pinned buffers was too low. The RAM budget is now smaller by the difference, which can move a block from the RAM tier to disk when RAM is nearly full
+
 ## [0.0.13] - 2026-10-27
 ### Added
 - `release(model, handle=None)`, which gives back the memory a model holds once it is no longer needed: it removes the offload hooks (when the handle from `install_offload()` or `offload_blocks()` is passed), replaces every weight and buffer with an empty tensor on the meta device, and empties the GPU cache and PyTorch's cache of pinned memory. The model cannot be run afterwards, and calling it twice is harmless. `handle.remove()` alone restores the blocks but frees nothing, because the weights stay alive. This makes it possible to run a pipeline in stages (for example text encoder, then UNet, then VAE) and give back each stage's RAM and VRAM before the next one is planned or loaded

@@ -169,6 +169,7 @@ def parse_bytes(value: Union[None, int, float, str]) -> Optional[int]:
 def _is_scale_key(key: str, ck: Checkpoint) -> bool:
     return key.endswith("_scale") and key[: -len("_scale")] in ck
 
+
 def _spread_disk_blocks(rest: List[BlockPlan], ram_budget: int) -> set:
     """Choose which of the blocks outside the GPU go to disk: as few as it takes for the others to fit in `ram_budget`, 
     spared evenly so that each disk read has other blocks' compute next to it to hide behind."""
@@ -179,6 +180,12 @@ def _spread_disk_blocks(rest: List[BlockPlan], ram_budget: int) -> set:
         if total - sum(rest[i].stored_bytes for i in chosen) <= ram_budget:
             return chosen
     return set(range(m))
+
+
+def _pinned_size(nbytes: int) -> int:
+    """The size PyTorch gives a pinned buffer: it rounds every pinned allocation up to the next power of two
+    (measured on PyTorch 2.5.1: two buffers of 0.7 GB took 2.15 GB, and one of 1.1 GB too the same)."""
+    return 1 << (nbytes - 1).bit_length() if nbytes > 0 else 0
 
 
 def plan(
@@ -312,7 +319,7 @@ def plan(
         ram_reserve = parse_bytes(min_free_ram) or 0
    
     # the prefetcher's pinned staging buffers: page-locked RAM that cannot be paged out, only when there is a GPU
-    pinned     = cfg.pinned_buffers * max((b.stored_bytes for b in blocks[n_res:]), default=0) if hw.vram_total else 0
+    pinned     = cfg.pinned_buffers * _pinned_size(max((b.stored_bytes for b in blocks[n_res:]), default=0)) if hw.vram_total else 0
     ram_budget = (ram_cap if ram_cap is not None else hw.ram_available) - ram_reserve - pinned
     ram_budget = max(ram_budget, 0)
     

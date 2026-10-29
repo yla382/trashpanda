@@ -5,7 +5,7 @@ torch = pytest.importorskip("torch")
 from .tiny_model import meta_model  # noqa: E402
 from trash_panda.offload.hardware import Hardware  # noqa: E402
 from trash_panda.offload.planner import (  # noqa: E402
-    BlockPlan, Plan, Tier, _GB, _PINNED_BUFFERS, _auto_ram_reserve, _spread_disk_blocks, parse_bytes, plan,
+    BlockPlan, Plan, Tier, _GB, _PINNED_BUFFERS, _auto_ram_reserve, _pinned_size, _spread_disk_blocks, parse_bytes, plan,
 )
 
 
@@ -183,7 +183,24 @@ def test_pinned_buffers_are_subtracted_from_the_ram_budget(tiny_checkpoint):
     largest = max(b.stored_bytes for b in auto(path, hw(0, 10 ** 9)).blocks)
     hardware = machine(16 * _GB, 10 * _GB, vram_free=1)                # a GPU is present, with almost no room on it
     p = plan_with(path, hardware, resident_blocks=0, min_free_ram=0)   # every block is off the GPU
-    assert p.ram_budget == 10 * _GB - _PINNED_BUFFERS * largest
+    assert p.ram_budget == 10 * _GB - _PINNED_BUFFERS * _pinned_size(largest)
+
+
+def test_pinned_size_rounds_up_to_the_next_power_of_two():
+    assert _pinned_size(0) == 0
+    assert _pinned_size(1) == 1
+    assert _pinned_size(1000) == 1024
+    assert _pinned_size(2 ** 30) == 2 ** 30
+    assert _pinned_size(2 ** 30 + 1) == 2 ** 31
+
+
+def test_pinned_buffers_are_counted_at_the_rounded_size(tiny_checkpoint, monkeypatch):
+    _, path = tiny_checkpoint
+    largest = max(b.stored_bytes for b in auto(path, hw(0, 10 ** 9)).blocks)
+    monkeypatch.setattr("trash_panda.offload.planner._pinned_size", lambda n: n + 1000)   # a size that cannot be mistaken for the raw one
+    hardware = machine(16 * _GB, 10 * _GB, vram_free=1)
+    p = plan_with(path, hardware, resident_blocks=0, min_free_ram=0)
+    assert p.ram_budget == 10 * _GB - _PINNED_BUFFERS * (largest + 1000)
 
 
 def test_no_pinned_buffers_without_a_gpu(tiny_checkpoint):

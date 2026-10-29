@@ -1,5 +1,9 @@
 # trash-panda
 
+<p align="left">
+  <img src="assets/raccoon_1.png" width="260" alt="A raccoon holding a circuit board in a trash can">
+</p>
+
 Run models bigger than your GPU: stream weights layer by layer across GPU, RAM and disk.
 
 > **Status: early (Phase 1).** The API may change. The package name is temporary.
@@ -223,7 +227,6 @@ Roughly in the order they are planned. Nothing here is promised or scheduled.
 **Planner**
 In this order, because the silent slowdowns seen so far (GPU memory spilling into shared memory at about 11.6 to
 11.8 GB, a headroom that was too thin, an overflow after sampling at 2K) all come from the planner knowing too little:
-* warn when a plan fills almost all of the GPU, since the overflow is silent and slow
 * measure the activation size automatically (and remember it per model and input size) instead of asking you to run
   `measure_activation_vram` once, and base the default headroom on it instead of the fixed 1.5 GB guess
 * plan a pipeline in stages (encode, denoise, decode) so memory used by an earlier stage can be released.
@@ -233,8 +236,6 @@ In this order, because the silent slowdowns seen so far (GPU memory spilling int
   helper that runs the stages in order, and a smaller step such as `release_gpu()` / `restore_gpu()` on the handle,
   which moves the resident blocks off the GPU and back while keeping the hooks. The cost of putting them back for each
   image, and the RAM they need meanwhile, have not been measured
-* count the pinned buffers at the size PyTorch gives them: it appears to round each pinned allocation up to the next
-  power of two (two buffers of 0.7 GB took 2.15 GB), so the RAM the planner counts for them can be too low
 * take memory held by other loaded models into account, or at least warn about it
 * a KV-cache budget for language models, from the context length you intend to use
 
@@ -253,7 +254,6 @@ In this order, because the silent slowdowns seen so far (GPU memory spilling int
 * `diffusers` pipelines: build the large components with `stream_load` and hand them to the pipeline class, so
   `from_pretrained` does not load everything into RAM first
 * LoRA and other adapters on offloaded blocks
-* compare speed and memory against the offloading built into `diffusers` and `accelerate`
 
 **Larger ideas**
 * compute the RAM tier on the CPU instead of copying it, as llama.cpp does, for token-by-token generation
