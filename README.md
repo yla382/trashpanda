@@ -222,6 +222,13 @@ direction, or come after it, and are not planned for now:
 * **Cheaper expansion**: reuse preallocated buffers and fuse the fp8 to bf16 conversion and scaling, instead of
   creating new tensors for every weight on every pass
 * **A cost model** that chooses between GPU, RAM and disk from measured disk and PCIe speed
+* **A command-line interface**, for example `trash-panda plan model.safetensors` to print a plan without writing a
+  script, and a hardware report for bug reports
+* **Visualizing the data flow**: a static report or trace file, built from the profile data, that shows each block
+  moving between tiers, the overlap of copying and compute, and the stalls. A live interface would be a later step
+* **Logging**: an optional log through Python's `logging` module, and an optional structured file (for example
+  `TRASH_PANDA_LOG=run.jsonl`) with the plan, memory and timings of a run. The visualization and a comparison of two
+  runs could read it
 
 These may be considered in the future. They are not part of the immediate plan.
 
