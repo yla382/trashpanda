@@ -150,10 +150,8 @@ are indicative only, and they do not show that trash-panda is faster than the ot
 * coordinating memory between several models that are loaded at the same time (for example a text encoder
   and a diffusion model). Each model is planned on its own from the memory that is free when you plan it, so
   plan them one after the other, or free the first model before loading the next
-* one-call cleanup after a model is done (a `release(model)` helper and a pipeline `stage()` helper that remove
-  the hooks, drop the weights, empty the GPU cache and report memory before and after). For now, free memory
-  yourself: `handle.remove()`, `del model`, `gc.collect()`, `torch.cuda.empty_cache()`; for the strictest cleanup
-  (system RAM in particular), run heavy stages in their own process
+* a pipeline `stage()` helper that runs the stages in order and reports memory before and after each one. For now,
+  call `release(model, handle)` yourself when a stage is done (see "Releasing a model")
 * full overlap of reading and computing for disk blocks: blocks waiting in RAM and on disk are prefetched through
   pinned buffers by a background thread, two blocks ahead by default, but the drive's speed sets a floor that no
   amount of prefetching removes (see "Known issues")
@@ -195,9 +193,45 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   16 GB of RAM. Other models, GPUs and operating systems are not covered yet. The unit tests run on the CPU, and
   `examples/sdxl_benchmark.py` has a path for machines without CUDA (the Apple GPU or the CPU) that is untested
 
+## Out of scope for now
+
+The current direction is sequential model chaining: each model of a pipeline is loaded, run and released before the
+next one is planned (for example text encoder, then diffusion model, then VAE). The following are not part of that
+direction, or come after it, and are not planned for now:
+
+* **ControlNet**: an extra network that steers a diffusion model with a guide image (edges, pose, depth). It runs
+  alongside the diffusion model at every denoising step, so both models must be loaded at the same time
+* **Speculative decoding**: a small draft model proposes several tokens and the large language model verifies them in
+  one pass. Both models run throughout the generation, so both must be loaded at the same time
+* **GGUF models**, possibly through `llama-cpp-python` as a separate backend
+* **Computing the RAM tier on the CPU** instead of copying it to the GPU, as llama.cpp does, for token-by-token
+  generation
+* **Batching for language models**, so one weight copy serves many sequences
+* **Multi-GPU support**
+* **A KV-cache budget for language models**, from the context length you intend to use
+* **4-bit and 8-bit storage** (for example NF4 with `bitsandbytes`, or our own implementation), to fit more of the
+  model in RAM and on the GPU and halve the traffic
+* **LoRA and other adapters** on offloaded blocks
+* **`transformers` compatibility**: a `from_pretrained`-style helper (build on the meta device with real buffers,
+  find the weight files, translate old checkpoint names, plan, load and install the hooks in one call), ignoring
+  buffers that are not in the checkpoint (rotary tables, position ids) instead of failing, and making `model.dtype`,
+  `model.device` and `model.to(...)` behave on offloaded models so `generate()` and `pipeline()` work
+* **A memory-mapped disk tier** as an experiment: map the checkpoint once and let the operating system keep recently
+  used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit read-ahead,
+  because a least-recently-used cache can thrash when the model is read in a cycle
+* **Cheaper expansion**: reuse preallocated buffers and fuse the fp8 to bf16 conversion and scaling, instead of
+  creating new tensors for every weight on every pass
+* **A cost model** that chooses between GPU, RAM and disk from measured disk and PCIe speed
+
+These may be considered in the future. They are not part of the immediate plan.
+
 ## Roadmap
 
-Roughly in the order they are planned. Nothing here is promised or scheduled.
+The current focus is model chaining: running the models of a pipeline one after another while the memory moves from
+one to the next as it frees up. The memory a stage no longer needs is released while the computation continues, and the
+next model is loaded into that space as it appears, instead of waiting for a stage to finish and release everything
+before the next one starts loading. `release()` does the whole-model version by hand today. The items below serve
+that focus, roughly in the order they are planned. Nothing here is promised or scheduled.
 
 **Speed**
 * read the RAM tier into memory ahead of use. In the profile of an all-RAM plan, 21 of the 140 streamed blocks were
@@ -217,12 +251,6 @@ Roughly in the order they are planned. Nothing here is promised or scheduled.
   loading; the same for the VAE during sampling. It needs the staged planning above, a plan that predicts the memory
   that will be free after a stage, and blocks that can change from streamed to resident while running. Preloading
   would also compete with the encoder for the drive when the encoder reads from disk. An idea, not a design
-* a memory-mapped disk tier as an experiment: map the checkpoint once and let the operating system keep recently
-  used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit
-  read-ahead, because a least-recently-used cache can thrash when the model is read in a cycle
-* cheaper expansion: reuse preallocated buffers and fuse the fp8 to bf16 conversion and scaling, instead of
-  creating new tensors for every weight on every pass
-* a cost model that chooses between GPU, RAM and disk from measured disk and PCIe speed
 
 **Planner**
 In this order, because the silent slowdowns seen so far (GPU memory spilling into shared memory at about 11.6 to
@@ -236,29 +264,13 @@ In this order, because the silent slowdowns seen so far (GPU memory spilling int
   helper that runs the stages in order, and a smaller step such as `release_gpu()` / `restore_gpu()` on the handle,
   which moves the resident blocks off the GPU and back while keeping the hooks. The cost of putting them back for each
   image, and the RAM they need meanwhile, have not been measured
-* take memory held by other loaded models into account, or at least warn about it
-* a KV-cache budget for language models, from the context length you intend to use
 
 **Formats**
-* 4-bit and 8-bit storage (for example NF4 with `bitsandbytes`, or our own implementation), to fit more of the
-  model in RAM and on the GPU and halve the traffic
 * fp8 checkpoints with block-wise scales (the `weight_scale_inv` layout used on the Hugging Face Hub)
-* GGUF models, possibly through `llama-cpp-python` as a separate backend
 
 **Compatibility**
-* `from_pretrained`-style helper for `transformers` models: build on the meta device with real buffers, find the
-  weight files (Hub or local), translate old checkpoint names, plan, load and install the hooks in one call
-* ignore buffers that are not in the checkpoint (rotary tables, position ids) instead of failing
-* make `model.dtype`, `model.device` and `model.to(...)` behave on offloaded models, so `generate()` and
-  `pipeline()` work
 * `diffusers` pipelines: build the large components with `stream_load` and hand them to the pipeline class, so
   `from_pretrained` does not load everything into RAM first
-* LoRA and other adapters on offloaded blocks
-
-**Larger ideas**
-* compute the RAM tier on the CPU instead of copying it, as llama.cpp does, for token-by-token generation
-* batching for language models, so one weight copy serves many sequences
-* multi-GPU support
 
 **Reliability and project**
 * investigate sudden exits: rarely, and only when RAM is already high (about 12 GB in use on a 16 GB machine)
