@@ -133,6 +133,30 @@ p = plan(unet, "unet.safetensors")               # this plan sees the memory the
 and PyTorch's cache of pinned memory. The model cannot be run afterwards. `handle.remove()` alone does not do this: it
 restores the blocks, but the weights stay in memory.
 
+### Running a stage
+
+`stage()` does the whole life of one model for you: it builds the model, plans, loads it, installs the hooks, and
+releases it when the `with` block ends, also if the block raises:
+
+```python
+import torch
+from trash_panda import stage
+
+def build_unet():
+    with torch.device("meta"):
+        return MyUNet(config)
+
+with stage(build_unet, "unet.safetensors", resident_blocks=12) as (unet, p):
+    print(p)
+    latents = denoise(unet, ...)
+                                                 # here the UNet's RAM and VRAM are free again
+```
+
+The keyword arguments go to `plan()`. The peak GPU memory of the block is remembered under `key` (by default the
+checkpoint path) and used as `activation_vram` the next time the same key is planned in the same process. The model
+cannot be used after the block. The checkpoint's tensor names must match the model's names, and adapters are not
+applied.
+
 ### Storage dtype
 
 By default weights are kept exactly as stored in the file. Optionally, `storage_dtype="bf16"` casts waiting
@@ -150,8 +174,8 @@ are indicative only, and they do not show that trash-panda is faster than the ot
 * coordinating memory between several models that are loaded at the same time (for example a text encoder
   and a diffusion model). Each model is planned on its own from the memory that is free when you plan it, so
   plan them one after the other, or free the first model before loading the next
-* a pipeline `stage()` helper that runs the stages in order and reports memory before and after each one. For now,
-  call `release(model, handle)` yourself when a stage is done (see "Releasing a model")
+* a helper that runs the stages of a pipeline in order and reports memory before and after each one. `stage()` handles
+  one model at a time, so call it once per model (see "Running a stage")
 * full overlap of reading and computing for disk blocks: blocks waiting in RAM and on disk are prefetched through
   pinned buffers by a background thread, two blocks ahead by default, but the drive's speed sets a floor that no
   amount of prefetching removes (see "Known issues")
@@ -212,10 +236,10 @@ direction, or come after it, and are not planned for now:
 * **4-bit and 8-bit storage** (for example NF4 with `bitsandbytes`, or our own implementation), to fit more of the
   model in RAM and on the GPU and halve the traffic
 * **LoRA and other adapters** on offloaded blocks
-* **`transformers` compatibility**: a `from_pretrained`-style helper (build on the meta device with real buffers,
-  find the weight files, translate old checkpoint names, plan, load and install the hooks in one call), ignoring
-  buffers that are not in the checkpoint (rotary tables, position ids) instead of failing, and making `model.dtype`,
-  `model.device` and `model.to(...)` behave on offloaded models so `generate()` and `pipeline()` work
+* **A `from_pretrained`-style helper for `transformers` models** (find the weight files, build on the meta device with
+  real buffers, plan, load and install the hooks in one call), ignoring buffers that are not in the checkpoint (rotary
+  tables, position ids) instead of failing, and making `model.dtype`, `model.device` and `model.to(...)` behave on
+  offloaded models so `generate()` and `pipeline()` work
 * **A memory-mapped disk tier** as an experiment: map the checkpoint once and let the operating system keep recently
   used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit read-ahead,
   because a least-recently-used cache can thrash when the model is read in a cycle
@@ -262,20 +286,23 @@ that focus, roughly in the order they are planned. Nothing here is promised or s
 **Planner**
 In this order, because the silent slowdowns seen so far (GPU memory spilling into shared memory at about 11.6 to
 11.8 GB, a headroom that was too thin, an overflow after sampling at 2K) all come from the planner knowing too little:
-* measure the activation size automatically (and remember it per model and input size) instead of asking you to run
-  `measure_activation_vram` once, and base the default headroom on it instead of the fixed 1.5 GB guess
 * plan a pipeline in stages (encode, denoise, decode) so memory used by an earlier stage can be released.
   `release()` does the releasing by hand now. In single runs, releasing the text encoder before the diffusion model was
   planned gave the planner several GB more RAM, and releasing the diffusion model before the VAE was built stopped the
-  decode of a 2048 x 1024 image from spilling into shared GPU memory (watched by eye, not logged). What is left is a
-  helper that runs the stages in order, and a smaller step such as `release_gpu()` / `restore_gpu()` on the handle,
-  which moves the resident blocks off the GPU and back while keeping the hooks. The cost of putting them back for each
-  image, and the RAM they need meanwhile, have not been measured
+  decode of a 2048 x 1024 image from spilling into shared GPU memory (watched by eye, not logged). `stage()` builds,
+  plans and loads one model around your code, releases it afterwards, and records its activation size. It supports the
+  diffusion model and the VAE of the Krea2 pipeline today; what remains is the text encoder, a `transformers` model
+  (see Compatibility below). Also left is a smaller step such as `release_gpu()` / `restore_gpu()` on the handle, which
+  moves the resident blocks off the GPU and back while keeping the hooks. The cost of putting them back for each image,
+  and the RAM they need meanwhile, have not been measured
 
 **Formats**
 * fp8 checkpoints with block-wise scales (the `weight_scale_inv` layout used on the Hugging Face Hub)
 
 **Compatibility**
+* make `stage()` work for every model of a pipeline, including `transformers` models: `plan()` and `stage()` take
+  `key_map` and `skip_prefixes`, as `stream_load()` does, so a checkpoint with older names or a part that is not loaded
+  (the text encoder of the Krea2 pipeline, with its vision tower) goes through the same path as the diffusion model
 * `diffusers` pipelines: build the large components with `stream_load` and hand them to the pipeline class, so
   `from_pretrained` does not load everything into RAM first
 
@@ -290,7 +317,6 @@ In this order, because the silent slowdowns seen so far (GPU memory spilling int
   `-1073741819` is a crash in native code, while a normal code points to the process being ended by the system. Also
   print the memory in use and the available commit (RAM plus page file) before loading, so a failed run shows what
   the machine had left
-* a `stage()` helper that runs a pipeline's stages in turn and releases each one (`release()` itself is done)
 * tests on tiny `transformers` and `diffusers` models on the CPU, in CI
 * tests on more models, GPUs and operating systems (Linux in particular), with benchmarks published here. A first
   test on a Mac is planned: the unit tests and `examples/sdxl_benchmark.py --size 512 --steps 10` in the baseline and

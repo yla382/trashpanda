@@ -3,6 +3,15 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.0.15] - 2026-10-29
+### Added
+- `stage(build, path, *, key=None, **plan_kwargs)`, a context manager that runs one model of a pipeline. It calls `build()` for the model on the meta device, plans it (`plan_kwargs` go to `plan()`), loads it, installs the hooks and hands the model and its plan to the `with` block; when the block ends, also with an error, it calls `release()`. It records the peak GPU memory of the block under `key` (default: the checkpoint path) and passes it as `activation_vram` to the next plan with the same key in the same process, unless `activation_vram` is given. Nothing is recorded when the block raises, and the model cannot be used after the block. It does not apply adapters, and the checkpoint names must match the model's names (no `key_map` or `skip_prefixes` yet)
+- On the test machine, the diffusion model and the VAE of a pipeline ran through `stage` with the same plan, the same sampling time (9.05 s per step, against 9.06 s) and the same memory returned on release as with the calls made by hand
+
+### Fixed
+- `measure_activation_vram()` no longer counts the blocks staged ahead by the look-ahead as activations. They are real GPU tensors and are in the peak, and the plan already reserves them separately (`Plan.staging_bytes`), so the measured value was too high by up to that amount and a plan made from it kept fewer blocks on the GPU than necessary. In a test on the test machine (RTX 3060, 12 GB) with a 12B-parameter model, the same run measured 0.59 GB with the look-ahead off and 1.43 GB with a look-ahead of 2 (0.87 GB staged); it now measures 0.56 GB with a look-ahead of 2. A run that makes a single pass through the blocks stages nothing, so for it the value can be too low
+- `measure_activation_vram` can be imported from `trash_panda`, as the README example does; it was missing from the package's list of names
+
 ## [0.0.14] - 2026-10-28
 ### Changed
 - `plan()` now counts each pinned buffer at the size PyTorch gives it. PyTorch rounds every pinned allocation up to the next power of two (measured on PyTorch 2.5.1: two buffers of 0.7 GB took 2.15 GB), so the RAM the planner reserved for the pinned buffers was too low. The RAM budget is now smaller by the difference, which can move a block from the RAM tier to disk when RAM is nearly full

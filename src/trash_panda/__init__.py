@@ -6,8 +6,8 @@ __version__ = "0.0.14"
 _OFFLOAD_NAMES = (
     "BlockGroup", "BlockPlan", "Checkpoint", "DiskReader", "Hardware", "Kind", "LoadReport",
     "OffloadHandle", "Plan", "TensorInfo", "Tier",
-    "detect_hardware", "expand", "find_blocks", "install_offload", "module_nbytes",
-    "offload_blocks", "release", "parse_bytes", "parse_dtype", "plan", "quantize_fp8", "stream_load",
+    "detect_hardware", "expand", "find_blocks", "install_offload", "measure_activation_vram", "module_nbytes",
+    "offload_blocks", "release", "parse_bytes", "parse_dtype", "plan", "quantize_fp8", "stream_load", "stage"
 )
 
 __all__ = ["__version__", *_OFFLOAD_NAMES]
