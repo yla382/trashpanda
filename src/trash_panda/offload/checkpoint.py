@@ -80,6 +80,21 @@ def _read_header(f: Path) -> Tuple[Dict[str, dict], int]:
     return header, 8 + n
 
 
+def name_resolver(expected, key_map=None):
+    """Return a function that maps a checkpoint key to the model parameter or buffer it fills, or None.
+    `key_map` is a dict or a function from checkpoint key to model name."""
+    def resolve(key: str) -> Optional[str]:
+        k = key_map(key) if callable(key_map) else (key_map or {}).get(key, key)
+        if k in expected:
+            return k
+        if k.startswith("model."):                       # newer transformers nest the LM under language_model
+            alt = "model.language_model." + k[len("model."):]
+            if alt in expected:
+                return alt
+        return None
+    return resolve
+
+
 class Checkpoint:
     """Header-level view of a (possibly sharded) safetensors checkpoint.
 

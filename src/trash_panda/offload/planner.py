@@ -9,14 +9,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Iterable, List, Optional, Sequence, Tuple, Union, Dict
 
 import torch
 import torch.nn as nn
 
 from . import config
 from .blocks import BlockGroup, find_blocks
-from .checkpoint import Checkpoint
+from .checkpoint import Checkpoint, name_resolver
 from .formats import expanded_nbytes, parse_dtype, stored_nbytes
 from .hardware import Hardware, detect_hardware
 from .report import fmt_bytes
@@ -170,6 +170,22 @@ def _is_scale_key(key: str, ck: Checkpoint) -> bool:
     return key.endswith("_scale") and key[: -len("_scale")] in ck
 
 
+def _model_names(ck: Checkpoint, model: nn.Module, key_map) -> Dict[str, Optional[str]]:
+    """For every checkpoint key, the model name it fills (None if  it fills nothing). A scale or comfy_quany key follows its weights."""
+    expected = {n for n, _ in model.named_parameters()} | {n for n, _ in model.named_buffers()}
+    resolve = name_resolver(expected, key_map)
+    names = {}
+    for k in ck.keys():
+        if k.endswith(".comfy_quant"):
+            k_w = k[: -len("comfy_quant")] + "weight"
+        elif _is_scale_key(k, ck):
+            k_w = k[: -len("_scale")]
+        else:
+            k_w = k
+        names[k] = resolve(k_w)
+    return names
+
+
 def _spread_disk_blocks(rest: List[BlockPlan], ram_budget: int) -> set:
     """Choose which of the blocks outside the GPU go to disk: as few as it takes for the others to fit in `ram_budget`, 
     spared evenly so that each disk read has other blocks' compute next to it to hide behind."""
@@ -205,6 +221,8 @@ def plan(
     spread_disk: bool = True,
     hardware: Optional[Hardware] = None,
     groups: Optional[List[BlockGroup]] = None,
+    key_map=None,
+    skip_prefixes: Sequence[str] = ()
 ) -> Plan:
     """Decide where each block lives. Every argument that is set explicitly overrides the automatic choice.
     Arguments left as None take their default from config (see config.py, which also lists the TRASH_PANDA_<NAME>
@@ -219,6 +237,8 @@ def plan(
     allow_disk       blocks that do not fit in RAM stay in the checkpoint file (slow) instead of RAM
     lookahead        how many blocks ahead the next weights are staged on the GPU(0 turns prefetching off); the plan leaves room for them
     spread_disk      put the disk blocks evenly among the others instead of at the end, so reads can overlap with compute
+    key_map          checkpoint key -> model name, a dict or a function (same as stream_load)
+    skip_prefixes    model entries with these prefixes are left out: not sized, not counted (same as stream_load)
     """
     cfg = config.current()
     headroom_vram = cfg.headroom_vram if headroom_vram is None else headroom_vram
@@ -234,11 +254,17 @@ def plan(
         warnings.append("No repeating blocks found in the model; nothing can be offloaded.")
 
     # -- sizes from the checkpoint headers
+        # -- sizes from the checkpoint headers
+    skip = tuple(skip_prefixes)
+    names = _model_names(ck, model, key_map)
+    skipped = {k for k, n in names.items() if skip and n is not None and n.startswith(skip)}
     blocks: List[BlockPlan] = []
     in_block = set()
     for g in found:
         for prefix in g.prefixes:
-            keys = ck.keys_with_prefix(prefix)
+            if skip and prefix.startswith(skip):
+                continue
+            keys = [k for k, n in names.items() if n is not None and n.startswith(prefix)]
             if not keys:
                 warnings.append(f"No checkpoint tensors found for block '{prefix}'.")
             stored = expanded = 0
@@ -252,7 +278,7 @@ def plan(
 
     other = 0
     for k in ck.keys():
-        if k in in_block or k.endswith(".comfy_quant") or _is_scale_key(k, ck):
+        if k in in_block or k in skipped or k.endswith(".comfy_quant") or _is_scale_key(k, ck):
             continue
         info = ck.info(k)
         other += expanded_nbytes(info.shape, info.torch_dtype, cdt)

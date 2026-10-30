@@ -5,6 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from .conftest import strip_net  # noqa: E402
 from .tiny_model import meta_model  # noqa: E402
 from trash_panda.offload import stage  # noqa: E402
 from trash_panda.offload.hardware import Hardware  # noqa: E402
@@ -24,7 +25,7 @@ def _cuda(available):
 def isolated(monkeypatch):
     """Run on the CPU whatever the machine has, with no CUDA seen by stage(), and nothing remembered at the start."""
     real = stage_module.stream_load
-    monkeypatch.setattr(stage_module, "stream_load", lambda model, path, plan: real(model, path, plan=plan, device="cpu"))
+    monkeypatch.setattr(stage_module, "stream_load", lambda model, path, plan, **kw: real(model, path, plan=plan, device="cpu", **kw))
     monkeypatch.setattr(stage_module, "torch", _cuda(False))
     monkeypatch.setattr(stage_module, "_activations", {})
 
@@ -127,6 +128,22 @@ def test_nothing_is_remembered_when_the_block_raises(tiny_checkpoint, measured):
             raise RuntimeError("boom")
     assert stage_module._activations == {}
     assert measured == []
+
+
+def test_key_map_reaches_both_the_planner_and_the_loader(renamed_checkpoint):
+    ref, path = renamed_checkpoint
+    x = torch.randn(1, 16)
+    with stage(meta_model, path, key_map=strip_net, **PLAN) as (model, p):
+        assert all(b.stored_bytes > 0 for b in p.blocks)
+        assert torch.allclose(model(x), ref(x))
+
+
+def test_skip_prefixes_reach_both_the_planner_and_the_loader(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    with stage(meta_model, path, skip_prefixes=("blocks.3.", "head."), **PLAN) as (model, p):
+        assert len(p.blocks) == 3
+        assert model.head.weight.is_meta
+        assert not model.blocks[0].lin1.weight.is_meta
 
 
 def test_nothing_is_measured_without_cuda(tiny_checkpoint, planned):

@@ -2,6 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from .conftest import strip_net  # noqa: E402
 from .tiny_model import meta_model  # noqa: E402
 from trash_panda.offload.hardware import Hardware  # noqa: E402
 from trash_panda.offload.planner import (  # noqa: E402
@@ -38,6 +39,48 @@ def test_parse_bytes():
     assert parse_bytes("1.5 gb") == 1_500_000_000
     assert parse_bytes(123) == 123
     assert parse_bytes(None) is None
+
+
+def test_key_map_finds_the_tensors_of_renamed_keys(tiny_checkpoint, renamed_checkpoint):
+    plain = auto(tiny_checkpoint[1], hw(0, 10 ** 9))
+    mapped = auto(renamed_checkpoint[1], hw(0, 10 ** 9), key_map=strip_net)
+    assert [b.stored_bytes for b in mapped.blocks] == [b.stored_bytes for b in plain.blocks]
+    assert mapped.other_bytes == plain.other_bytes
+    assert not any("No checkpoint tensors" in w for w in mapped.warnings)
+
+
+def test_renamed_keys_without_a_key_map_find_nothing(renamed_checkpoint):
+    p = auto(renamed_checkpoint[1], hw(0, 10 ** 9))
+    assert all(b.stored_bytes == 0 for b in p.blocks)
+    assert any("No checkpoint tensors" in w for w in p.warnings)
+
+
+def test_key_map_can_be_a_dict(tiny_checkpoint, renamed_checkpoint):
+    ref, path = renamed_checkpoint
+    names = {"net." + k: k for k in ref.state_dict()}
+    mapped = auto(path, hw(0, 10 ** 9), key_map=names)
+    assert [b.stored_bytes for b in mapped.blocks] == [b.stored_bytes for b in auto(tiny_checkpoint[1], hw(0, 10 ** 9)).blocks]
+
+
+def test_skipped_entries_are_not_counted_outside_the_blocks(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    whole = auto(path, hw(0, 10 ** 9))
+    skipped = auto(path, hw(0, 10 ** 9), skip_prefixes=("head.",))
+    assert whole.other_bytes - skipped.other_bytes == (16 * 4 + 4) * 4        # the head's weight and bias in float32
+    assert len(skipped.blocks) == len(whole.blocks)
+
+
+def test_a_skipped_block_is_left_out_of_the_plan(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    whole = auto(path, hw(0, 10 ** 9))
+    p = auto(path, hw(0, 10 ** 9), skip_prefixes=("blocks.3.",))
+    assert [b.prefix for b in p.blocks] == [b.prefix for b in whole.blocks][:-1]
+    assert not any("No checkpoint tensors" in w for w in p.warnings)
+
+
+def test_skipping_with_key_map_uses_model_names(renamed_checkpoint):
+    p = auto(renamed_checkpoint[1], hw(0, 10 ** 9), key_map=strip_net, skip_prefixes=("blocks.0.",))
+    assert "blocks.0." not in [b.prefix for b in p.blocks]
 
 
 def test_everything_on_gpu_when_it_fits(tiny_checkpoint):

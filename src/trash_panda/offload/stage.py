@@ -12,7 +12,7 @@ from .planner import plan
 _activations: Dict[str, int] = {}  # key -> measured activation bytes, kept for the life of the process
 
 @contextmanager
-def stage(build: Callable[[], torch.nn.Module], path, *, key: Optional[str] = None, **plan_kwargs):
+def stage(build, path, *, key=None, key_map=None, skip_prefixes=(), **plan_kwargs):
     """Load one model for the `with` block and give its memory back afterwards.
     `build` returns the model on the meta device. `path` is its checkpoint. `plan_kwargs` go to plan().
     The peak GPU memory of the block is remembered under `key` (default: the checkpoint path) and used as 
@@ -21,8 +21,8 @@ def stage(build: Callable[[], torch.nn.Module], path, *, key: Optional[str] = No
     k = key or str(path)
     model = build()
     plan_kwargs.setdefault("activation_vram", _activations.get(k))
-    p = plan(model, path, **plan_kwargs)
-    stream_load(model, path, plan=p)
+    p = plan(model, path, key_map=key_map, skip_prefixes=skip_prefixes, **plan_kwargs)
+    stream_load(model, path, plan=p, key_map=key_map, skip_prefixes=skip_prefixes)
     handle = install_offload(model)
     before = _start_peak() if torch.cuda.is_available() else None
     try:

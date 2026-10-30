@@ -3,6 +3,14 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.0.16] - 2026-10-30
+### Added
+- `plan()` and `stage()` take `key_map` and `skip_prefixes`, with the same meaning as in `stream_load()`. `plan()` sizes each block from the checkpoint tensors whose names map to the model's names through `key_map`, and leaves out the model entries under `skip_prefixes`: blocks under those prefixes are not planned, and their tensors are not counted in the weights outside the blocks. `stage()` passes both to `plan()` and to `stream_load()`. A checkpoint with other names than the model, or with parts the model does not need (the vision tower of a text encoder), can now go through `stage`
+- On the test machine, the text encoder of the Krea2 pipeline (Qwen3-VL, vision tower skipped) ran through `stage`. The plan found all 36 language layers and placed them on the GPU in compact fp8 (3.63 GB), where the code written by hand kept them in RAM and streamed them. Sampling in the same run took 8.90 s per step, against 9.05 s before. The time to encode the prompt was not measured
+
+### Changed
+- `plan()` matches checkpoint tensors to blocks by the model's names (after `key_map`) instead of by the checkpoint's names. A checkpoint tensor that matches no entry of the model is no longer counted in the size of a block; it is counted with the weights outside the blocks. Nothing changes when the checkpoint and the model use the same names
+
 ## [0.0.15] - 2026-10-29
 ### Added
 - `stage(build, path, *, key=None, **plan_kwargs)`, a context manager that runs one model of a pipeline. It calls `build()` for the model on the meta device, plans it (`plan_kwargs` go to `plan()`), loads it, installs the hooks and hands the model and its plan to the `with` block; when the block ends, also with an error, it calls `release()`. It records the peak GPU memory of the block under `key` (default: the checkpoint path) and passes it as `activation_vram` to the next plan with the same key in the same process, unless `activation_vram` is given. Nothing is recorded when the block raises, and the model cannot be used after the block. It does not apply adapters, and the checkpoint names must match the model's names (no `key_map` or `skip_prefixes` yet)

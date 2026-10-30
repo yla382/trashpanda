@@ -14,3 +14,17 @@ def tiny_checkpoint(tmp_path):
     path = tmp_path / "tiny.safetensors"
     save_file({k: v.contiguous() for k, v in ref.state_dict().items()}, str(path))
     return ref, path
+
+
+def strip_net(key):
+    return key[len("net."):]
+
+
+@pytest.fixture
+def renamed_checkpoint(tmp_path):
+    """Like tiny_checkpoint, but every key in the file starts with "net.". Load it with key_map=strip_net."""
+    torch.manual_seed(0)
+    ref = Tiny().eval()
+    path = tmp_path / "renamed.safetensors"
+    save_file({"net." + k: v.contiguous() for k, v in ref.state_dict().items()}, str(path))
+    return ref, path

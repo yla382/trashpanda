@@ -18,7 +18,7 @@ from typing import Callable, Dict, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 
-from .checkpoint import Checkpoint
+from .checkpoint import Checkpoint, name_resolver
 from .formats import (
     SCALE_SUFFIX,
     Kind,
@@ -120,16 +120,7 @@ def stream_load(
     expected = {n for n, _ in model.named_parameters()} | {n for n, _ in model.named_buffers()}
     skipped = {n for n in expected if n.startswith(skip_prefixes)} if skip_prefixes else set()
     quant_device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    def resolve(key: str) -> Optional[str]:
-        k = key_map(key) if callable(key_map) else (key_map or {}).get(key, key)
-        if k in expected:
-            return k
-        if k.startswith("model."):                       # newer transformers nest the LM under language_model
-            alt = "model.language_model." + k[len("model."):]
-            if alt in expected:
-                return alt
-        return None
+    resolve = name_resolver(expected, key_map)
 
     def tier_of(name: str) -> str:
         if disk_prefixes and name.startswith(disk_prefixes):

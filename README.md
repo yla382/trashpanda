@@ -152,10 +152,11 @@ with stage(build_unet, "unet.safetensors", resident_blocks=12) as (unet, p):
                                                  # here the UNet's RAM and VRAM are free again
 ```
 
-The keyword arguments go to `plan()`. The peak GPU memory of the block is remembered under `key` (by default the
-checkpoint path) and used as `activation_vram` the next time the same key is planned in the same process. The model
-cannot be used after the block. The checkpoint's tensor names must match the model's names, and adapters are not
-applied.
+The keyword arguments go to `plan()`, except `key_map` and `skip_prefixes`, which go to both `plan()` and
+`stream_load()`. Use them when the checkpoint's names differ from the model's, or when part of the model should not be
+loaded (for example the vision tower of a text encoder). The peak GPU memory of the block is remembered under `key` (by
+default the checkpoint path) and used as `activation_vram` the next time the same key is planned in the same process.
+The model cannot be used after the block, and adapters are not applied.
 
 ### Storage dtype
 
@@ -235,6 +236,8 @@ direction, or come after it, and are not planned for now:
 * **A KV-cache budget for language models**, from the context length you intend to use
 * **4-bit and 8-bit storage** (for example NF4 with `bitsandbytes`, or our own implementation), to fit more of the
   model in RAM and on the GPU and halve the traffic
+* **fp8 checkpoints with block-wise scales** (the `weight_scale_inv` layout used on the Hugging Face Hub), with one
+  scale per 128 x 128 block of weights. It touches the scale lookup, the expansion and the staging of the scales
 * **LoRA and other adapters** on offloaded blocks
 * **A `from_pretrained`-style helper for `transformers` models** (find the weight files, build on the meta device with
   real buffers, plan, load and install the hooks in one call), ignoring buffers that are not in the checkpoint (rotary
@@ -290,19 +293,13 @@ In this order, because the silent slowdowns seen so far (GPU memory spilling int
   `release()` does the releasing by hand now. In single runs, releasing the text encoder before the diffusion model was
   planned gave the planner several GB more RAM, and releasing the diffusion model before the VAE was built stopped the
   decode of a 2048 x 1024 image from spilling into shared GPU memory (watched by eye, not logged). `stage()` builds,
-  plans and loads one model around your code, releases it afterwards, and records its activation size. It supports the
-  diffusion model and the VAE of the Krea2 pipeline today; what remains is the text encoder, a `transformers` model
-  (see Compatibility below). Also left is a smaller step such as `release_gpu()` / `restore_gpu()` on the handle, which
-  moves the resident blocks off the GPU and back while keeping the hooks. The cost of putting them back for each image,
-  and the RAM they need meanwhile, have not been measured
-
-**Formats**
-* fp8 checkpoints with block-wise scales (the `weight_scale_inv` layout used on the Hugging Face Hub)
+  plans and loads one model around your code, releases it afterwards, and records its activation size. It runs the
+  text encoder (a `transformers` model), the diffusion model and the VAE of the Krea2 pipeline today. Left is a smaller
+  step such as `release_gpu()` / `restore_gpu()` on the handle, which moves the resident blocks off the GPU and back
+  while keeping the hooks. The cost of putting them back for each image, and the RAM they need meanwhile, have not been
+  measured
 
 **Compatibility**
-* make `stage()` work for every model of a pipeline, including `transformers` models: `plan()` and `stage()` take
-  `key_map` and `skip_prefixes`, as `stream_load()` does, so a checkpoint with older names or a part that is not loaded
-  (the text encoder of the Krea2 pipeline, with its vision tower) goes through the same path as the diffusion model
 * `diffusers` pipelines: build the large components with `stream_load` and hand them to the pipeline class, so
   `from_pretrained` does not load everything into RAM first
 
