@@ -61,7 +61,7 @@ def planned(monkeypatch):
 
 def test_the_model_is_loaded_inside_the_block_and_released_after(tiny_checkpoint):
     _, path = tiny_checkpoint
-    with stage(meta_model, path, **PLAN) as (model, p):
+    with stage(meta_model, path, **PLAN) as (model, _p, _handle):
         assert not any(t.is_meta for t in model.parameters())
         assert model(torch.zeros(1, 16)).shape == (1, 4)
     assert all(t.is_meta for t in model.parameters())
@@ -71,7 +71,7 @@ def test_the_model_is_released_when_the_block_raises(tiny_checkpoint):
     _, path = tiny_checkpoint
     held = []
     with pytest.raises(RuntimeError, match="boom"):
-        with stage(meta_model, path, **PLAN) as (model, _):
+        with stage(meta_model, path, **PLAN) as (model, _, _handle):
             held.append(model)
             raise RuntimeError("boom")
     assert all(t.is_meta for t in held[0].parameters())
@@ -88,7 +88,7 @@ def test_the_peak_is_remembered_and_used_by_the_next_plan(tiny_checkpoint, measu
 
 def test_the_peak_is_measured_from_the_start_of_the_block_with_the_plan(tiny_checkpoint, measured):
     _, path = tiny_checkpoint
-    with stage(meta_model, path, **PLAN) as (_, p):
+    with stage(meta_model, path, **PLAN) as (_, p, _handle):
         pass
     assert measured == [(7, p)]
 
@@ -133,14 +133,14 @@ def test_nothing_is_remembered_when_the_block_raises(tiny_checkpoint, measured):
 def test_key_map_reaches_both_the_planner_and_the_loader(renamed_checkpoint):
     ref, path = renamed_checkpoint
     x = torch.randn(1, 16)
-    with stage(meta_model, path, key_map=strip_net, **PLAN) as (model, p):
+    with stage(meta_model, path, key_map=strip_net, **PLAN) as (model, p, _handle):
         assert all(b.stored_bytes > 0 for b in p.blocks)
         assert torch.allclose(model(x), ref(x))
 
 
 def test_skip_prefixes_reach_both_the_planner_and_the_loader(tiny_checkpoint):
     _, path = tiny_checkpoint
-    with stage(meta_model, path, skip_prefixes=("blocks.3.", "head."), **PLAN) as (model, p):
+    with stage(meta_model, path, skip_prefixes=("blocks.3.", "head."), **PLAN) as (model, p, _handle):
         assert len(p.blocks) == 3
         assert model.head.weight.is_meta
         assert not model.blocks[0].lin1.weight.is_meta
@@ -151,3 +151,13 @@ def test_nothing_is_measured_without_cuda(tiny_checkpoint, planned):
     with stage(meta_model, path, **PLAN):
         pass
     assert stage_module._activations == {}
+
+
+def test_the_block_gets_the_handle_and_a_final_pass_frees_the_blocks(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    with stage(meta_model, path, **PLAN) as (model, _, handle):
+        handle.final_pass()
+        model(torch.zeros(1, 16))
+        assert all(t.is_meta for t in model.blocks.parameters())
+        assert not model.head.weight.is_meta                   # the weights outside the blocks stay until the block ends
+    assert all(t.is_meta for t in model.parameters())

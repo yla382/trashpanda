@@ -146,13 +146,14 @@ def build_unet():
     with torch.device("meta"):
         return MyUNet(config)
 
-with stage(build_unet, "unet.safetensors", resident_blocks=12) as (unet, p):
+with stage(build_unet, "unet.safetensors", resident_blocks=12) as (unet, p, _):
     print(p)
     latents = denoise(unet, ...)
                                                  # here the UNet's RAM and VRAM are free again
 ```
 
-The keyword arguments go to `plan()`, except `key_map` and `skip_prefixes`, which go to both `plan()` and
+The block gets the model, its plan and the handle that `install_offload()` returns. The keyword arguments go to
+`plan()`, except `key_map` and `skip_prefixes`, which go to both `plan()` and
 `stream_load()`. Use them when the checkpoint's names differ from the model's, or when part of the model should not be
 loaded (for example the vision tower of a text encoder). The peak GPU memory of the block is remembered under `key` (by
 default the checkpoint path) and used as `activation_vram` the next time the same key is planned in the same process.
@@ -243,6 +244,7 @@ direction, or come after it, and are not planned for now:
   real buffers, plan, load and install the hooks in one call), ignoring buffers that are not in the checkpoint (rotary
   tables, position ids) instead of failing, and making `model.dtype`, `model.device` and `model.to(...)` behave on
   offloaded models so `generate()` and `pipeline()` work
+* **A ComfyUI custom node** that loads and runs a model through trash-panda inside a ComfyUI workflow
 * **A memory-mapped disk tier** as an experiment: map the checkpoint once and let the operating system keep recently
   used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit read-ahead,
   because a least-recently-used cache can thrash when the model is read in a cycle
@@ -280,24 +282,40 @@ that focus, roughly in the order they are planned. Nothing here is promised or s
   when the hooks are installed, and let the order seen at run time correct it
 * the number of pinned buffers as a tested option (`TRASH_PANDA_PINNED_BUFFERS`, 3 or 4 instead of 2), if the
   profile's "worker waited for a free pinned buffer" line shows the worker is held up by them
-* overlap the stages of a pipeline: while the text encoder runs, load as much of the diffusion model as there is
-  spare VRAM and RAM for, then release the encoder and start sampling with what is already loaded while the rest keeps
-  loading; the same for the VAE during sampling. It needs the staged planning above, a plan that predicts the memory
-  that will be free after a stage, and blocks that can change from streamed to resident while running. Preloading
-  would also compete with the encoder for the drive when the encoder reads from disk. An idea, not a design
 
 **Planner**
-In this order, because the silent slowdowns seen so far (GPU memory spilling into shared memory at about 11.6 to
-11.8 GB, a headroom that was too thin, an overflow after sampling at 2K) all come from the planner knowing too little:
-* plan a pipeline in stages (encode, denoise, decode) so memory used by an earlier stage can be released.
-  `release()` does the releasing by hand now. In single runs, releasing the text encoder before the diffusion model was
-  planned gave the planner several GB more RAM, and releasing the diffusion model before the VAE was built stopped the
-  decode of a 2048 x 1024 image from spilling into shared GPU memory (watched by eye, not logged). `stage()` builds,
-  plans and loads one model around your code, releases it afterwards, and records its activation size. It runs the
-  text encoder (a `transformers` model), the diffusion model and the VAE of the Krea2 pipeline today. Left is a smaller
-  step such as `release_gpu()` / `restore_gpu()` on the handle, which moves the resident blocks off the GPU and back
-  while keeping the hooks. The cost of putting them back for each image, and the RAM they need meanwhile, have not been
-  measured
+`stage()` and `release()` run the models of a pipeline one at a time today (see "Running a stage"), and `stage()` runs
+the text encoder, the diffusion model and the VAE of the Krea2 pipeline. In single runs, releasing the text encoder
+before the diffusion model was planned gave the planner several GB more RAM, and releasing the diffusion model before
+the VAE was built stopped the decode of a 2048 x 1024 image from spilling into shared GPU memory (watched by eye, not
+logged). What is left is to let memory move between stages while they run. The steps below are small, each can be
+tested on its own, and they are listed in the order they depend on one another:
+* announce each release as an event on a queue: which block, how many bytes, in which tier, and a CUDA event that
+  marks when the memory can be reused (a tensor freed in Python may still be read by queued GPU work). The hook only
+  puts the event on the queue, so the compute thread never waits for whoever reacts to it. Whether the allocator
+  reuses memory freed on one stream for copies on another needs a test
+* find out whether a RAM-tier block can be given back before the model is released. The RAM tier is the checkpoint
+  file mapped into memory, and it is not known whether part of the mapping can be dropped, or whether the blocks would
+  have to be separate tensors. A small script that maps a checkpoint, touches the blocks, drops them one at a time and
+  watches the free RAM would settle it
+* load the next model's blocks into the VRAM that a final pass has freed. A block would move in its stored form (fp8,
+  for example) and be expanded in the stream buffer only when it runs. Compare the next stage's time with its time
+  when it is loaded after the release. A background thread would take the events from the queue and load the next
+  planned blocks, waiting for each event's CUDA event first. Loading early would compete with the running stage for the
+  drive when that stage reads from disk
+* plan a stage with the memory that is expected to be free when it starts. `plan()` uses the memory that is free when
+  it runs, so it needs a way to be given the memory that the running stage will release. The stage would be planned
+  once for that end state, with the activation headroom from an earlier measurement, and the loading above would only
+  fill the plan in as memory frees up; if the free memory at the start differs from the prediction, it is planned once
+  more then. Planning again on every event is the alternative if this proves too coarse
+* let the depth of the staging follow the profile: a look-ahead above 2 only where the main thread waits for blocks,
+  and the spare VRAM to the next model where it does not
+* one pinned pool for the whole pipeline, sized for the largest block of any stage and kept until the pipeline ends,
+  instead of one pool per model
+* `release_gpu()` / `restore_gpu()` on the handle, which move the resident blocks off the GPU and back while keeping
+  the hooks. The cost of putting them back for each image, and the RAM they need meanwhile, have not been measured
+* something that holds these together: it runs the stages of a pipeline in order and owns the memory budgets that move
+  between them. Its interface is not decided; it is better settled after the steps above have measurements
 
 **Compatibility**
 * `diffusers` pipelines: build the large components with `stream_load` and hand them to the pipeline class, so
@@ -314,6 +332,11 @@ In this order, because the silent slowdowns seen so far (GPU memory spilling int
   `-1073741819` is a crash in native code, while a normal code points to the process being ended by the system. Also
   print the memory in use and the available commit (RAM plus page file) before loading, so a failed run shows what
   the machine had left
+* an option to keep chosen blocks or weights when `final_pass()` frees a model, if a model turns out to need it. By
+  default every block is freed after it runs and the weights outside the blocks are left alone. A block that runs more
+  than once in a pass (weight sharing as in ALBERT, or a caller that runs the model twice in one step) would be freed
+  after its first run, and a weight tied between a block and an outside layer would be shared with a layer that still
+  needs it. A list of name prefixes, like `skip_prefixes`, would leave those alone. It may not be needed
 * tests on tiny `transformers` and `diffusers` models on the CPU, in CI
 * tests on more models, GPUs and operating systems (Linux in particular), with benchmarks published here. A first
   test on a Mac is planned: the unit tests and `examples/sdxl_benchmark.py --size 512 --steps 10` in the baseline and

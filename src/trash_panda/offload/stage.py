@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from contextlib import contextmanager
-from typing import Callable, Dict, Optional
+from typing import Dict
 import torch
 from .hooks import install_offload, release
 from .loader import stream_load
@@ -17,6 +17,7 @@ def stage(build, path, *, key=None, key_map=None, skip_prefixes=(), **plan_kwarg
     `build` returns the model on the meta device. `path` is its checkpoint. `plan_kwargs` go to plan().
     The peak GPU memory of the block is remembered under `key` (default: the checkpoint path) and used as 
     `activation_vram` the next time the same key is planned, unless plan_kwargs set it. Nothing is remembered when the block raises.
+    The block gets `(model, plan, handle)`; `handle.final_pass()` frees each block as it runs during the last call.
     The model cannot be used after the block."""
     k = key or str(path)
     model = build()
@@ -26,7 +27,7 @@ def stage(build, path, *, key=None, key_map=None, skip_prefixes=(), **plan_kwarg
     handle = install_offload(model)
     before = _start_peak() if torch.cuda.is_available() else None
     try:
-        yield model, p
+        yield model, p, handle
         if before is not None:
             _activations[k] = _peak_since(before, p)
     finally:

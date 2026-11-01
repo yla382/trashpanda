@@ -3,6 +3,15 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.0.17] - 2026-10-31
+### Added
+- `handle.final_pass()` on the handle that `install_offload()` and `offload_blocks()` return. The caller says which call is the last one (for example before the last denoising step, or, with classifier-free guidance, before the last of the two calls of that step); from then on every block is freed right after it has run, blocks that were on the GPU from the start included, and the model cannot be run again. The weights outside the blocks are not freed by it; `release()` does that. Calling the model after the final pass does not raise an error: the freed blocks are on the meta device and give meta tensors back
+- On the test machine, with temporary logging, the memory PyTorch had allocated fell block by block during the final pass of each model of the Krea2 pipeline. Text encoder: 36 layers, from 4.36 to 1.00 GB, about 0.1 GB per layer. Diffusion model: 32 blocks, from about 6 to about 1 GB during the last call of the last step, with small rises in between from the blocks staged ahead. VAE: 8 planned blocks of 177 MB in total; the allocated memory rose during the decode, because the decode's own tensors grew by more than the blocks freed. The memory PyTorch had reserved did not change (4.89 GB for the encoder, 9.87 GB for the diffusion model), so Task Manager and `nvidia-smi` do not show the drop. Whether the next model can use the freed memory is not tested yet
+
+### Changed
+- **Breaking:** `stage()` now hands `(model, plan, handle)` to the `with` block instead of `(model, plan)`, so the block can call `handle.final_pass()`. Code that unpacks two values fails with an unpack error and needs a third name, for example `as (unet, p, _)`
+- `ruff check` is set up for development (`ruff` in the dev dependencies, rules `E4`, `E7`, `E9` and `F`, line length 120). The code is not reformatted. It found two unused imports in `stage.py` and a lambda assigned to a name in `install_offload()`, both fixed
+
 ## [0.0.16] - 2026-10-30
 ### Added
 - `plan()` and `stage()` take `key_map` and `skip_prefixes`, with the same meaning as in `stream_load()`. `plan()` sizes each block from the checkpoint tensors whose names map to the model's names through `key_map`, and leaves out the model entries under `skip_prefixes`: blocks under those prefixes are not planned, and their tensors are not counted in the weights outside the blocks. `stage()` passes both to `plan()` and to `stream_load()`. A checkpoint with other names than the model, or with parts the model does not need (the vision tower of a text encoder), can now go through `stage`

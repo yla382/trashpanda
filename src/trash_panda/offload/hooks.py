@@ -30,6 +30,7 @@ class OffloadHandle:
 
     def __init__(self) -> None:
         self._undo: List[Callable[[], None]] = []
+        self._prefetcher = None
 
     def _add(self, fn: Callable[[], None]) -> None:
         self._undo.append(fn)
@@ -40,6 +41,10 @@ class OffloadHandle:
     def remove(self) -> None:
         while self._undo:
             self._undo.pop()()
+
+    def final_pass(self) -> None:
+        """From now on each block is freed right after it runs. The model cannot run again."""
+        self._prefetcher.final = True
 
 
 class DiskReader:
@@ -154,6 +159,7 @@ class _Prefetcher:
         self.in_flight   = deque()
         self.pool        = _PinnedPool(cfg.pinned_buffers) if self.stream is not None else None
         self.worker      = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not None else None
+        self.final       = False
         # profiling: where does the time go? Off by default; on with profile=True or TRASH_PANDA_PROFILE=1
         self.profile     = cfg.profile if profile is None else bool(profile)
         self.stats       = defaultdict(float)
@@ -424,6 +430,18 @@ def _needs_wrapping(slots, scales, device: torch.device, dtype: torch.dtype, dis
     return False
 
 
+def _to_meta(module: nn.Module) -> None:
+    for m in module.modules():
+        for name in list(m._parameters):
+            p = m._parameters[name]
+            if p is not None and not p.is_meta:
+                m._parameters[name] = nn.Parameter(torch.empty_like(p, device="meta"), requires_grad=False)
+        for name in list(m._buffers):
+            b = m._buffers[name]
+            if b is not None and not b.is_meta:
+                m._buffers[name] = torch.empty_like(b, device="meta")
+
+
 def offload_blocks(
     blocks: Iterable[nn.Module],
     *,
@@ -445,6 +463,7 @@ def offload_blocks(
     if prefetcher is None:
         prefetcher = _Prefetcher(dev, lookahead, profile)
         handle._add(prefetcher.close)
+    handle._prefetcher = prefetcher
 
     for block in blocks:
         scales = {
@@ -462,6 +481,12 @@ def offload_blocks(
 
         reader = disk(block) if disk is not None else None
         if not _needs_wrapping(slots, scales, dev, compute_dtype, reader):
+            def free_after_run(module, _inputs, _output):
+                if prefetcher.final:
+                    _to_meta(module)
+
+            hook = block.register_forward_hook(free_after_run)
+            handle._add(hook.remove)
             continue
 
         entry  = _Entry(slots, scales, reader)
@@ -497,7 +522,7 @@ def offload_blocks(
 
         original_forward = block.forward
 
-        def wrapped(*args, _orig=original_forward, _bring=bring, _restore=restore, _entry=entry, **kwargs):
+        def wrapped(*args, _orig=original_forward, _bring=bring, _restore=restore, _entry=entry, _block=block, **kwargs):
             prefetcher.learn(_entry)
             prefetcher.wait_for_room()
             _bring()
@@ -506,7 +531,12 @@ def offload_blocks(
             try:
                 return _orig(*args, **kwargs)
             finally:
-                _restore()
+                if prefetcher.final:
+                    _entry.slots.clear()   # the entry holds the original tensors, so these keep the memory alive
+                    _entry.scales.clear()
+                    _to_meta(_block)
+                else:
+                    _restore()
                 prefetcher.block_done()
 
         def undo(block=block, restore=restore, entry=entry):
@@ -544,13 +574,15 @@ def install_offload(
     handle = OffloadHandle()
     pre    = _Prefetcher(torch.device(dev or ("cuda" if torch.cuda.is_available() else "cpu")), lookahead, profile)
     handle._add(pre.close) #registered first, so it runs last on remove()
+    handle._prefetcher = pre
     for b in plan.blocks:
         block = model.get_submodule(b.prefix.rstrip("."))
         reader_factory = None
         if b.tier == Tier.DISK:
             if state is None:
                 raise ValueError("Disk blocks need a model loaded with stream_load().")
-            reader_factory = lambda _blk, p=b.prefix: DiskReader(state.checkpoint, state.disk_keys, p)
+            def reader_factory(_blk, p=b.prefix):
+                return DiskReader(state.checkpoint, state.disk_keys, p)
         handle.extend(offload_blocks([block], device=dev, compute_dtype=cdt, disk=reader_factory, prefetcher=pre))
     return handle
 
@@ -564,16 +596,7 @@ def release(model: nn.Module, handle: Optional[OffloadHandle] = None) -> None:
     if handle is not None:
         handle.remove()
     model.__dict__.pop("_trash_panda_state", None)
-
-    for module in model.modules():
-        for name in list(module._parameters):
-            p = module._parameters[name]
-            if p is not None and not p.is_meta:
-                module._parameters[name] = nn.Parameter(torch.empty_like(p, device="meta"), requires_grad=False)
-        for name in list(module._buffers):
-            b = module._buffers[name]
-            if b is not None and not b.is_meta:
-                module._buffers[name] = torch.empty_like(b, device="meta")
+    _to_meta(model)
 
     gc.collect()
     if torch.cuda.is_available():

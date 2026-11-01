@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "dumpsterpanda"
-version = "0.0.16"
+version = "0.0.17"
 description = "Run models bigger than your GPU: layer-by-layer weight streaming across GPU, RAM and disk."
 authors = ["yla382"]
 readme = "README.md"
@@ -26,6 +26,7 @@ safetensors = ">=0.4.3"
 pytest = "*"
 psutil = "*"
 numpy = "*"      # safetensors.torch.save_file (used by the tests) needs it
+ruff = "*"       # lint only (ruff check); the code keeps its own formatting, so ruff format is not used
 # CPU-only torch for running the tests. Real users install the build that matches their GPU themselves.
 torch = { version = ">=2.1", source = "pytorch-cpu" }
 
@@ -33,6 +34,13 @@ torch = { version = ">=2.1", source = "pytorch-cpu" }
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 priority = "explicit"
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
