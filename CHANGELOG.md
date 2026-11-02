@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.0.18] - 2026-11-01
+### Added
+- The prefetcher is told the order of the blocks when the hooks are installed, so the first pass can be prefetched; before, it learned the order during the first pass and the first pass of any model, and every pass of a model that runs once, was not prefetched at all. By default the order is the one the plan lists the blocks in, which is the order the model defines them in. The order seen at run time still corrects the links from the second pass on
+- `order=` on `stage()` and `install_offload()`: a list of block prefixes that run first, in that order; the other blocks follow in the plan's order. A name that is not in the plan raises a `ValueError`. With `order` given, the order file below is neither read nor written
+- A warning, once per model, when the first blocks that run do not follow the order given. It names the blocks and says how to pass `order=`. For the Krea2 diffusion model it appears without `order=`, because the model runs its four text blocks before its 28 main blocks and defines them after
+- With `order=None`, the order the blocks ran in is saved when the model is released, in `<checkpoint name>_order.json` next to the checkpoint, and read the next time. `order_file_destination=` on `stage()` and `install_offload()` is the folder to use instead. The file lists every block that ran, wrapped or not, so a block that never runs (the encoder blocks of the VAE in a decode) is absent. It is written only when there was no file or the order in it was wrong, a file that names a block the model does not have is ignored and replaced, and a folder that cannot be written gives one warning. One line is printed when the file is saved and one when it is used
+- On the test machine, the Krea2 pipeline saved files for the text encoder (36 blocks), the diffusion model (32 blocks) and the VAE (6 of its 8 planned blocks), and the next run used the first two with no warning. The time did not change in a way that stands out from the variation between runs: 62 to 66 s for the 7 sampling steps, 8.98 to 9.46 s per step, with and without the order given. The first step of the diffusion model took 25.2 s before and 21.8 s with the order, against about 7 s for the others. The missing prefetch is therefore probably not the main reason the first step is slow; this is a conclusion from single runs, not a measurement of the cause
+
+### Changed
+- Resident blocks that are not wrapped get a forward pre-hook that notes the block's name when it starts, so that the order file lists them. The hooks are removed with the handle
+- With `order=None`, a file named after the checkpoint is now created next to it by the first run of a model that has run blocks. Delete it to start over
+
+### Notes
+- The file's name is the checkpoint's file name plus `_order.json`. Two checkpoints with the same file name (diffusers models are usually all `diffusion_pytorch_model.safetensors`) share a name if `order_file_destination` is one folder, and then overwrite each other's file. The default location, next to the checkpoint, does not have this problem. How to name the file is not decided
+
 ## [0.0.17] - 2026-10-31
 ### Added
 - `handle.final_pass()` on the handle that `install_offload()` and `offload_blocks()` return. The caller says which call is the last one (for example before the last denoising step, or, with classifier-free guidance, before the last of the two calls of that step); from then on every block is freed right after it has run, blocks that were on the GPU from the start included, and the model cannot be run again. The weights outside the blocks are not freed by it; `release()` does that. Calling the model after the final pass does not raise an error: the freed blocks are on the meta device and give meta tensors back

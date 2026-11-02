@@ -159,6 +159,26 @@ loaded (for example the vision tower of a text encoder). The peak GPU memory of 
 default the checkpoint path) and used as `activation_vram` the next time the same key is planned in the same process.
 The model cannot be used after the block, and adapters are not applied.
 
+The prefetcher stages the next blocks ahead of the one that runs, so it has to know the order the blocks run in. It
+used to learn that during the first pass, which left the first pass without prefetching. Now the order is known
+before the first call:
+
+* With `order=None` (the default), `stage()` looks for `<checkpoint name>_order.json` next to the checkpoint, or in the
+  folder `order_file_destination`, and uses the order in it. If there is no file, it uses the order the model defines
+  its blocks in. When the model is released, the order the blocks ran in, every block that ran, is written to that
+  file. This happens when there was no file, or when the order in it turned out wrong, and the next run starts with
+  the real order. A file that names a block the model does not have is ignored and replaced, and a folder that cannot
+  be written gives one warning.
+* `forward()` decides the real order, and it can differ from the defined one: a diffusion model can define its four
+  text blocks after its 28 main blocks, and run them first. When the first blocks that run do not follow the order
+  given, a warning appears once. A run without a file would warn on the first run only.
+* `order=["txtfusion.layerwise_blocks.0", ...]` names the blocks that run first, in that order, and the others follow
+  in the plan's order. With it, the file is neither read nor written.
+
+The file is named after the checkpoint file, so two checkpoints with the same file name (diffusers models are
+usually all `diffusion_pytorch_model.safetensors`) share a name if `order_file_destination` is one folder, and then
+overwrite each other's file. With the default location, next to each checkpoint, this does not happen.
+
 ### Storage dtype
 
 By default weights are kept exactly as stored in the file. Optionally, `storage_dtype="bf16"` casts waiting
@@ -215,6 +235,11 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   read a block from disk the first time it is used. In one profiled run a few blocks made the main thread wait
   1 to 3 s each, and a text encoder that runs once copied its blocks at about disk speed. The cause is not
   confirmed yet (see the roadmap)
+* **Checkpoints with the same file name share an order file name.** The order file is named after the checkpoint file
+  plus `_order.json`. Diffusers models are usually all called `diffusion_pytorch_model.safetensors`, so with one shared
+  `order_file_destination` they overwrite each other's file. With the default location, next to the checkpoint, this
+  does not happen. A file that names a block the model does not have is ignored, so nothing breaks, but the file is
+  rewritten on every run
 * **Tested on one setup so far:** a 12B diffusion model (fp8 with scales) on Windows with an RTX 3060 (12 GB) and
   16 GB of RAM. Other models, GPUs and operating systems are not covered yet. The unit tests run on the CPU, and
   `examples/sdxl_benchmark.py` has a path for machines without CUDA (the Apple GPU or the CPU) that is untested
@@ -275,11 +300,38 @@ that focus, roughly in the order they are planned. Nothing here is promised or s
   in only 1 of 7 passes. That suggests nearly all the waiting is in the first pass, when the file-backed RAM tier is
   read from disk on first use. If so, steady steps may be much faster than the average the progress bar shows (about
   6 s against 9.3 s) and the first step much slower. This is an inference, not a measurement: the profile now lists
-  the time and the waiting of every pass (`TRASH_PANDA_PROFILE=1`), which will confirm or reject it. If it holds, a
-  background thread would touch the RAM-tier pages once when the hooks are installed, keeping the tier file-backed
-* prefetch models that run a single pass (a text encoder, a VAE) from their first block: the prefetcher learns the
-  block order during the first pass, so a one-pass model is not prefetched at all. Hand it the order of the blocks
-  when the hooks are installed, and let the order seen at run time correct it
+  the time and the waiting of every pass (`TRASH_PANDA_PROFILE=1`), which will confirm or reject it. On the test
+  machine the first step of a diffusion model stayed around 21 to 25 s over repeated runs, which a warm file cache
+  would be expected to shorten, so this may not be the cause. If it holds, a background thread would touch the
+  RAM-tier pages once when the hooks are installed, keeping the tier file-backed
+* a better first order for a model that has never run. The first run uses the order the model defines its blocks in,
+  which `forward()` can override (a diffusion model can define its four text blocks after its 28 main blocks and
+  run them first), so that run warns and is prefetched less well. The effect measured so far is small: the first step
+  of that model went from 25 s to 22 s, which is within the variation between runs. Two ways to know the real order
+  before the first call: a helper that records it without a real run (a call on the meta device with small inputs
+  that the caller gives), or reading the source of `forward()` with the `ast` module, which fails on code that is not
+  plain
+* decide the name of the order file, so that checkpoints with the same file name do not overwrite each other's file
+  (see Known issues). Options: a hash of the block names in the name, or the checkpoint's folder name
+* run a model while its blocks are still loading. `stage()` loads every block before the first call, so the load of
+  the resident blocks (12 of the 32 blocks, 5.21 GB, of a diffusion model on the test machine) comes before the
+  progress bar appears. The goal is to start the first call as soon as its first blocks are on the GPU. The first step
+  of that model also takes about 20 s against about 7 s for the others. Its cause is not known, and this item would not
+  remove it. The pieces, each testable on its own:
+  * the order of the blocks at install time, which `stage()` has now (see "Running a stage"), so that the loader knows
+    which block runs first
+  * `stream_load` on a worker thread that loads the resident blocks in that order and marks each one ready with a CUDA
+    event
+  * a hook on the resident blocks that waits for the mark of its block during the first call and then removes itself,
+    so later calls pay nothing
+  * the activation measurement in `stage()`: the load would then fall inside the measured region, so the peak would
+    include the weights and the next plan would reserve too much VRAM. It has to start after the load or subtract the
+    weights
+  * the order of the weights outside the blocks (embeddings, input and output layers) in the order file, if the loader
+    needs to load them before the first block
+
+  The saving is bounded by the load time of the resident blocks, so the time of `stream_load` should be measured
+  before the thread is built
 * the number of pinned buffers as a tested option (`TRASH_PANDA_PINNED_BUFFERS`, 3 or 4 instead of 2), if the
   profile's "worker waited for a free pinned buffer" line shows the worker is held up by them
 

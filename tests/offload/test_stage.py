@@ -1,4 +1,5 @@
 import importlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -151,6 +152,25 @@ def test_nothing_is_measured_without_cuda(tiny_checkpoint, planned):
     with stage(meta_model, path, **PLAN):
         pass
     assert stage_module._activations == {}
+
+
+def test_order_reaches_the_hooks(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    with stage(meta_model, path, order=["blocks.2"], **{**PLAN, "compute_dtype": "bf16"}) as (_, _plan, handle):
+        entry, names = handle._prefetcher.head, []
+        while entry is not None:
+            names.append(entry.name)
+            entry = entry.next
+        assert names == ["blocks.2", "blocks.0", "blocks.1", "blocks.3"]
+
+
+def test_the_order_file_goes_to_the_destination_given(tiny_checkpoint, tmp_path):
+    _, path = tiny_checkpoint
+    folder = tmp_path / "from_stage"
+    with stage(meta_model, path, order_file_destination=folder, **{**PLAN, "compute_dtype": "bf16"}) as (model, _, _):
+        model(torch.zeros(1, 16).bfloat16())
+    saved = json.loads((folder / "tiny_order.json").read_text(encoding="utf-8"))["order"]
+    assert saved == ["blocks.0", "blocks.1", "blocks.2", "blocks.3"]
 
 
 def test_the_block_gets_the_handle_and_a_final_pass_frees_the_blocks(tiny_checkpoint):

@@ -13,6 +13,7 @@ import time
 import warnings
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -22,6 +23,7 @@ from . import config
 from .checkpoint import Checkpoint
 from .formats import SCALE_SUFFIX, expand
 from .loader import OffloadState, _navigate
+from .order_file import order_path, read_order, write_order
 from .planner import Plan, Tier
 
 
@@ -85,6 +87,7 @@ class _Entry:
         self.reader = reader
         self.next   = None
         self.staged = None
+        self.name   = None
 
     def needs_copy(self) -> bool:
         """True if the block's weights are on disk or in CPU memory, so they must be copied to the GPU."""
@@ -146,7 +149,8 @@ class _PinnedPool:
 class _Prefetcher:
     """Copies the next block's compact tensors to the device on a second CUDA stream"""
 
-    profile = False
+    profile    = False
+    order_path = None
 
     def __init__(self, device: torch.device, lookahead: Optional[int] = None, profile: Optional[bool] = None):
         cfg = config.current()
@@ -155,6 +159,12 @@ class _Prefetcher:
         self.index       = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
         self.stream      = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.last        = None
+        self.head        = None                      # the first block in the order the blocks were given
+        self.hinted      = None                      # the last block handed over, in the order the blocks were given
+        self.warned      = False
+        self.seen        = {}                        # block names in the order they first ran
+        self.order_path  = None                      # where to save that order when the prefetcher closes
+        self.order_read  = False                     # True if the order in use came from that file
         self.window      = []
         self.in_flight   = deque()
         self.pool        = _PinnedPool(cfg.pinned_buffers) if self.stream is not None else None
@@ -176,6 +186,8 @@ class _Prefetcher:
             atexit.register(self.report)
 
     def learn(self, entry) -> None:
+        if entry.name is not None:
+            self.note(entry.name)
         if self.profile:
             if self.first is None:
                 self.first = entry
@@ -185,9 +197,37 @@ class _Prefetcher:
                 self._pass_start = time.perf_counter()
                 self._pass_wait0 = self.stats["wait_staged_s"]
             self.where.setdefault(id(entry), len(self.where))
-        if self.last is not None:
+        if self.last is None:
+            if self.head is not None and entry is not self.head and not self.warned:
+                self._warn_order(f"{entry.name or 'a block'} ran first, but {self.head.name or 'another block'} was expected first.")
+        else:
+            expected = self.last.next
+            if expected is not None and expected is not entry and not self.warned:
+                self._warn_order(
+                    f"{entry.name or 'a block'} ran after {self.last.name or 'a block'}, "
+                    f"but {expected.name or 'another block'} was expected."
+                )
             self.last.next = entry
         self.last = entry
+
+    def _warn_order(self, what: str) -> None:
+        self.warned = True
+        warnings.warn(
+            f"block order differs from the order given: {what} Pass order=[...] to stage() or install_offload(), "
+            "or list the blocks in the order they run, so the first pass is prefetched correctly."
+        )
+
+    def note(self, name: str) -> None:
+        """Remember that the block called `name` has started, the first time only: this is the order it first ran in."""
+        self.seen.setdefault(name, None)
+
+    def expect(self, entry) -> None:
+        """Link `entry` after the previous one in the order the blocks were given, before any pass has run."""
+        if self.hinted is None:
+            self.head = entry
+        else:
+            self.hinted.next = entry
+        self.hinted = entry
 
     def _end_pass(self) -> None:
         """Close the pass in progress: how long it took (until its last block finished) and how long the main thread waited for staged blocks during it."""
@@ -399,8 +439,16 @@ class _Prefetcher:
         print(text)
         return text
 
+    def _save_order(self) -> None:
+        """Save the order that was seen, unless there is nothing to save or the file in use was right."""
+        if self.order_path is None or not self.seen or (self.order_read and not self.warned):
+            return
+        if write_order(self.order_path, self.seen):
+            print(f"trash-panda: saved the order of {len(self.seen)} blocks to {self.order_path}")
+
     def close(self) -> None:
         """Stop the worker thread and let go of the pinned buffers and anything still staged."""
+        self._save_order()
         self.report()
         if self.worker is not None:
             self.worker.shutdown(wait=True)
@@ -490,6 +538,7 @@ def offload_blocks(
             continue
 
         entry  = _Entry(slots, scales, reader)
+        prefetcher.expect(entry)
 
         def bring(entry=entry):
             staged = prefetcher.take(entry)
@@ -550,6 +599,18 @@ def offload_blocks(
     return handle
 
 
+def _in_order(blocks, order):
+    """The plan's blocks with the ones named in `order` first, in that order; the rest follow in plan order."""
+    names   = [p.rstrip(".") for p in order]
+    by_name = {b.prefix.rstrip("."): b for b in blocks}
+    unknown = [n for n in names if n not in by_name]
+    if unknown:
+        raise ValueError(f"order names blocks that are not in the plan: {unknown}")
+    first = [by_name[n] for n in dict.fromkeys(names)]
+    named = set(names)
+    return first + [b for b in blocks if b.prefix.rstrip(".") not in named]
+
+
 def install_offload(
     model: nn.Module,
     plan: Optional[Plan] = None,
@@ -558,8 +619,15 @@ def install_offload(
     compute_dtype: Optional[torch.dtype] = None,
     lookahead: Optional[int] = None,
     profile: Optional[bool] = None,
+    order: Optional[Iterable[str]] = None,
+    order_file_destination: Union[str, Path, None] = None,
 ) -> OffloadHandle:
-    """Install the offload hooks for every block in the plan (defaults to the plan used by stream_load)."""
+    """Install the offload hooks for every block in the plan (defaults to the plan used by stream_load).
+    `order` names blocks (by prefix) that run first, in that order; the others follow in the plan's order. It tells the
+    prefetcher what to stage before the first pass has shown the real order.
+    When `order` is None, the order the blocks ran in is saved when the handle is removed, in
+    `<checkpoint name>_order.json`, and read the next time. `order_file_destination` is the folder of that file (by
+    default the checkpoint's own folder); it is only used when `order` is None."""
     state: Optional[OffloadState] = getattr(model, "_trash_panda_state", None)
     plan = plan or (state.plan if state is not None else None)
     if plan is None:
@@ -575,7 +643,14 @@ def install_offload(
     pre    = _Prefetcher(torch.device(dev or ("cuda" if torch.cuda.is_available() else "cpu")), lookahead, profile)
     handle._add(pre.close) #registered first, so it runs last on remove()
     handle._prefetcher = pre
-    for b in plan.blocks:
+    if order is None and state is not None:
+        pre.order_path = order_path(state.checkpoint.path, order_file_destination)
+        saved = read_order(pre.order_path, {b.prefix.rstrip(".") for b in plan.blocks})
+        if saved is not None:
+            order, pre.order_read = saved, True
+            print(f"trash-panda: using the block order saved in {pre.order_path}")
+    blocks = plan.blocks if order is None else _in_order(plan.blocks, order)
+    for b in blocks:
         block = model.get_submodule(b.prefix.rstrip("."))
         reader_factory = None
         if b.tier == Tier.DISK:
@@ -583,7 +658,14 @@ def install_offload(
                 raise ValueError("Disk blocks need a model loaded with stream_load().")
             def reader_factory(_blk, p=b.prefix):
                 return DiskReader(state.checkpoint, state.disk_keys, p)
+        before = pre.hinted
         handle.extend(offload_blocks([block], device=dev, compute_dtype=cdt, disk=reader_factory, prefetcher=pre))
+        name = b.prefix.rstrip(".")
+        if pre.hinted is not before:                     # the block was wrapped, so it has an entry
+            pre.hinted.name = name
+        else:                                            # not wrapped, so only note when it starts
+            hook = block.register_forward_pre_hook(lambda _module, _args, n=name: pre.note(n))
+            handle._add(hook.remove)
     return handle
 
 
