@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import atexit
 import gc
+import queue
 import threading
 import time
 import types
@@ -18,18 +19,35 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from . import config
+from .blocks import module_nbytes
 from .checkpoint import Checkpoint
 from .formats import SCALE_SUFFIX, expand
 from .hardware import _process_memory, _read_ram
 from .loader import OffloadState, _navigate
 from .order_file import order_path, read_order, write_order
 from .planner import Plan, Tier
+
+
+class Release(NamedTuple):
+    """One block that a final pass has freed, as it is put on the queue of `OffloadHandle.subscribe()`.
+
+    `nbytes` is what the block held in its tier: its weights on the GPU for "gpu" (a block that stays on the GPU), its
+    stored weights in CPU memory for "ram" (with the memory-mapped RAM tier the pages stay in the file cache until the
+    system needs them), and 0 for "disk", which holds nothing in memory between uses. The block is already freed when
+    this is queued. `event` marks the end of the block's work on the compute stream: GPU memory it held may be reused
+    for work on another stream once the event has completed. It is None without CUDA."""
+
+    name: Optional[str]
+    tier: str
+    nbytes: int
+    event: Optional[torch.cuda.Event]
+    queued: float                       # time.perf_counter() when it was put on the queue
 
 
 class OffloadHandle:
@@ -52,6 +70,11 @@ class OffloadHandle:
     def final_pass(self) -> None:
         """From now on each block is freed right after it runs. The model cannot run again."""
         self._prefetcher.final = True
+
+    def subscribe(self) -> "queue.SimpleQueue[Release]":
+        """A queue that gets a `Release` for every block the final pass frees, in the order they are freed. Nothing is
+        queued until this is called, and nothing is queued outside a final pass. The queue is not bounded: read it."""
+        return self._prefetcher.subscribe()
 
 
 class DiskReader:
@@ -97,6 +120,18 @@ class _Entry:
     def needs_copy(self) -> bool:
         """True if the block's weights are on disk or in CPU memory, so they must be copied to the GPU."""
         return self.reader is not None or any(slot[4].device.type == "cpu" for slot in self.slots)
+
+    def tier(self) -> str:
+        """Where the block's weights are kept between uses: "disk", "ram" or "gpu"."""
+        if self.reader is not None:
+            return "disk"
+        return "ram" if any(slot[4].device.type == "cpu" for slot in self.slots) else "gpu"
+
+    def stored_nbytes(self) -> int:
+        """Bytes of the block's stored weights and scales (none for a disk block, which keeps nothing in memory)."""
+        if self.reader is not None:
+            return 0
+        return sum(t.numel() * t.element_size() for t in [slot[4] for slot in self.slots] + list(self.scales.values()))
 
 
 _ALIGN = 256
@@ -171,6 +206,7 @@ class _Prefetcher:
         self.hinted      = None                      # the last block handed over, in the order the blocks were given
         self.warned      = False
         self.seen        = {}                        # block names in the order they first ran
+        self.known       = {}                        # profile: name -> bytes of every named block that was handed over
         self.order_path  = None                      # where to save that order when the prefetcher closes
         self.order_read  = False                     # True if the order in use came from that file
         self.pending     = {}                        # block name -> Event set when its weights are loaded (deferred blocks)
@@ -181,6 +217,9 @@ class _Prefetcher:
         self.pool        = _PinnedPool(cfg.pinned_buffers) if self.stream is not None else None
         self.worker      = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not None else None
         self.final       = False
+        self.releases    = None                      # queue.SimpleQueue of Release, once somebody has subscribed
+        self.release_log = []                        # profile: (time, tier, bytes) of every block the final pass freed
+        self.release_peak = 0                        # profile: the most Releases waiting on the queue at once
         # profiling: where does the time go? Off by default; on with profile=True or TRASH_PANDA_PROFILE=1
         self.profile     = cfg.profile if profile is None else bool(profile)
         self.stats       = defaultdict(float)
@@ -199,6 +238,31 @@ class _Prefetcher:
         self._reported   = False
         if self.profile:
             atexit.register(self.report)
+
+    def subscribe(self) -> "queue.SimpleQueue[Release]":
+        if self.releases is None:
+            self.releases = queue.SimpleQueue()
+        return self.releases
+
+    @property
+    def watching(self) -> bool:
+        """True if a freed block is reported: somebody subscribed, or the profile is on."""
+        return self.releases is not None or self.profile
+
+    def announce(self, name: Optional[str], tier: str, nbytes: int) -> None:
+        """A block of the final pass has been freed: queue it for the subscriber and note it for the profile. Called
+        on the compute thread after the block ran and was freed, so it never waits for whoever reads the queue."""
+        now = time.perf_counter()
+        if self.releases is not None:
+            event = None
+            if self.device.type == "cuda":
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(self.device))
+            self.releases.put(Release(name, tier, nbytes, event, now))
+        if self.profile:
+            self.release_log.append((now, tier, nbytes))
+            if self.releases is not None:
+                self.release_peak = max(self.release_peak, self.releases.qsize())
 
     def learn(self, entry) -> None:
         if entry.name is not None:
@@ -450,7 +514,7 @@ class _Prefetcher:
 
     def report(self) -> str:
         """A short summary of where the prefetching spent its time. Printed at exit when profiling is on."""
-        if not self.profile or self._reported or not self.stats:
+        if not self.profile or self._reported or not (self.stats or self.release_log or self._unused()):
             return ""
         s = self.stats
         self._end_pass()
@@ -496,6 +560,24 @@ class _Prefetcher:
                 f"  loader thread: {int(s['load_blocks'])} blocks in {s['load_s']:.2f} s, "
                 f"main thread waited for it {s['wait_loader_s']:.2f} s (once, not per pass)"
             )
+        unused = self._unused()
+        if unused:
+            names = ", ".join(name for name, _ in unused[:6]) + (f" and {len(unused) - 6} more" if len(unused) > 6 else "")
+            lines.append(
+                f"  blocks that never ran: {names} ({sum(n for _, n in unused) / 1e9:.2f} GB). "
+                "If the model never uses them, consider leaving them out with skip_prefixes"
+            )
+        if self.release_log:
+            held = {tier: [0, 0] for tier in ("gpu", "ram", "disk")}
+            for _at, tier, nbytes in self.release_log:
+                held[tier][0] += 1
+                held[tier][1] += nbytes
+            parts = [f"{tier} {n} blocks {nbytes / 1e9:.2f} GB" for tier, (n, nbytes) in held.items() if n]
+            span = self.release_log[-1][0] - self.release_log[0][0]
+            line = f"  final pass freed {len(self.release_log)} blocks over {span:.2f} s ({', '.join(parts)})"
+            if self.releases is not None:
+                line += f"; the queue held at most {self.release_peak}, {self.releases.qsize()} unread now"
+            lines.append(line)
 
         slowest = sorted(self.block_wait, key=self.block_wait.get, reverse=True)[:5]
         if slowest:
@@ -508,6 +590,12 @@ class _Prefetcher:
         text = "\n".join(lines)
         print(text)
         return text
+
+    def _unused(self) -> List[Tuple[str, int]]:
+        """(name, bytes) of the named blocks that never started, once some block has. Only known with the profile on."""
+        if not self.seen:
+            return []
+        return [(name, nbytes) for name, nbytes in self.known.items() if name not in self.seen]
 
     def _copied(self, index: int) -> str:
         """What the worker read and copied while pass `index` ran, for its line in the report."""
@@ -560,6 +648,11 @@ def _needs_wrapping(slots, scales, device: torch.device, dtype: torch.dtype, dis
     return False
 
 
+def _loaded_nbytes(module: nn.Module) -> int:
+    """Bytes of the module's parameters and buffers that are not on the meta device, so 0 for a block already freed."""
+    return sum(t.numel() * t.element_size() for t in [*module.parameters(), *module.buffers()] if not t.is_meta)
+
+
 def _to_meta(module: nn.Module) -> None:
     for m in module.modules():
         for name in list(m._parameters):
@@ -602,6 +695,8 @@ def offload_blocks(
 
     for i, block in enumerate(blocks):
         label  = names[i] if names is not None else None
+        if label is not None and prefetcher.profile:
+            prefetcher.known[label] = module_nbytes(block)
         scales = {
             n[: -len(SCALE_SUFFIX)]: b for n, b in block.named_buffers() if n.endswith(SCALE_SUFFIX)
         }
@@ -617,9 +712,12 @@ def offload_blocks(
 
         reader = disk(block) if disk is not None else None
         if not _needs_wrapping(slots, scales, dev, compute_dtype, reader):
-            def free_after_run(module, _inputs, _output):
+            def free_after_run(module, _inputs, _output, _label=label):
                 if prefetcher.final:
+                    held = _loaded_nbytes(module) if prefetcher.watching else 0
                     _to_meta(module)
+                    if held:
+                        prefetcher.announce(_label, "gpu", held)
 
             hook = block.register_forward_hook(free_after_run)
             handle._add(hook.remove)
@@ -674,9 +772,12 @@ def offload_blocks(
                 return _orig(*args, **kwargs)
             finally:
                 if prefetcher.final:
+                    freed = (_entry.name, _entry.tier(), _entry.stored_nbytes()) if prefetcher.watching else None
                     _entry.slots.clear()   # the entry holds the original tensors, so these keep the memory alive
                     _entry.scales.clear()
                     _to_meta(_block)
+                    if freed is not None:
+                        prefetcher.announce(*freed)
                 else:
                     _restore()
                 prefetcher.block_done()
@@ -708,7 +809,10 @@ def _defer_block(block: nn.Module, name: str, pre: "_Prefetcher", handle: Offloa
             return block.forward(*args, **kwargs)
         out = block.forward(*args, **kwargs)              # not wrapped: the hook that frees it starts with the next call
         if pre.final:
+            held = _loaded_nbytes(block) if pre.watching else 0
             _to_meta(block)
+            if held:
+                pre.announce(name, "gpu", held)
         return out
 
     def undo():
@@ -815,6 +919,8 @@ def install_offload(
         block = model.get_submodule(b.prefix.rstrip("."))
         name  = b.prefix.rstrip(".")
         if deferred is not None and b.prefix in deferred.items:
+            if pre.profile:
+                pre.known[name] = module_nbytes(block)
             pre.hold([name])                             # the weights are still being loaded; the hooks go in when they are
             _defer_block(
                 block, name, pre, handle,

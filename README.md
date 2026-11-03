@@ -188,6 +188,26 @@ when `overlap=True`, because the load falls inside the measured part of the run.
 machine it gave no measurable gain (see "Settings and environment variables"), and it is groundwork for running one
 model's loads behind another model's compute rather than a speed-up on its own.
 
+A model can free its blocks as it runs. `handle.final_pass()`, called before the last call of the model, frees each block
+right after it runs, so the VRAM and RAM of the first blocks are free while the last ones still compute. The model
+cannot run again. `handle.subscribe()` returns a queue that gets a `Release` for each block freed this way: its name,
+its tier (`"gpu"`, `"ram"` or `"disk"`), the bytes it held in that tier (0 for a disk block), a CUDA event that marks
+when the GPU memory it held can be reused, and the time it was queued. The block is already freed when its `Release` is
+queued, and nothing is queued until `subscribe()` is called:
+
+```python
+with stage(build_encoder, "encoder.safetensors") as (encoder, p, handle):
+    releases = handle.subscribe()
+    handle.final_pass()
+    embeddings = encode(encoder, ...)
+    while not releases.empty():
+        r = releases.get_nowait()
+        print(r.name, r.tier, f"{r.nbytes / 1e9:.2f} GB")
+```
+
+Blocks that a model never runs, such as the encoder half of a VAE that only decodes, are named by the profile (see
+"Reading the profile"). `skip_prefixes` leaves them out.
+
 ### Storage dtype
 
 By default weights are kept exactly as stored in the file. Optionally, `storage_dtype="bf16"` casts waiting
@@ -296,6 +316,11 @@ With `TRASH_PANDA_PROFILE=1`, each stage prints a report when its hooks are remo
   for the copy (`staged`), waiting for the GPU (`gpu`) and the rest (launching work, one-time warm-up).
 * `loader thread`: with `overlap=True`, how long the resident blocks took to load and how long the main thread waited
   for them.
+* `final pass freed N blocks over X s (...)`: after `handle.final_pass()`, the blocks and GB freed in each tier and the
+  time from the first block freed to the last. With a subscriber (`handle.subscribe()`) it also gives the most
+  `Release` objects the queue held at once and how many were unread when the profile was printed.
+* `blocks that never ran`: named blocks that were loaded but that no call used, with their size. If the model never uses
+  them, leave them out with `skip_prefixes`. It is printed once some block has run.
 * `memory while releasing`: at five points of `release()`, the RAM the machine has free, the working set and the private
   bytes of the process, and the CPU tensors of 1 MB or more that are still alive. If more than 0.1 GB stays alive it
   also names what holds the biggest. Read the working set, not the private bytes: the private bytes include GPU memory
@@ -397,8 +422,14 @@ direction, or come after it, and are not planned for now:
 * **A cost model** that chooses between GPU, RAM and disk from measured disk and PCIe speed
 * **A command-line interface**, for example `trash-panda plan model.safetensors` to print a plan without writing a
   script, and a hardware report for bug reports
-* **Visualizing the data flow**: a static report or trace file, built from the profile data, that shows each block
-  moving between tiers, the overlap of copying and compute, and the stalls. A live interface would be a later step
+* **Visualizing the data flow, with a trace of a run**: the events the profile adds up today (block copies from RAM or
+  disk, waits for a copy, waits for the GPU, block runs, loader-thread loads, release steps) would be recorded with
+  their start and end times and written to a file in the Chrome trace-event format, which Perfetto and
+  `chrome://tracing` open as a timeline with a track per thread and stream. It would show each block moving between
+  tiers, the overlap of copying and compute, the stalls, the time each block of a final pass was freed, and blocks that
+  never start, which show as a gap in the timeline. It would be switched on by its own environment variable and be off
+  by default. A web interface of our own would only be needed for what a timeline cannot show, such as a view of the
+  plan, and a live interface would be a later step
 * **Logging**: an optional log through Python's `logging` module, and an optional structured file (for example
   `TRASH_PANDA_LOG=run.jsonl`) with the plan, memory and timings of a run. The visualization and a comparison of two
   runs could read it
@@ -439,16 +470,15 @@ that focus, roughly in the order they are planned. Nothing here is promised or s
 the text encoder, the diffusion model and the VAE of the Krea2 pipeline. In single runs, releasing the text encoder
 before the diffusion model was planned gave the planner several GB more RAM, and releasing the diffusion model before
 the VAE was built stopped the decode of a 2048 x 1024 image from spilling into shared GPU memory (watched by eye, not
-logged). What is left is to let memory move between stages while they run. The steps below are small, each can be
-tested on its own, and they are listed in the order they depend on one another:
-* announce each release as an event on a queue: which block, how many bytes, in which tier, and a CUDA event that
-  marks when the memory can be reused (a tensor freed in Python may still be read by queued GPU work). The hook only
-  puts the event on the queue, so the compute thread never waits for whoever reacts to it. Whether the allocator
-  reuses memory freed on one stream for copies on another needs a test
-* find out whether a RAM-tier block can be given back before the model is released. The RAM tier is the checkpoint
-  file mapped into memory, and it is not known whether part of the mapping can be dropped, or whether the blocks would
-  have to be separate tensors. A small script that maps a checkpoint, touches the blocks, drops them one at a time and
-  watches the free RAM would settle it
+logged). A final pass already announces each block it frees on a queue (`handle.subscribe()`, see "Running a stage").
+What is left is to let memory move between stages while they run. The steps below are small, each can be tested on
+its own, and they are listed in the order they depend on one another:
+* find out why the last RAM-tier block of a final pass is freed 1.7 to 1.9 s after the one before it. The last step of
+  the diffusion model takes 7.8 to 8.0 s against 6.3 to 6.4 s for the others, and the difference is inside that gap.
+  The final pass drops each block's tensors as it runs. Private memory (`TRASH_PANDA_RAM_IN_MEMORY`) goes back to the
+  system at once, and memory-mapped pages stay in the file cache until the system needs them. One possible cause is
+  that the checkpoint file is mapped once and the mapping is only released with the last tensor that uses it; a run
+  with `TRASH_PANDA_RAM_IN_MEMORY=1` would show it
 * start the next model's reads behind compute that is long enough to hide them. The measurements show that reads and
   compute only overlap when something computes while the drive works: on the test pipeline the text encoder computes for
   0.2 s against an 11.7 s load, and the diffusion model's reads come before any of its compute, so there is nothing to
@@ -460,7 +490,14 @@ tested on its own, and they are listed in the order they depend on one another:
   for example) and be expanded in the stream buffer only when it runs. Compare the next stage's time with its time
   when it is loaded after the release. A background thread would take the events from the queue and load the next
   planned blocks, waiting for each event's CUDA event first. Loading early would compete with the running stage for the
-  drive when that stage reads from disk
+  drive when that stage reads from disk. The destination of a copy has to be allocated while the compute stream is
+  current, and the copy stream fills it after it waits for an event recorded after the allocation, with
+  `record_stream` on each tensor. A probe with 4 blocks of 512 MB on torch 2.8 showed that tensors allocated on the
+  copy stream do not reuse memory freed on the compute stream (the reserved memory went from 2 GB to 4 GB), while
+  tensors allocated on the compute stream do, also from another thread. It has not been tried with torch 2.5.1 or
+  with blocks of different sizes, and the prefetcher and the loader thread allocate on the copy stream today. On the
+  test pipeline the 12 GPU blocks (5.21 GB) of the diffusion model are freed 2.8 s into its last step, which takes
+  about 7.9 s
 * plan a stage with the memory that is expected to be free when it starts. `plan()` uses the memory that is free when
   it runs, so it needs a way to be given the memory that the running stage will release. The stage would be planned
   once for that end state, with the activation headroom from an earlier measurement, and the loading above would only
