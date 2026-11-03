@@ -164,6 +164,39 @@ def test_order_reaches_the_hooks(tiny_checkpoint):
         assert names == ["blocks.2", "blocks.0", "blocks.1", "blocks.3"]
 
 
+def test_overlap_loads_the_resident_blocks_while_the_model_runs(tiny_checkpoint):
+    ref, path = tiny_checkpoint
+    x = torch.randn(3, 16)
+    with stage(meta_model, path, overlap=True, resident_blocks=2, **PLAN) as (model, p, _):
+        assert model._trash_panda_state.deferred.prefixes() == list(p.resident)
+        assert len(p.resident) == 2
+        assert torch.allclose(model(x), ref(x), atol=1e-6)
+    assert all(t.is_meta for t in model.parameters())             # released as usual
+
+
+def test_overlap_is_off_by_default(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    with stage(meta_model, path, resident_blocks=2, **PLAN) as (model, _, _):
+        assert model._trash_panda_state.deferred is None
+        assert not any(t.is_meta for t in model.parameters())
+
+
+def test_overlap_does_not_remember_the_peak_memory(tiny_checkpoint, measured):
+    _, path = tiny_checkpoint
+    with stage(meta_model, path, overlap=True, resident_blocks=2, **PLAN) as (model, _, _):
+        model(torch.randn(3, 16))
+    assert measured == []                                          # the load falls inside the measured part of the run
+    assert stage_module._activations == {}
+
+
+def test_without_overlap_the_peak_memory_is_still_remembered(tiny_checkpoint, measured):
+    _, path = tiny_checkpoint
+    with stage(meta_model, path, resident_blocks=2, **PLAN) as (model, _, _):
+        model(torch.randn(3, 16))
+    assert len(measured) == 1
+    assert list(stage_module._activations.values()) == [123]
+
+
 def test_the_order_file_goes_to_the_destination_given(tiny_checkpoint, tmp_path):
     _, path = tiny_checkpoint
     folder = tmp_path / "from_stage"

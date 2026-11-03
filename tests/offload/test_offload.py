@@ -580,6 +580,75 @@ def test_each_pass_is_timed_and_its_waiting_recorded(monkeypatch):
     assert "pass 2: 3.00 s, waited 0.50 s" in text
 
 
+def test_each_pass_keeps_what_the_worker_copied_while_it_ran(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(hooks.time, "perf_counter", lambda: clock[0])
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    a = _queue_entry("a")                                 # a model of one block, so every call starts a pass
+    prefetcher.learn(a)                                   # pass 1 starts
+    prefetcher.stats["ram_copy_s"] += 20.0               # a slow, cold copy
+    prefetcher.stats["ram_copy_gb"] += 10.0
+    clock[0] = 21.0
+    prefetcher.block_done()
+    prefetcher.learn(a)                                   # pass 2 starts, pass 1 is closed
+    prefetcher.stats["ram_copy_s"] += 4.0                 # the same copy, warm
+    prefetcher.stats["ram_copy_gb"] += 10.0
+    prefetcher.stats["disk_read_s"] += 2.0
+    prefetcher.stats["disk_read_gb"] += 1.0
+    clock[0] = 28.0
+    prefetcher.block_done()
+    text = prefetcher.report()
+    assert prefetcher.pass_copy == [(20.0, 10.0, 0.0, 0.0), (4.0, 10.0, 2.0, 1.0)]
+    assert "pass 1: 21.00 s, waited 0.00 s, RAM copies 10.00 GB in 20.00 s (0.50 GB/s)" in text
+    assert "pass 2: 7.00 s, waited 0.00 s, RAM copies 10.00 GB in 4.00 s (2.50 GB/s), disk reads 1.00 GB in 2.00 s (500 MB/s)" in text
+
+
+def test_the_first_pass_is_logged_block_by_block(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(hooks.time, "perf_counter", lambda: clock[0])
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    a, b = _chain(*[_queue_entry(n) for n in "ab"])
+    a.name = "first"                                      # b has no name: the report falls back to its position
+    clock[0] = 1.0
+    prefetcher.learn(a)
+    prefetcher.stats["wait_staged_s"] += 2.0
+    clock[0] = 4.0
+    prefetcher.block_done()
+    prefetcher.learn(b)
+    prefetcher.stats["wait_gpu_s"] += 0.5
+    clock[0] = 5.0
+    prefetcher.block_done()
+    prefetcher.learn(a)                                   # pass 2: not logged block by block
+    clock[0] = 9.0
+    prefetcher.block_done()
+    assert prefetcher.first_pass == [(0, "first", 3.0, 2.0, 0.0), (1, None, 1.0, 0.0, 0.5)]
+    text = prefetcher.report()
+    assert "first pass, main thread time by block (2 blocks, 4.00 s" in text
+    assert text.index("first: 3.00 s (staged 2.00, gpu 0.00)") < text.index("block 1: 1.00 s (staged 0.00, gpu 0.50)")
+
+
+def test_the_report_lists_the_six_slowest_blocks_of_the_first_pass():
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    prefetcher.stats["passes"] = 1
+    prefetcher.first_pass = [(n, f"b{n}", float(n), 0.0, 0.0) for n in range(10)]
+    text = prefetcher.report()
+    assert "b9: 9.00 s" in text and "b4: 4.00 s" in text and "b3:" not in text
+
+
+def test_the_loader_and_the_wait_for_it_are_timed(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(hooks.time, "perf_counter", lambda: clock[0])
+    prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
+    prefetcher.stats["passes"] = 1
+    deferred = type("Deferred", (), {"load": lambda self, prefix: clock.__setitem__(0, clock[0] + 1.5)})()
+    prefetcher.hold(["blocks.0"])
+    hooks._BlockLoader(deferred, ["blocks.0."], prefetcher, torch.device("cpu"))._run()
+    prefetcher.wait_ready("blocks.0")
+    assert prefetcher.stats["load_s"] == 1.5 and prefetcher.stats["load_blocks"] == 1
+    text = prefetcher.report()
+    assert "loader thread: 1 blocks in 1.50 s, main thread waited for it 0.00 s" in text
+
+
 def test_a_long_run_shows_only_the_first_and_last_passes(monkeypatch):
     prefetcher = hooks._Prefetcher(torch.device("cpu"), profile=True)
     prefetcher.stats["passes"] = 12

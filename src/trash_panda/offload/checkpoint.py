@@ -170,6 +170,23 @@ class Checkpoint:
         with open(info.file, "rb") as fh:
             return self._read_one(fh, info)
 
+    def read_tensor(self, key: str) -> torch.Tensor:
+        """Read a tensor with one big sequential read into memory of its own. Unlike get_tensor() inside
+        `with checkpoint:`, the result is not mapped from the file: the operating system cannot drop it and re-read it."""
+        info = self._index[key]
+        dtype = info.torch_dtype
+        if dtype is None:
+            raise ValueError(f"Unsupported dtype {info.dtype} for {key!r}")
+        size = info.end - info.start
+        if size == 0:
+            return torch.empty(info.shape, dtype=dtype)
+        # A bytearray, not torch.empty(): on Windows, PyTorch's CPU allocator keeps the blocks it was given after they are
+        # freed, so a model released with several GB read this way kept them in the process (measured: 3 GB freed, working
+        # set unchanged) and the next plan saw that RAM as taken. Python's allocator gives freed blocks back at once.
+        buf = torch.frombuffer(bytearray(size), dtype=torch.uint8)
+        self.read_into(key, buf)
+        return buf.view(dtype).reshape(info.shape)
+
     def read_into(self, key: str, out: torch.Tensor) -> None:
         """Read a tensor's raw bytes straight from the file into `out`, with no intermediate copy.
         `out` must be a contiguous uint8 CPU tensor of exactly the tensor's size in bytes,

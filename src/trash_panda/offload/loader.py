@@ -12,12 +12,16 @@ Each tensor is read lazily from the checkpoint and placed according to its tier:
 
 from __future__ import annotations
 
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 
+from . import config
 from .checkpoint import Checkpoint, name_resolver
 from .formats import (
     SCALE_SUFFIX,
@@ -35,6 +39,27 @@ from .report import LoadReport
 KeyMap = Union[None, Dict[str, str], Callable[[str], str]]
 
 
+def _read_pair(ck: Checkpoint, key: str, scale_key: Optional[str]):
+    """A tensor and its scale, each read with one big read into memory of its own. Runs on a reader thread."""
+    return ck.read_tensor(key), (ck.read_tensor(scale_key) if scale_key is not None else None)
+
+
+class DeferredLoad:
+    """The tensors of resident blocks that stream_load() left on the meta device, to be loaded one block at a time."""
+
+    def __init__(self, items: Dict[str, list], store: Callable) -> None:
+        self.items  = items           # block prefix -> [(key, target, has_scale, scale_key), ...]
+        self._store = store
+
+    def prefixes(self) -> list:
+        return list(self.items)
+
+    def load(self, prefix: str) -> None:
+        """Read the block's tensors from the checkpoint and put them on the compute device."""
+        for key, target, has_scale, scale_key in self.items.get(prefix, ()):
+            self._store(key, target, "gpu_raw", has_scale, scale_key)
+
+
 @dataclass
 class OffloadState:
     """Remembered on the model so install_offload() knows what the loader did."""
@@ -43,6 +68,7 @@ class OffloadState:
     compute_dtype: torch.dtype
     checkpoint: Checkpoint
     disk_keys: Dict[str, Tuple[str, Optional[str]]] = field(default_factory=dict)   # param name -> (key, scale key)
+    deferred: Optional[DeferredLoad] = None
 
 
 def _navigate(module: nn.Module, name: str) -> Tuple[nn.Module, str]:
@@ -89,6 +115,7 @@ def stream_load(
     resident_prefixes: Sequence[str] = (),
     disk_prefixes: Sequence[str] = (),
     skip_prefixes: Sequence[str] = (),
+    defer_prefixes: Sequence[str] = (),
     compute_dtype: Union[str, torch.dtype] = "bf16",
     storage_dtype: Union[None, str, torch.dtype] = "auto",
     device: Optional[str] = None,
@@ -101,11 +128,15 @@ def stream_load(
       resident_prefixes  ... wait on the compute device in compact form (subset of the above, wins over it)
       disk_prefixes      ... are not loaded; they are read from the file when needed (wins over both)
       skip_prefixes      model entries with these prefixes are neither loaded nor required
+      defer_prefixes     resident blocks (a subset of resident_prefixes) whose tensors are left on the meta device;
+                         `model._trash_panda_state.deferred.load(prefix)` loads one of them later (install_offload()
+                         does that on a worker thread, and the block waits for it)
     Anything else is expanded to `compute_dtype` on `device` right away.
 
     key_map  optional dict or function mapping checkpoint key -> model name.
     Returns a LoadReport (print it) and remembers the settings on the model for install_offload().
     """
+    began_all = time.perf_counter()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     if plan is not None:
         cdt, sdt = plan.compute_dtype, plan.storage_dtype
@@ -116,6 +147,7 @@ def stream_load(
         cdt, sdt = parse_dtype(compute_dtype) or torch.bfloat16, parse_dtype(storage_dtype)
     offload_prefixes, resident_prefixes = tuple(offload_prefixes), tuple(resident_prefixes)
     disk_prefixes, skip_prefixes = tuple(disk_prefixes), tuple(skip_prefixes)
+    defer_prefixes = tuple(defer_prefixes)
 
     expected = {n for n, _ in model.named_parameters()} | {n for n, _ in model.named_buffers()}
     skipped = {n for n in expected if n.startswith(skip_prefixes)} if skip_prefixes else set()
@@ -135,6 +167,41 @@ def stream_load(
     report = LoadReport()
     loaded = set()
     disk_keys: Dict[str, Tuple[str, Optional[str]]] = {}
+    deferred_items: Dict[str, list] = {}
+    cfg = config.current()
+    spent = defaultdict(float)                               # seconds per tier, for the profile
+    ram_jobs: list = []                                      # streamed tensors to read into memory of their own, after the rest
+    ram_read = {"seconds": 0.0, "bytes": 0}                  # what that took, for the profile
+
+    def store(key: str, target: str, tier: str, has_scale: bool, scale_key: str, preloaded=None) -> None:
+        """Put one tensor where its tier says. It is read here, unless `preloaded` already holds it and its scale."""
+        if preloaded is None:
+            raw = ck.get_tensor(key)
+            scale = ck.get_tensor(scale_key) if has_scale else None
+        else:
+            raw, scale = preloaded
+        kind = classify(raw.dtype, has_scale) if raw.is_floating_point() else None
+
+        if tier == "normal":
+            tensor = expand(raw, scale, cdt, device) if raw.is_floating_point() else raw.to(device)
+            _assign(model, target, tensor)
+            report.add("normal", tensor.numel() * tensor.element_size())
+        else:
+            if kind == Kind.CAST and sdt is not None:
+                if is_fp8(sdt) and should_quantize(key, tuple(raw.shape)):
+                    raw, scale = quantize_fp8(raw.to(quant_device), sdt)
+                    kind = Kind.FP8_SCALED
+                elif not is_fp8(sdt):
+                    raw = raw.to(sdt)
+            dest = device if tier == "gpu_raw" else "cpu"
+            raw = raw.to(dest)
+            _assign(model, target, raw)
+            nbytes = raw.numel() * raw.element_size()
+            if scale is not None:
+                scale = scale.to(dest)
+                _set_scale(model, target, scale)
+                nbytes += scale.numel() * scale.element_size()
+            report.add(tier, nbytes, kind.value if kind is not None else None)
 
     with ck:
         for key in ck.keys():
@@ -171,31 +238,41 @@ def stream_load(
                 loaded.add(target)
                 continue
 
-            raw = ck.get_tensor(key)
-            scale = ck.get_tensor(scale_key) if has_scale else None
-            kind = classify(raw.dtype, has_scale) if raw.is_floating_point() else None
+            if tier == "gpu_raw" and defer_prefixes and target.startswith(defer_prefixes):
+                prefix = next(p for p in defer_prefixes if target.startswith(p))
+                deferred_items.setdefault(prefix, []).append((key, target, has_scale, scale_key))
+                loaded.add(target)
+                continue
 
-            if tier == "normal":
-                tensor = expand(raw, scale, cdt, device) if raw.is_floating_point() else raw.to(device)
-                _assign(model, target, tensor)
-                report.add("normal", tensor.numel() * tensor.element_size())
+            if tier == "ram" and cfg.ram_in_memory:
+                ram_jobs.append((key, target, has_scale, scale_key))
             else:
-                if kind == Kind.CAST and sdt is not None:
-                    if is_fp8(sdt) and should_quantize(key, tuple(raw.shape)):
-                        raw, scale = quantize_fp8(raw.to(quant_device), sdt)
-                        kind = Kind.FP8_SCALED
-                    elif not is_fp8(sdt):
-                        raw = raw.to(sdt)
-                dest = device if tier == "gpu_raw" else "cpu"
-                raw = raw.to(dest)
-                _assign(model, target, raw)
-                nbytes = raw.numel() * raw.element_size()
-                if scale is not None:
-                    scale = scale.to(dest)
-                    _set_scale(model, target, scale)
-                    nbytes += scale.numel() * scale.element_size()
-                report.add(tier, nbytes, kind.value if kind is not None else None)
+                began = time.perf_counter()
+                store(key, target, tier, has_scale, scale_key)
+                spent[tier] += time.perf_counter() - began
             loaded.add(target)
+
+        if ram_jobs:                                        # one big read per tensor, several at a time, in the order of the file
+            began = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=max(cfg.ram_read_threads, 1)) as pool:
+                reads = [pool.submit(_read_pair, ck, key, scale_key if has_scale else None) for key, _t, has_scale, scale_key in ram_jobs]
+                for (key, target, has_scale, scale_key), read in zip(ram_jobs, reads):
+                    pair = read.result()
+                    ram_read["bytes"] += sum(t.numel() * t.element_size() for t in pair if t is not None)
+                    store(key, target, "ram", has_scale, scale_key, preloaded=pair)
+            ram_read["seconds"] = time.perf_counter() - began
+            spent["ram"] += ram_read["seconds"]
+
+    if cfg.profile:
+        tiers = ", ".join(f"{tier} {seconds:.2f} s" for tier, seconds in spent.items())
+        later = "; blocks loaded while the model runs are not counted" if deferred_items else ""
+        print(f"trash-panda: stream_load took {time.perf_counter() - began_all:.2f} s ({tiers}{later})")
+        if ram_read["bytes"]:
+            gb = ram_read["bytes"] / 1e9
+            print(
+                f"trash-panda: read {gb:.2f} GB of streamed-block tensors into memory in {ram_read['seconds']:.2f} s "
+                f"({gb / max(ram_read['seconds'], 1e-9):.2f} GB/s, {max(cfg.ram_read_threads, 1)} threads)"
+            )
 
     missing = expected - loaded - skipped
     if missing:
@@ -213,6 +290,7 @@ def stream_load(
         )
 
     model._trash_panda_state = OffloadState(
-        plan=plan, device=device, compute_dtype=cdt, checkpoint=ck, disk_keys=disk_keys
+        plan=plan, device=device, compute_dtype=cdt, checkpoint=ck, disk_keys=disk_keys,
+        deferred=DeferredLoad(deferred_items, store) if deferred_items else None,
     )
     return report

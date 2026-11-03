@@ -179,11 +179,128 @@ The file is named after the checkpoint file, so two checkpoints with the same fi
 usually all `diffusion_pytorch_model.safetensors`) share a name if `order_file_destination` is one folder, and then
 overwrite each other's file. With the default location, next to each checkpoint, this does not happen.
 
+By default `stage()` loads every block before the first call. With `overlap=True` it does not wait for the resident
+blocks: they are loaded one at a time, in the order the blocks run, on a worker thread, and the model starts as soon as
+its first block is on the GPU. A block that starts before its weights have arrived waits for them. The weights outside
+the blocks, the blocks that wait in RAM and the blocks on disk are handled as before. If the loading fails, the call
+that needs the missing block raises an error that names it. The peak GPU memory is not remembered for the next plan
+when `overlap=True`, because the load falls inside the measured part of the run. It is off by default. On the test
+machine it gave no measurable gain (see "Settings and environment variables"), and it is groundwork for running one
+model's loads behind another model's compute rather than a speed-up on its own.
+
 ### Storage dtype
 
 By default weights are kept exactly as stored in the file. Optionally, `storage_dtype="bf16"` casts waiting
 weights down, and `storage_dtype="fp8"` quantizes large 2-D weights to fp8 on load (lossy; small tensors such
 as norms are left alone).
+
+## Settings and environment variables
+
+Every tuning setting is kept, with its default, in `trash_panda.offload.config`. Each can be changed with an
+environment variable named `TRASH_PANDA_<SETTING>` in capitals, for example `TRASH_PANDA_LOOKAHEAD=0`. The variable is
+read when a function runs, not when the library is imported. An argument passed to a function wins over the
+environment, and the environment wins over the default. Switches take `1` / `0`, `true` / `false`, `yes` / `no` or
+`on` / `off`.
+
+In PowerShell a variable lasts for that window only:
+
+```
+$env:TRASH_PANDA_PROFILE = "1"
+Remove-Item Env:TRASH_PANDA_PROFILE
+```
+
+In bash, use `export TRASH_PANDA_PROFILE=1` and `unset TRASH_PANDA_PROFILE`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TRASH_PANDA_PROFILE` | `0` | Print where loading and prefetching spent their time (see "Reading the profile") |
+| `TRASH_PANDA_LOOKAHEAD` | `2` | Blocks ahead whose weights are copied while one computes. `0` turns prefetching off |
+| `TRASH_PANDA_PINNED_BUFFERS` | `2` | Page-locked host buffers that blocks are copied through |
+| `TRASH_PANDA_BLOCKS_IN_FLIGHT` | `2` | The GPU may run at most this many blocks behind the copies |
+| `TRASH_PANDA_RAM_IN_MEMORY` | `0` | Read the tensors of the blocks that wait in RAM into memory of their own while loading, instead of keeping them mapped from the checkpoint file |
+| `TRASH_PANDA_RAM_READ_THREADS` | `1` | Threads that do that reading. Only used with `TRASH_PANDA_RAM_IN_MEMORY` |
+| `TRASH_PANDA_MIN_FREE_RAM` | `auto` | RAM kept free for the system: `auto` (the three settings below) or a size such as `2GB` |
+| `TRASH_PANDA_RAM_RESERVE_FRACTION` | `0.08` | With `auto`, the share of the machine's RAM kept free, ... |
+| `TRASH_PANDA_RAM_RESERVE_MIN_GB` | `1.0` | ... but at least this many GiB, ... |
+| `TRASH_PANDA_RAM_RESERVE_MAX_GB` | `4.0` | ... and at most this many |
+| `TRASH_PANDA_RAM_RESERVE_UNKNOWN_GB` | `2.0` | The reserve when the machine's RAM cannot be read |
+| `TRASH_PANDA_COMMIT_WARN_FRACTION` | `0.9` | Warn when the blocks in RAM need more than this share of the Windows commit limit |
+| `TRASH_PANDA_HEADROOM_VRAM` | `1.5GB` | VRAM kept free for activations when none was measured |
+| `TRASH_PANDA_STREAM_BUFFER_FACTOR` | `1.3` | Working area for a streamed block, as a multiple of its expanded size |
+| `TRASH_PANDA_ACTIVATION_MARGIN_FRACTION` | `0.05` | Margin added to a measured activation size: this share of the VRAM, ... |
+| `TRASH_PANDA_ACTIVATION_MARGIN_MIN_GB` | `0.5` | ... but at least this many GiB |
+| `TRASH_PANDA_VRAM_FILL_WARN_FRACTION` | `0.9` | Warn when the planned GPU use is above this share of the free VRAM |
+| `TRASH_PANDA_FIND_BLOCKS_MIN_FRACTION` | `0.01` | A group of layers must hold at least this share of the model's bytes to count as the blocks |
+| `TRASH_PANDA_FIND_BLOCKS_MIN_BLOCKS` | `2` | ... and have at least this many blocks |
+
+Two options are arguments of `stage()`, not environment variables: `overlap=True` (see "Running a stage") and `order=`
+with `order_file_destination=`.
+
+### What we measured
+
+All numbers come from one machine (Windows 11, an RTX 3060 with 12 GB, 16 GB of RAM and a SATA SSD) and one pipeline:
+a text encoder, a 12B diffusion model with fp8 weights and scale tensors, and a VAE, making one 1024 x 1024 image in 7
+steps. The diffusion model's plan was 12 blocks (5.21 GB) on the GPU and 20 blocks (7.29 GB) in RAM, and the RAM in use
+at the start was 5.5 to 6.5 GB. They are single runs. Identical runs differed by 2 to 3 s in total time, so a
+difference smaller than that is not a result.
+
+* **The drive sets the pace of every cold read.** The text encoder's blocks, the diffusion model's resident blocks and
+  its RAM tier all ran at 0.36 to 0.42 GB/s the first time they were read, however they were read (the memory-mapped
+  copy, one reader thread, two reader threads). A run reads about 16 GB cold, which is roughly 40 s of a total of about
+  95 s. The first step of the diffusion model is the first read of its RAM tier: 20 to 22 s, against 6.3 s for every
+  later step, and 12.5 to 15 s of that difference is the main thread waiting for blocks. About 2.8 s of the first step
+  is one-time warm-up in its first three blocks.
+* **Defaults:** 94.9, 95.6, 96.5 and 98.3 s in four runs.
+* **`TRASH_PANDA_RAM_IN_MEMORY=1`:** the first step takes 9.0 s and the sampling 47 s instead of 61 s, because the read
+  of the RAM tier has moved to the load: 7.29 GB in 20 to 23 s (0.31 GB/s with one thread, 0.34 to 0.36 with two). The
+  total was 104 to 108 s, which is 8 to 12 s longer than with the defaults. The read is slower than the memory-mapped
+  copy, and it no longer overlaps with the compute of the first step. Two threads read 16% faster than one; more were
+  not tried, because both are close to what the drive delivers. The tensors are private memory, so they count against
+  the Windows commit limit while the model is loaded.
+* **`stage(overlap=True)`:** 96.5 to 98.8 s in four runs, against 94.9 to 98.3 s without it, and 109.3 s together with
+  `TRASH_PANDA_RAM_IN_MEMORY=1` against 105.0 s. It cannot help much here. The compute of a model is small next to the
+  load of its resident blocks: a resident block of the diffusion model takes about 1.1 s to load and 0.2 s to run, so
+  only about 3 s of compute can overlap with the load, and the text encoder computes for 0.2 s against an 11.7 s load.
+  The loader thread also reads with plain seek-and-read, which ran at 0.25 to 0.28 GB/s against 0.41 GB/s for the
+  memory-mapped reads that `stream_load()` does for the same blocks.
+* **`TRASH_PANDA_LOOKAHEAD`:** a depth of 4 was no better than 2 for disk blocks and uses more VRAM.
+* **A read-ahead of the RAM tier** through ordinary file reads, ahead of the copy, made the first step slower (34.7 s
+  against 21 to 22 s) and was removed: the pages it read did not serve the memory-mapped copy.
+* **Memory after a release.** On Windows, PyTorch's own CPU allocator keeps blocks after they are freed (3 GB of
+  tensors freed, working set unchanged), so memory read into `torch.empty` tensors still counted as taken when the next
+  model was planned (a RAM budget of 2.0 to 2.6 GB, against about 9 GB). `TRASH_PANDA_RAM_IN_MEMORY` allocates through
+  Python's allocator instead, which gives the memory back at once, and after the fix the next plan saw 8.2 to 9.3 GB.
+
+### Current recommendation
+
+* Leave every setting at its default. The defaults were the fastest total in these measurements.
+* Leave `TRASH_PANDA_RAM_IN_MEMORY` off unless you want steady steps from the first one, and have the RAM and the commit
+  headroom for it (about 7 GB of private memory on the test pipeline). It does not make a single run shorter.
+* Leave `overlap` off. It is groundwork for starting the next model's loads behind compute that is long enough to hide
+  them (see the roadmap), not a speed-up for one pipeline.
+* A slow first step is the first read of the RAM tier from the drive. The profile shows it as a first pass with a low
+  GB/s in the RAM copies and a large "waited". Only a faster drive shortens it.
+* Set `TRASH_PANDA_PROFILE=1` when you want to see where the time goes.
+
+### Reading the profile
+
+With `TRASH_PANDA_PROFILE=1`, each stage prints a report when its hooks are removed:
+
+* `stream_load took X s (...)`: the time of the load, by tier. With `overlap=True` the blocks that are loaded while the
+  model runs are not counted.
+* `read N GB of streamed-block tensors into memory in X s (Y GB/s, T threads)`: only with `TRASH_PANDA_RAM_IN_MEMORY`.
+* `per pass`: for each pass through the blocks, its time, the time the main thread waited for staged blocks, and the GB
+  and GB/s of RAM copies and disk reads done meanwhile. A first pass much slower than the others, with a low GB/s, is
+  cold reads.
+* `first pass, main thread time by block`: the six slowest blocks of the first pass, with their time split into waiting
+  for the copy (`staged`), waiting for the GPU (`gpu`) and the rest (launching work, one-time warm-up).
+* `loader thread`: with `overlap=True`, how long the resident blocks took to load and how long the main thread waited
+  for them.
+* `memory while releasing`: at five points of `release()`, the RAM the machine has free, the working set and the private
+  bytes of the process, and the CPU tensors of 1 MB or more that are still alive. If more than 0.1 GB stays alive it
+  also names what holds the biggest. Read the working set, not the private bytes: the private bytes include GPU memory
+  that Windows charges to the process. The profile scans the live objects at these five points, which costs a little
+  time.
 
 ## Benchmarks
 
@@ -231,10 +348,12 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   one block's compute on a slow drive. On the test machine's SATA SSD (about 400 MB/s measured, with 1, 2, 4 or 8
   reader threads alike) a plan with 11 blocks (4.1 GB) on disk took about 16 s per step, against about 9.3 s with
   every streamed block in RAM. A deeper look-ahead (4) was no better and uses more VRAM. These are single runs
-* **The first use of a RAM-tier block may be slow.** The RAM tier is mapped from the checkpoint file, so Windows may
-  read a block from disk the first time it is used. In one profiled run a few blocks made the main thread wait
-  1 to 3 s each, and a text encoder that runs once copied its blocks at about disk speed. The cause is not
-  confirmed yet (see the roadmap)
+* **The first step of a model with a RAM tier is slow.** The RAM tier is mapped from the checkpoint file, so each block
+  is read from the drive the first time it is used. On the test machine that was 7.3 GB at about 0.4 GB/s: the first
+  step of a diffusion model took 20 to 22 s against 6.3 s for the others, and 12.5 to 15 s of the difference was the
+  main thread waiting for blocks. Every cold read on that machine ran at 0.36 to 0.42 GB/s, however it was read, so
+  only a faster drive shortens it. `TRASH_PANDA_RAM_IN_MEMORY=1` moves the read to the load, before the first step, but
+  the total time is not shorter (see "Settings and environment variables")
 * **Checkpoints with the same file name share an order file name.** The order file is named after the checkpoint file
   plus `_order.json`. Diffusers models are usually all called `diffusion_pytorch_model.safetensors`, so with one shared
   `order_file_destination` they overwrite each other's file. With the default location, next to the checkpoint, this
@@ -295,15 +414,6 @@ before the next one starts loading. `release()` does the whole-model version by 
 that focus, roughly in the order they are planned. Nothing here is promised or scheduled.
 
 **Speed**
-* read the RAM tier into memory ahead of use. In the profile of an all-RAM plan, 21 of the 140 streamed blocks were
-  late by about 1 s each, which is roughly the time to read one block from the drive, and each of the slowest was late
-  in only 1 of 7 passes. That suggests nearly all the waiting is in the first pass, when the file-backed RAM tier is
-  read from disk on first use. If so, steady steps may be much faster than the average the progress bar shows (about
-  6 s against 9.3 s) and the first step much slower. This is an inference, not a measurement: the profile now lists
-  the time and the waiting of every pass (`TRASH_PANDA_PROFILE=1`), which will confirm or reject it. On the test
-  machine the first step of a diffusion model stayed around 21 to 25 s over repeated runs, which a warm file cache
-  would be expected to shorten, so this may not be the cause. If it holds, a background thread would touch the
-  RAM-tier pages once when the hooks are installed, keeping the tier file-backed
 * a better first order for a model that has never run. The first run uses the order the model defines its blocks in,
   which `forward()` can override (a diffusion model can define its four text blocks after its 28 main blocks and
   run them first), so that run warns and is prefetched less well. The effect measured so far is small: the first step
@@ -311,27 +421,16 @@ that focus, roughly in the order they are planned. Nothing here is promised or s
   before the first call: a helper that records it without a real run (a call on the meta device with small inputs
   that the caller gives), or reading the source of `forward()` with the `ast` module, which fails on code that is not
   plain
-* decide the name of the order file, so that checkpoints with the same file name do not overwrite each other's file
-  (see Known issues). Options: a hash of the block names in the name, or the checkpoint's folder name
-* run a model while its blocks are still loading. `stage()` loads every block before the first call, so the load of
-  the resident blocks (12 of the 32 blocks, 5.21 GB, of a diffusion model on the test machine) comes before the
-  progress bar appears. The goal is to start the first call as soon as its first blocks are on the GPU. The first step
-  of that model also takes about 20 s against about 7 s for the others. Its cause is not known, and this item would not
-  remove it. The pieces, each testable on its own:
-  * the order of the blocks at install time, which `stage()` has now (see "Running a stage"), so that the loader knows
-    which block runs first
-  * `stream_load` on a worker thread that loads the resident blocks in that order and marks each one ready with a CUDA
-    event
-  * a hook on the resident blocks that waits for the mark of its block during the first call and then removes itself,
-    so later calls pay nothing
-  * the activation measurement in `stage()`: the load would then fall inside the measured region, so the peak would
-    include the weights and the next plan would reserve too much VRAM. It has to start after the load or subtract the
-    weights
-  * the order of the weights outside the blocks (embeddings, input and output layers) in the order file, if the loader
-    needs to load them before the first block
-
-  The saving is bounded by the load time of the resident blocks, so the time of `stream_load` should be measured
-  before the thread is built
+* the loader thread of `stage(overlap=True)` reads with plain seek-and-read, which ran at 0.25 to 0.28 GB/s against
+  0.41 GB/s for the memory-mapped reads that `stream_load()` does for the same blocks (12 blocks, 5.21 GB: 18.5 to
+  21.2 s against 12.7 s). Memory-mapped reads in the loader would remove most of that gap. The loader would have to open
+  and keep its own mapping for the whole load, because mapping the whole file for every read charges the Windows commit
+  limit (see the comment in `checkpoint.py`). What `overlap` can save on the test pipeline stays bounded by the compute
+  that can overlap with the load, about 3 s, so this matters mostly for chaining. Two other parts of `overlap` are open:
+  * the peak GPU memory is not remembered with `overlap=True`, because the load falls inside the measured part of the
+    run. It has to be measured after the load, or with the weights subtracted
+  * the order of the weights outside the blocks (embeddings, input and output layers) in the order file, if they
+    should be loaded in the order they are needed; today they are loaded before the first call
 * the number of pinned buffers as a tested option (`TRASH_PANDA_PINNED_BUFFERS`, 3 or 4 instead of 2), if the
   profile's "worker waited for a free pinned buffer" line shows the worker is held up by them
 
@@ -350,6 +449,13 @@ tested on its own, and they are listed in the order they depend on one another:
   file mapped into memory, and it is not known whether part of the mapping can be dropped, or whether the blocks would
   have to be separate tensors. A small script that maps a checkpoint, touches the blocks, drops them one at a time and
   watches the free RAM would settle it
+* start the next model's reads behind compute that is long enough to hide them. The measurements show that reads and
+  compute only overlap when something computes while the drive works: on the test pipeline the text encoder computes for
+  0.2 s against an 11.7 s load, and the diffusion model's reads come before any of its compute, so there is nothing to
+  hide them behind. A pipeline with a language model that rewrites the prompt, or one that makes several images, has
+  stages that compute for a long time while the drive is idle. `TRASH_PANDA_RAM_IN_MEMORY` is the memory model for it (a
+  model read ahead before it starts cannot have its pages dropped by the system), and `stage(overlap=True)` (a loader
+  thread, ready marks, the order file) is the groundwork
 * load the next model's blocks into the VRAM that a final pass has freed. A block would move in its stored form (fp8,
   for example) and be expanded in the stream buffer only when it runs. Compare the next stage's time with its time
   when it is loaded after the release. A background thread would take the events from the queue and load the next

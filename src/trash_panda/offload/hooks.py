@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import atexit
 import gc
+import threading
 import time
+import types
 import warnings
+import weakref
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -22,6 +26,7 @@ import torch.nn as nn
 from . import config
 from .checkpoint import Checkpoint
 from .formats import SCALE_SUFFIX, expand
+from .hardware import _process_memory, _read_ram
 from .loader import OffloadState, _navigate
 from .order_file import order_path, read_order, write_order
 from .planner import Plan, Tier
@@ -146,6 +151,9 @@ class _PinnedPool:
         self.events[i] = event
 
 
+_PASS_KEYS = ("ram_copy_s", "ram_copy_gb", "disk_read_s", "disk_read_gb")      # the worker's figures that are also kept per pass
+
+
 class _Prefetcher:
     """Copies the next block's compact tensors to the device on a second CUDA stream"""
 
@@ -156,7 +164,7 @@ class _Prefetcher:
         cfg = config.current()
         self.device      = device
         self.lookahead   = cfg.lookahead if lookahead is None else lookahead
-        self.index       = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
+        self.index      = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
         self.stream      = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.last        = None
         self.head        = None                      # the first block in the order the blocks were given
@@ -165,6 +173,9 @@ class _Prefetcher:
         self.seen        = {}                        # block names in the order they first ran
         self.order_path  = None                      # where to save that order when the prefetcher closes
         self.order_read  = False                     # True if the order in use came from that file
+        self.pending     = {}                        # block name -> Event set when its weights are loaded (deferred blocks)
+        self.ready       = set()                     # names of the deferred blocks that are loaded
+        self.failure     = None                      # why the loader stopped, if it did
         self.window      = []
         self.in_flight   = deque()
         self.pool        = _PinnedPool(cfg.pinned_buffers) if self.stream is not None else None
@@ -178,6 +189,10 @@ class _Prefetcher:
         self.block_wait  = defaultdict(float)       # position -> seconds the main thread waited for that block
         self.block_late  = defaultdict(int)         # position -> times it was not ready when asked for
         self.pass_log    = []                       # per finished pass: (seconds it took, seconds spent waiting for staged blocks)
+        self.pass_copy   = []                       # per finished pass: the worker's _PASS_KEYS figures, as they grew during it
+        self.first_pass  = []                       # per block of the first pass: (position, name, seconds on the main thread, of which waiting for the staged copy, of which waiting for the GPU)
+        self._pass_mark  = {}
+        self._block_mark = None
         self._pass_start = None
         self._pass_end   = None
         self._pass_wait0 = 0.0
@@ -196,13 +211,16 @@ class _Prefetcher:
                 self.stats["passes"] += 1               # the first block starts a new pass through the model
                 self._pass_start = time.perf_counter()
                 self._pass_wait0 = self.stats["wait_staged_s"]
+                self._pass_mark  = {k: self.stats[k] for k in _PASS_KEYS}
             self.where.setdefault(id(entry), len(self.where))
+            self._block_mark = (time.perf_counter(), self.stats["wait_staged_s"], self.stats["wait_gpu_s"])
+        late = entry.name in self.pending                # a block whose weights were loaded while the model ran has no place in the order given
         if self.last is None:
-            if self.head is not None and entry is not self.head and not self.warned:
+            if self.head is not None and entry is not self.head and not late and not self.warned:
                 self._warn_order(f"{entry.name or 'a block'} ran first, but {self.head.name or 'another block'} was expected first.")
         else:
             expected = self.last.next
-            if expected is not None and expected is not entry and not self.warned:
+            if expected is not None and expected is not entry and not late and not self.warned:
                 self._warn_order(
                     f"{entry.name or 'a block'} ran after {self.last.name or 'a block'}, "
                     f"but {expected.name or 'another block'} was expected."
@@ -221,6 +239,32 @@ class _Prefetcher:
         """Remember that the block called `name` has started, the first time only: this is the order it first ran in."""
         self.seen.setdefault(name, None)
 
+    def hold(self, names) -> None:
+        """Blocks whose weights are not loaded yet: a block that starts before it is marked ready waits for it."""
+        for name in names:
+            self.pending.setdefault(name, threading.Event())
+
+    def mark_ready(self, name: str) -> None:
+        self.ready.add(name)
+        self.pending[name].set()
+
+    def fail(self, error: BaseException) -> None:
+        """The loader stopped with `error`: nobody waits any longer, and a block that was not loaded raises it."""
+        self.failure = error
+        for event in self.pending.values():
+            event.set()
+
+    def wait_ready(self, name) -> None:
+        event = self.pending.get(name)
+        if event is None:
+            return
+        started = time.perf_counter() if self.profile else 0.0
+        event.wait()
+        if self.profile:
+            self.stats["wait_loader_s"] += time.perf_counter() - started
+        if name not in self.ready:
+            raise RuntimeError(f"the weights of {name} were not loaded: {self.failure!r}") from self.failure
+
     def expect(self, entry) -> None:
         """Link `entry` after the previous one in the order the blocks were given, before any pass has run."""
         if self.hinted is None:
@@ -234,7 +278,19 @@ class _Prefetcher:
         if self._pass_start is None or self._pass_end is None:
             return
         self.pass_log.append((self._pass_end - self._pass_start, self.stats["wait_staged_s"] - self._pass_wait0))
+        self.pass_copy.append(tuple(self.stats[k] - self._pass_mark.get(k, 0.0) for k in _PASS_KEYS))
         self._pass_start = None
+
+    def _log_block(self) -> None:
+        """In the first pass, keep how the main thread spent the time of the block that just ran."""
+        if self.stats["passes"] != 1 or self._block_mark is None or self.last is None:
+            return
+        started, staged, gpu = self._block_mark
+        self.first_pass.append((
+            self.where.get(id(self.last)), self.last.name, self._pass_end - started,
+            self.stats["wait_staged_s"] - staged, self.stats["wait_gpu_s"] - gpu,
+        ))
+        self._block_mark = None
 
     def stage(self, entry) -> None:
         if self.stream is None or entry is  None or entry.staged is not None:
@@ -278,6 +334,7 @@ class _Prefetcher:
         """Mark the end of a block's work on the ocmpute stream."""
         if self.profile:
             self._pass_end = time.perf_counter()
+            self._log_block()
         if self.stream is None or self.lookahead <= 0:
             return
         event = torch.cuda.Event()
@@ -425,7 +482,20 @@ class _Prefetcher:
                     lines.append("    ...")
                 else:
                     n, (took, waited) = item
-                    lines.append(f"    pass {n}: {took:.2f} s, waited {waited:.2f} s")
+                    lines.append(f"    pass {n}: {took:.2f} s, waited {waited:.2f} s{self._copied(n - 1)}")
+        if self.first_pass:
+            total = sum(b[2] for b in self.first_pass)
+            lines.append(
+                f"  first pass, main thread time by block ({len(self.first_pass)} blocks, {total:.2f} s; "
+                "staged = waiting for the copy, gpu = waiting for the GPU, the rest is launching work):"
+            )
+            for position, name, ran, staged, gpu in sorted(self.first_pass, key=lambda b: b[2], reverse=True)[:6]:
+                lines.append(f"    {name or f'block {position}'}: {ran:.2f} s (staged {staged:.2f}, gpu {gpu:.2f})")
+        if s["load_s"]:
+            lines.append(
+                f"  loader thread: {int(s['load_blocks'])} blocks in {s['load_s']:.2f} s, "
+                f"main thread waited for it {s['wait_loader_s']:.2f} s (once, not per pass)"
+            )
 
         slowest = sorted(self.block_wait, key=self.block_wait.get, reverse=True)[:5]
         if slowest:
@@ -438,6 +508,18 @@ class _Prefetcher:
         text = "\n".join(lines)
         print(text)
         return text
+
+    def _copied(self, index: int) -> str:
+        """What the worker read and copied while pass `index` ran, for its line in the report."""
+        if index >= len(self.pass_copy):
+            return ""
+        ram_s, ram_gb, disk_s, disk_gb = self.pass_copy[index]
+        parts = []
+        if ram_s:
+            parts.append(f"RAM copies {ram_gb:.2f} GB in {ram_s:.2f} s ({ram_gb / ram_s:.2f} GB/s)")
+        if disk_s:
+            parts.append(f"disk reads {disk_gb:.2f} GB in {disk_s:.2f} s ({disk_gb * 1000 / disk_s:.0f} MB/s)")
+        return f", {', '.join(parts)}" if parts else ""
 
     def _save_order(self) -> None:
         """Save the order that was seen, unless there is nothing to save or the file in use was right."""
@@ -499,13 +581,18 @@ def offload_blocks(
     prefetcher: Optional["_Prefetcher"] = None,
     lookahead: Optional[int] = None,
     profile: Optional[bool] = None,
+    names: Optional[Iterable[str]] = None,
+    hint: bool = True,
 ) -> OffloadHandle:
     """Low-level: wrap each block so its weights are expanded on `device` only while it runs.
 
     Blocks whose weights are already on the device in the compute dtype are left untouched.
     `disk` (advanced) maps a block to a DiskReader when its weights live in the checkpoint file.
     `lookahead` is how many blocks ahead the next weights are copied (0 turns prefetching off; the default comes
-    from config)."""
+    from config).
+    `names` gives each block a name, for the order file and for messages. `hint` is False for a block that is
+    installed while the model runs, which has no place in the order given."""
+    names  = list(names) if names is not None else None
     dev    = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     handle = OffloadHandle()
     if prefetcher is None:
@@ -513,7 +600,8 @@ def offload_blocks(
         handle._add(prefetcher.close)
     handle._prefetcher = prefetcher
 
-    for block in blocks:
+    for i, block in enumerate(blocks):
+        label  = names[i] if names is not None else None
         scales = {
             n[: -len(SCALE_SUFFIX)]: b for n, b in block.named_buffers() if n.endswith(SCALE_SUFFIX)
         }
@@ -535,10 +623,15 @@ def offload_blocks(
 
             hook = block.register_forward_hook(free_after_run)
             handle._add(hook.remove)
+            if label is not None:                        # not wrapped, so only note when it starts
+                note = block.register_forward_pre_hook(lambda _module, _args, n=label: prefetcher.note(n))
+                handle._add(note.remove)
             continue
 
         entry  = _Entry(slots, scales, reader)
-        prefetcher.expect(entry)
+        entry.name = label
+        if hint:
+            prefetcher.expect(entry)
 
         def bring(entry=entry):
             staged = prefetcher.take(entry)
@@ -592,11 +685,78 @@ def offload_blocks(
             restore()
             block.__dict__.pop("forward", None)
             entry.staged = None
+            entry.slots.clear()                  # the prefetcher keeps the entries for as long as the handle lives, and these
+            entry.scales.clear()                 # hold the original tensors, which release() is meant to give back
 
         block.forward = wrapped
         handle._add(undo)
 
     return handle
+
+
+def _defer_block(block: nn.Module, name: str, pre: "_Prefetcher", handle: OffloadHandle, install: Callable) -> None:
+    """Until the block's weights are loaded, calling the block waits for them; then the real hooks go in.
+    `install()` puts them in and returns their handle."""
+    state = {"inner": None}
+
+    def gate(*args, **kwargs):
+        pre.wait_ready(name)
+        block.__dict__.pop("forward", None)               # so that install() sees the block's own forward
+        state["inner"] = install()
+        pre.note(name)
+        if "forward" in block.__dict__:                   # wrapped: its own forward does the rest
+            return block.forward(*args, **kwargs)
+        out = block.forward(*args, **kwargs)              # not wrapped: the hook that frees it starts with the next call
+        if pre.final:
+            _to_meta(block)
+        return out
+
+    def undo():
+        if state["inner"] is not None:
+            state["inner"].remove()
+        elif block.__dict__.get("forward") is gate:
+            block.__dict__.pop("forward", None)
+
+    block.forward = gate
+    handle._add(undo)
+
+
+class _BlockLoader:
+    """Loads the deferred resident blocks one at a time, in the order given, on a worker thread."""
+
+    def __init__(self, deferred, order: Iterable[str], prefetcher: "_Prefetcher", device: torch.device) -> None:
+        self.deferred   = deferred
+        self.order      = list(order)
+        self.prefetcher = prefetcher
+        self.device     = device
+        self._stop      = threading.Event()
+        self.thread     = threading.Thread(target=self._run, name="trash-panda-loader", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        """Ask the thread to stop after the block it is loading, and wait for it."""
+        self._stop.set()
+        self.thread.join()
+
+    def _run(self) -> None:
+        try:
+            with torch.cuda.device(self.device) if self.device.type == "cuda" else nullcontext():
+                for prefix in self.order:
+                    if self._stop.is_set():
+                        break
+                    started = time.perf_counter()
+                    self.deferred.load(prefix)
+                    if self.prefetcher.profile:
+                        self.prefetcher.stats["load_s"] += time.perf_counter() - started
+                        self.prefetcher.stats["load_blocks"] += 1
+                    self.prefetcher.mark_ready(prefix.rstrip("."))
+            if self._stop.is_set():
+                self.prefetcher.fail(RuntimeError("the loader was stopped"))
+        except BaseException as e:
+            self.prefetcher.fail(e)
+            warnings.warn(f"loading the weights failed: {e!r}")
 
 
 def _in_order(blocks, order):
@@ -650,23 +810,112 @@ def install_offload(
             order, pre.order_read = saved, True
             print(f"trash-panda: using the block order saved in {pre.order_path}")
     blocks = plan.blocks if order is None else _in_order(plan.blocks, order)
+    deferred = state.deferred if state is not None else None
     for b in blocks:
         block = model.get_submodule(b.prefix.rstrip("."))
+        name  = b.prefix.rstrip(".")
+        if deferred is not None and b.prefix in deferred.items:
+            pre.hold([name])                             # the weights are still being loaded; the hooks go in when they are
+            _defer_block(
+                block, name, pre, handle,
+                lambda block=block, name=name: offload_blocks(
+                    [block], device=dev, compute_dtype=cdt, prefetcher=pre, names=[name], hint=False
+                ),
+            )
+            continue
         reader_factory = None
         if b.tier == Tier.DISK:
             if state is None:
                 raise ValueError("Disk blocks need a model loaded with stream_load().")
             def reader_factory(_blk, p=b.prefix):
                 return DiskReader(state.checkpoint, state.disk_keys, p)
-        before = pre.hinted
-        handle.extend(offload_blocks([block], device=dev, compute_dtype=cdt, disk=reader_factory, prefetcher=pre))
-        name = b.prefix.rstrip(".")
-        if pre.hinted is not before:                     # the block was wrapped, so it has an entry
-            pre.hinted.name = name
-        else:                                            # not wrapped, so only note when it starts
-            hook = block.register_forward_pre_hook(lambda _module, _args, n=name: pre.note(n))
-            handle._add(hook.remove)
+        handle.extend(offload_blocks(
+            [block], device=dev, compute_dtype=cdt, disk=reader_factory, prefetcher=pre, names=[name]
+        ))
+    if deferred is not None:
+        loader = _BlockLoader(
+            deferred, [b.prefix for b in blocks if b.prefix in deferred.items], pre, torch.device(pre.device)
+        )
+        handle._add(loader.stop)                         # added last, so that remove() stops the thread first
+        loader.start()
     return handle
+
+
+def _cpu_tensors(smallest: int = 1 << 20) -> list:
+    """The CPU tensors that are alive right now and whose storage holds at least `smallest` bytes, one per storage, as
+    (bytes, weak reference)."""
+    found, seen = [], set()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                 # looking at every object trips deprecation warnings in some modules
+        for obj in gc.get_objects():
+            try:
+                if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
+                    continue
+                storage = obj.untyped_storage()
+                key, size = storage.data_ptr(), storage.nbytes()
+                if size >= smallest and key not in seen:
+                    seen.add(key)
+                    found.append((size, weakref.ref(obj)))
+            except Exception:
+                continue
+    return found
+
+
+def _who(obj) -> str:
+    """A few words that say what an object is."""
+    if isinstance(obj, dict):
+        return "dict with keys " + ", ".join(repr(k) for k in list(obj)[:4])
+    if isinstance(obj, (list, tuple)):
+        return f"{type(obj).__name__} of {len(obj)}"
+    name = getattr(obj, "__qualname__", None)
+    return f"{type(obj).__name__} {name}" if name else type(obj).__name__
+
+
+def _holders(obj, limit: int = 6) -> list:
+    """What refers to `obj`, and what refers to each of those, one line each."""
+    lines, refs = [], gc.get_referrers(obj)
+    for ref in refs:
+        if isinstance(ref, types.FrameType):
+            continue
+        owners = [_who(o) for o in gc.get_referrers(ref) if o is not refs and not isinstance(o, types.FrameType)][:3]
+        lines.append(f"{_who(ref)}  <-  {'; '.join(owners) or 'nothing'}")
+    return lines[:limit]
+
+
+class _RamTrace:
+    """With profiling on, remember at a few points of release() how much RAM was free, how much this process holds and
+    which big CPU tensors are still alive, to see which step gives memory back and what keeps it when none does."""
+
+    def __init__(self) -> None:
+        self.on      = config.current().profile
+        self.points  = []                           # (what, RAM available, (working set, private) or None, tensors alive, their bytes)
+        self.commits = []                           # bytes the system would still let processes commit
+        self.biggest = None                         # weak reference to the biggest CPU tensor alive at the last mark
+
+    def mark(self, what: str) -> None:
+        if not self.on:
+            return
+        _total, available, commit = _read_ram()
+        found = _cpu_tensors()
+        self.points.append((what, available, _process_memory(), len(found), sum(size for size, _ in found)))
+        self.biggest = max(found, key=lambda item: item[0])[1] if found else None
+        if commit is not None:
+            self.commits.append(commit)
+
+    def report(self) -> None:
+        if not self.on or not self.points:
+            return
+        lines = ["trash-panda: memory while releasing (free RAM; this process: working set / private; CPU tensors of 1 MB or more alive):"]
+        for what, free, process, count, held in self.points:
+            used = f", process {process[0] / 1e9:.2f} / {process[1] / 1e9:.2f} GB" if process else ""
+            lines.append(f"  {what:15} {free / 1e9:6.2f} GB free{used}, {count} tensors of {held / 1e9:.2f} GB")
+        if len(self.commits) >= 2:
+            lines.append(f"  commit headroom {self.commits[0] / 1e9:.2f} -> {self.commits[-1] / 1e9:.2f} GB")
+        big = self.biggest() if self.biggest is not None else None
+        if big is not None and self.points[-1][4] > 10 ** 8:
+            lines.append("  still alive at the end, the biggest tensor is held by:")
+            lines.extend(f"    {line}" for line in _holders(big))
+        print("\n".join(lines))
 
 
 def release(model: nn.Module, handle: Optional[OffloadHandle] = None) -> None:
@@ -675,12 +924,17 @@ def release(model: nn.Module, handle: Optional[OffloadHandle] = None) -> None:
 
     Pass the handle that install_offload() / offload_blocks() returned; without it the hooks keep the weights alive.
     The model ends up on the meta device and cannot run again. Safe to call twice."""
+    trace = _RamTrace()
+    trace.mark("start")
     if handle is not None:
         handle.remove()
+    trace.mark("hooks removed")
     model.__dict__.pop("_trash_panda_state", None)
     _to_meta(model)
+    trace.mark("weights dropped")
 
     gc.collect()
+    trace.mark("gc")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         # PyTorch keeps freed pinned (page-locked) memory for reuse, and empty_cache() does not touch it. Measured
@@ -689,3 +943,5 @@ def release(model: nn.Module, handle: Optional[OffloadHandle] = None) -> None:
         empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
         if empty_host_cache is not None:
             empty_host_cache()
+    trace.mark("caches emptied")
+    trace.report()

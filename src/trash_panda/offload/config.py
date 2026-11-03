@@ -36,6 +36,8 @@ class Defaults:
     vram_fill_warn_fraction: float = 0.9        # warn when the planned GPU use in above this share of the free VRAM
 
     # RAM
+    ram_in_memory: bool = False                 # read the tensors of streamed blocks into memory of their own while loading, not mapped from the file
+    ram_read_threads: int = 1                   # threads that do that reading
     min_free_ram: str = "auto"                  # RAM kept free for the system: "auto" (below) or a size such as "2GB"
     ram_reserve_fraction: float = 0.08          # "auto" keeps this share of the machine's RAM free ...
     ram_reserve_min_gb: float = 1.0             # ... but at least this many GiB

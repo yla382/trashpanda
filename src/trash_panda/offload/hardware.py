@@ -56,6 +56,39 @@ def _windows_memory() -> Optional[Tuple[int, int, int]]:
     return int(status.ullTotalPhys), int(status.ullAvailPhys), int(status.ullAvailPageFile)
 
 
+def _process_memory() -> Optional[Tuple[int, int]]:
+    """(working set, private bytes) of this process, or None if they cannot be read."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        kernel32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(COUNTERS), wintypes.DWORD]
+        counters = COUNTERS()
+        counters.cb = ctypes.sizeof(COUNTERS)
+        if not psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            return None
+        return int(counters.WorkingSetSize), int(counters.PrivateUsage)
+    try:
+        import psutil
+
+        info = psutil.Process().memory_info()
+        return int(info.rss), int(info.vms)
+    except ImportError:
+        return None
+
+
 def _read_ram() -> Tuple[int, int, Optional[int]]:
     """(total, available, commit_available or None)"""
     total = available = 0
