@@ -220,18 +220,18 @@ In bash, use `export TRASH_PANDA_PROFILE=1` and `unset TRASH_PANDA_PROFILE`.
 | `TRASH_PANDA_RAM_IN_MEMORY` | `0` | Read the tensors of the blocks that wait in RAM into memory of their own while loading, instead of keeping them mapped from the checkpoint file |
 | `TRASH_PANDA_RAM_READ_THREADS` | `1` | Threads that do that reading. Only used with `TRASH_PANDA_RAM_IN_MEMORY` |
 | `TRASH_PANDA_MIN_FREE_RAM` | `auto` | RAM kept free for the system: `auto` (the three settings below) or a size such as `2GB` |
-| `TRASH_PANDA_RAM_RESERVE_FRACTION` | `0.08` | With `auto`, the share of the machine's RAM kept free, ... |
-| `TRASH_PANDA_RAM_RESERVE_MIN_GB` | `1.0` | ... but at least this many GiB, ... |
-| `TRASH_PANDA_RAM_RESERVE_MAX_GB` | `4.0` | ... and at most this many |
+| `TRASH_PANDA_RAM_RESERVE_FRACTION` | `0.08` | With `auto`, the share of the machine's RAM kept free for the system. The result stays between the minimum and the maximum below |
+| `TRASH_PANDA_RAM_RESERVE_MIN_GB` | `1.0` | With `auto`, the least RAM kept free, in GiB, however small the share above comes out |
+| `TRASH_PANDA_RAM_RESERVE_MAX_GB` | `4.0` | With `auto`, the most RAM kept free, in GiB, however large the share above comes out |
 | `TRASH_PANDA_RAM_RESERVE_UNKNOWN_GB` | `2.0` | The reserve when the machine's RAM cannot be read |
 | `TRASH_PANDA_COMMIT_WARN_FRACTION` | `0.9` | Warn when the blocks in RAM need more than this share of the Windows commit limit |
 | `TRASH_PANDA_HEADROOM_VRAM` | `1.5GB` | VRAM kept free for activations when none was measured |
 | `TRASH_PANDA_STREAM_BUFFER_FACTOR` | `1.3` | Working area for a streamed block, as a multiple of its expanded size |
-| `TRASH_PANDA_ACTIVATION_MARGIN_FRACTION` | `0.05` | Margin added to a measured activation size: this share of the VRAM, ... |
-| `TRASH_PANDA_ACTIVATION_MARGIN_MIN_GB` | `0.5` | ... but at least this many GiB |
+| `TRASH_PANDA_ACTIVATION_MARGIN_FRACTION` | `0.05` | Safety margin added to a measured activation size, as a share of the VRAM. It is never smaller than the minimum below |
+| `TRASH_PANDA_ACTIVATION_MARGIN_MIN_GB` | `0.5` | The smallest safety margin added to a measured activation size, in GiB |
 | `TRASH_PANDA_VRAM_FILL_WARN_FRACTION` | `0.9` | Warn when the planned GPU use is above this share of the free VRAM |
 | `TRASH_PANDA_FIND_BLOCKS_MIN_FRACTION` | `0.01` | A group of layers must hold at least this share of the model's bytes to count as the blocks |
-| `TRASH_PANDA_FIND_BLOCKS_MIN_BLOCKS` | `2` | ... and have at least this many blocks |
+| `TRASH_PANDA_FIND_BLOCKS_MIN_BLOCKS` | `2` | The least number of blocks a group of layers must have to count as the blocks |
 
 Two options are arguments of `stage()`, not environment variables: `overlap=True` (see "Running a stage") and `order=`
 with `order_file_destination=`.
