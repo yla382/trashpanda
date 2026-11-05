@@ -9,11 +9,11 @@ from .loader import stream_load
 from .planner import BlockPlan, Plan, Tier, parse_bytes, plan
 from .report import LoadReport
 from .measure import measure_activation_vram
-from .stage import stage
+from .stage import PendingStage, preload, stage
 
 __all__ = [
     "BlockGroup", "BlockPlan", "Checkpoint", "DiskReader", "Hardware", "Kind", "LoadReport",
-    "OffloadHandle", "Plan", "TensorInfo", "Tier",
+    "OffloadHandle", "PendingStage", "Plan", "TensorInfo", "Tier",
     "detect_hardware", "expand", "find_blocks", "install_offload", "measure_activation_vram", "module_nbytes",
-    "offload_blocks", "release", "parse_bytes", "parse_dtype", "plan", "quantize_fp8", "stream_load", "stage"
+    "offload_blocks", "release", "parse_bytes", "parse_dtype", "plan", "preload", "quantize_fp8", "stream_load", "stage"
 ]

@@ -194,6 +194,8 @@ class _Prefetcher:
 
     profile    = False
     order_path = None
+    dropper    = None
+    background_drop = False
 
     def __init__(self, device: torch.device, lookahead: Optional[int] = None, profile: Optional[bool] = None):
         cfg = config.current()
@@ -217,6 +219,8 @@ class _Prefetcher:
         self.pool        = _PinnedPool(cfg.pinned_buffers) if self.stream is not None else None
         self.worker      = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not None else None
         self.final       = False
+        self.dropper     = None                      # thread that lets go of RAM-tier tensors in a final pass, made when needed
+        self.background_drop = self.stream is not None   # only where there is a compute stream to keep going
         self.releases    = None                      # queue.SimpleQueue of Release, once somebody has subscribed
         self.release_log = []                        # profile: (time, tier, bytes) of every block the final pass freed
         self.release_peak = 0                        # profile: the most Releases waiting on the queue at once
@@ -249,20 +253,62 @@ class _Prefetcher:
         """True if a freed block is reported: somebody subscribed, or the profile is on."""
         return self.releases is not None or self.profile
 
-    def announce(self, name: Optional[str], tier: str, nbytes: int) -> None:
+    def _compute_event(self):
+        """A CUDA event recorded now on the current stream of the calling thread (the compute stream), or None without CUDA."""
+        if self.device.type != "cuda":
+            return None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.device))
+        return event
+
+    def announce(self, name: Optional[str], tier: str, nbytes: int, event=None) -> None:
         """A block of the final pass has been freed: queue it for the subscriber and note it for the profile. Called
-        on the compute thread after the block ran and was freed, so it never waits for whoever reads the queue."""
+        after the block ran and was freed, on the compute thread or (for RAM-tier blocks, see drop()) on the drop
+        thread, so it never waits for whoever reads the queue. `event` is a CUDA event recorded on the compute stream
+        after the block was freed; without one, a new event is recorded on the current stream."""
         now = time.perf_counter()
         if self.releases is not None:
-            event = None
-            if self.device.type == "cuda":
-                event = torch.cuda.Event()
-                event.record(torch.cuda.current_stream(self.device))
+            if event is None:
+                event = self._compute_event()
             self.releases.put(Release(name, tier, nbytes, event, now))
         if self.profile:
             self.release_log.append((now, tier, nbytes))
             if self.releases is not None:
                 self.release_peak = max(self.release_peak, self.releases.qsize())
+
+    def drop(self, held, tier: str, freed) -> None:
+        """Final pass: let go of the tensors a block stored (`held`: the entry's slots and scales, already taken out of
+        the entry) and announce the block (`freed`: its name, tier and bytes, or None if nobody is watching).
+
+        The tensors of a RAM-tier block may be memory-mapped from the checkpoint, and the last of them to go takes the
+        mapping with it: 1.1 s for 6.95 GB of touched pages, and Python's lock is not held meanwhile. So where there
+        is a compute stream, RAM-tier tensors are dropped one block at a time on a thread of their own, in the order
+        the blocks ran, and the block is announced when its memory is really gone. The compute thread goes on at once.
+        close() and report() wait for the thread."""
+        if tier == "ram" and self.background_drop:
+            event = self._compute_event() if freed is not None and self.releases is not None else None
+            if self.dropper is None:
+                self.dropper = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda-drop")
+            self.dropper.submit(self._drop_job, held, freed, event)
+            return
+        self._drop_job(held, freed, None)
+
+    def _drop_job(self, held, freed, event) -> None:
+        for part in held:
+            part.clear()
+        if freed is not None:
+            if event is None:
+                self.announce(*freed)
+            else:
+                self.announce(*freed, event=event)
+
+    def settle(self) -> None:
+        """Wait until every drop handed to the drop thread has finished."""
+        if self.dropper is not None:
+            try:
+                self.dropper.submit(lambda: None).result()
+            except RuntimeError:                         # the interpreter is shutting down
+                pass
 
     def learn(self, entry) -> None:
         if entry.name is not None:
@@ -514,6 +560,7 @@ class _Prefetcher:
 
     def report(self) -> str:
         """A short summary of where the prefetching spent its time. Printed at exit when profiling is on."""
+        self.settle()
         if not self.profile or self._reported or not (self.stats or self.release_log or self._unused()):
             return ""
         s = self.stats
@@ -620,6 +667,9 @@ class _Prefetcher:
         """Stop the worker thread and let go of the pinned buffers and anything still staged."""
         self._save_order()
         self.report()
+        if self.dropper is not None:
+            self.dropper.shutdown(wait=True)
+            self.dropper = None
         if self.worker is not None:
             self.worker.shutdown(wait=True)
             self.worker = None
@@ -772,12 +822,13 @@ def offload_blocks(
                 return _orig(*args, **kwargs)
             finally:
                 if prefetcher.final:
-                    freed = (_entry.name, _entry.tier(), _entry.stored_nbytes()) if prefetcher.watching else None
-                    _entry.slots.clear()   # the entry holds the original tensors, so these keep the memory alive
+                    tier = _entry.tier()
+                    freed = (_entry.name, tier, _entry.stored_nbytes()) if prefetcher.watching else None
+                    held = [list(_entry.slots), dict(_entry.scales)]   # the entry holds the original tensors: these keep the memory alive
+                    _entry.slots.clear()
                     _entry.scales.clear()
                     _to_meta(_block)
-                    if freed is not None:
-                        prefetcher.announce(*freed)
+                    prefetcher.drop(held, tier, freed)
                 else:
                     _restore()
                 prefetcher.block_done()

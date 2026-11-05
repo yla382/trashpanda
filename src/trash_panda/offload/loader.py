@@ -116,6 +116,7 @@ def stream_load(
     disk_prefixes: Sequence[str] = (),
     skip_prefixes: Sequence[str] = (),
     defer_prefixes: Sequence[str] = (),
+    ram_in_memory: Optional[bool] = None,
     compute_dtype: Union[str, torch.dtype] = "bf16",
     storage_dtype: Union[None, str, torch.dtype] = "auto",
     device: Optional[str] = None,
@@ -131,6 +132,8 @@ def stream_load(
       defer_prefixes     resident blocks (a subset of resident_prefixes) whose tensors are left on the meta device;
                          `model._trash_panda_state.deferred.load(prefix)` loads one of them later (install_offload()
                          does that on a worker thread, and the block waits for it)
+      ram_in_memory      read the RAM tier into memory of its own, not mapped from the file (default: the
+                         TRASH_PANDA_RAM_IN_MEMORY setting). A mapped RAM tier is not read at all here, only on first use
     Anything else is expanded to `compute_dtype` on `device` right away.
 
     key_map  optional dict or function mapping checkpoint key -> model name.
@@ -169,6 +172,7 @@ def stream_load(
     disk_keys: Dict[str, Tuple[str, Optional[str]]] = {}
     deferred_items: Dict[str, list] = {}
     cfg = config.current()
+    in_memory = cfg.ram_in_memory if ram_in_memory is None else bool(ram_in_memory)
     spent = defaultdict(float)                               # seconds per tier, for the profile
     ram_jobs: list = []                                      # streamed tensors to read into memory of their own, after the rest
     ram_read = {"seconds": 0.0, "bytes": 0}                  # what that took, for the profile
@@ -244,7 +248,7 @@ def stream_load(
                 loaded.add(target)
                 continue
 
-            if tier == "ram" and cfg.ram_in_memory:
+            if tier == "ram" and in_memory:
                 ram_jobs.append((key, target, has_scale, scale_key))
             else:
                 began = time.perf_counter()

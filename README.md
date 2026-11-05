@@ -205,8 +205,47 @@ with stage(build_encoder, "encoder.safetensors") as (encoder, p, handle):
         print(r.name, r.tier, f"{r.nbytes / 1e9:.2f} GB")
 ```
 
+On a GPU, the tensors of a RAM-tier block are dropped on a thread of their own. With a memory-mapped RAM tier the last
+tensor of the checkpoint to go takes the whole mapping with it (1.1 s for 6.95 GB of touched pages), and that would hold
+up the model's last call. The `Release` of such a block is queued when its memory is really gone, so it can arrive up to
+about a second after the last call returns, and a queue read right after that call may not have the last one yet.
+`release()` and leaving `stage()` wait for the thread.
+
 Blocks that a model never runs, such as the encoder half of a VAE that only decodes, are named by the profile (see
 "Reading the profile"). `skip_prefixes` leaves them out.
+
+### Loading the next model while one runs
+
+`preload()` starts loading the next model of a pipeline while the current one is still running, so the drive works
+during the running model's compute:
+
+```python
+from trash_panda import preload, stage
+
+with stage(build_llm, "llm.safetensors") as (llm, p, _):
+    pending = preload(build_unet, "unet.safetensors", max_vram="11GB", max_ram="8GB")
+    prompt = rewrite(llm, ...)                   # a long computation; the UNet's RAM tier is read meanwhile
+with pending as (unet, p, _):
+    latents = denoise(unet, prompt)
+```
+
+It plans the next model now, with the memory you say it will have: `max_vram` is required, because the GPU is in use
+now, and `max_ram` is cut down to the RAM that is free (with a warning); `None` means the RAM that is free. The RAM tier
+is read on a background thread into memory of its own, whatever `TRASH_PANDA_RAM_IN_MEMORY` says: a memory-mapped RAM
+tier is not read until it is used, so there would be nothing to read ahead. The GPU blocks are loaded when the `with`
+block is entered, which has to happen after the running model was released; with `overlap=True` they are loaded on the
+worker thread, as `stage()` does. The `with` block waits for the reads, and an error in them is raised there. A pending
+model that will not be used has to be given up with `cancel()`, which waits for the reads and frees what they loaded.
+It can be entered once. The other arguments are those of `stage()`.
+
+The weights outside the blocks (640 MB for the diffusion model of the test pipeline) are put on the GPU as soon as they
+are read, so they need room there while the running model holds its own. The reads share the drive with whatever else is
+reading from it. With `TRASH_PANDA_PROFILE=1` it prints how long the background read took and how long the model waited
+for it.
+
+It can only help where something computes for a long time while the drive is idle. On the test pipeline the text
+encoder computes for 0.2 s, so there is nothing to hide the reads behind, and it has not been run on a real pipeline
+yet: it is tested on the CPU only.
 
 ### Storage dtype
 
@@ -417,6 +456,9 @@ direction, or come after it, and are not planned for now:
 * **A memory-mapped disk tier** as an experiment: map the checkpoint once and let the operating system keep recently
   used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit read-ahead,
   because a least-recently-used cache can thrash when the model is read in a cycle
+* **Starting the next model's reads behind compute in a pipeline that runs the same stages for many inputs in a row**:
+  the first model of the next input would be read while the last stage of the current one computes. It goes beyond
+  `preload()`, which covers one run through the stages
 * **Cheaper expansion**: reuse preallocated buffers and fuse the fp8 to bf16 conversion and scaling, instead of
   creating new tensors for every weight on every pass
 * **A cost model** that chooses between GPU, RAM and disk from measured disk and PCIe speed
@@ -473,31 +515,24 @@ the VAE was built stopped the decode of a 2048 x 1024 image from spilling into s
 logged). A final pass already announces each block it frees on a queue (`handle.subscribe()`, see "Running a stage").
 What is left is to let memory move between stages while they run. The steps below are small, each can be tested on
 its own, and they are listed in the order they depend on one another:
-* find out why the last RAM-tier block of a final pass is freed 1.7 to 1.9 s after the one before it. The last step of
-  the diffusion model takes 7.8 to 8.0 s against 6.3 to 6.4 s for the others, and the difference is inside that gap.
-  The final pass drops each block's tensors as it runs. Private memory (`TRASH_PANDA_RAM_IN_MEMORY`) goes back to the
-  system at once, and memory-mapped pages stay in the file cache until the system needs them. One possible cause is
-  that the checkpoint file is mapped once and the mapping is only released with the last tensor that uses it; a run
-  with `TRASH_PANDA_RAM_IN_MEMORY=1` would show it
-* start the next model's reads behind compute that is long enough to hide them. The measurements show that reads and
-  compute only overlap when something computes while the drive works: on the test pipeline the text encoder computes for
-  0.2 s against an 11.7 s load, and the diffusion model's reads come before any of its compute, so there is nothing to
-  hide them behind. A pipeline with a language model that rewrites the prompt, or one that makes several images, has
-  stages that compute for a long time while the drive is idle. `TRASH_PANDA_RAM_IN_MEMORY` is the memory model for it (a
-  model read ahead before it starts cannot have its pages dropped by the system), and `stage(overlap=True)` (a loader
-  thread, ready marks, the order file) is the groundwork
 * load the next model's blocks into the VRAM that a final pass has freed. A block would move in its stored form (fp8,
   for example) and be expanded in the stream buffer only when it runs. Compare the next stage's time with its time
   when it is loaded after the release. A background thread would take the events from the queue and load the next
   planned blocks, waiting for each event's CUDA event first. Loading early would compete with the running stage for the
-  drive when that stage reads from disk. The destination of a copy has to be allocated while the compute stream is
-  current, and the copy stream fills it after it waits for an event recorded after the allocation, with
-  `record_stream` on each tensor. A probe with 4 blocks of 512 MB on torch 2.8 showed that tensors allocated on the
-  copy stream do not reuse memory freed on the compute stream (the reserved memory went from 2 GB to 4 GB), while
-  tensors allocated on the compute stream do, also from another thread. It has not been tried with torch 2.5.1 or
-  with blocks of different sizes, and the prefetcher and the loader thread allocate on the copy stream today. On the
-  test pipeline the 12 GPU blocks (5.21 GB) of the diffusion model are freed 2.8 s into its last step, which takes
-  about 7.9 s
+  drive when that stage reads from disk. Tensors allocated on the copy stream do not reuse memory freed on the compute
+  stream (probes with 12 freed blocks and a second model's blocks allocated as space frees, on torch 2.5.1 and 2.8 with
+  identical results: the reserved memory roughly doubled). Tensors allocated while the compute stream is current do
+  reuse it, also from another thread, but only when they are no larger than the freed blocks (2.6 to 2.8 GB reserved
+  for 2.6 GB of blocks), because the freed segments are not merged; larger blocks need new memory (4.9 to 5.3 GB). The
+  destination of a copy would then be allocated on the compute stream, and the copy stream fills it after it waits for
+  an event recorded after the allocation, with `record_stream` on each tensor. For larger blocks,
+  `torch.cuda.empty_cache()` after the freed blocks' events gave full reuse for every shape (2.7 GB), at about 12 to
+  30 ms per call on the thread that calls it, with no stalled launches from another thread and a few percent less
+  throughput on a stand-in workload. On the test pipeline the text encoder's blocks (0.10 GB) are smaller than the
+  diffusion model's (0.43 GB), so the step into the diffusion model is the larger case, and the step into the VAE is
+  the smaller one. None of this has been measured with the real blocks, and the prefetcher and the loader thread
+  allocate on the copy stream today. On the test pipeline the 12 GPU blocks (5.21 GB) of the diffusion model are freed
+  2.8 s into its last step, which takes about 6.3 s
 * plan a stage with the memory that is expected to be free when it starts. `plan()` uses the memory that is free when
   it runs, so it needs a way to be given the memory that the running stage will release. The stage would be planned
   once for that end state, with the activation headroom from an earlier measurement, and the loading above would only
