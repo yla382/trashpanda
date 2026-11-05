@@ -222,11 +222,11 @@ during the running model's compute:
 ```python
 from trash_panda import preload, stage
 
-with stage(build_llm, "llm.safetensors") as (llm, p, _):
-    pending = preload(build_unet, "unet.safetensors", max_vram="11GB", max_ram="8GB")
-    prompt = rewrite(llm, ...)                   # a long computation; the UNet's RAM tier is read meanwhile
-with pending as (unet, p, _):
-    latents = denoise(unet, prompt)
+with stage(build_first, "first.safetensors") as (first, p, _):
+    pending = preload(build_second, "second.safetensors", max_vram="11GB", max_ram="8GB")
+    result = run_long_computation(first, ...)    # a long computation; the second model's RAM tier is read meanwhile
+with pending as (second, p, _):
+    output = run(second, result)
 ```
 
 It plans the next model now, with the memory you say it will have: `max_vram` is required, because the GPU is in use
