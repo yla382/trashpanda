@@ -174,6 +174,13 @@ before the first call:
   given, a warning appears once. A run without a file would warn on the first run only.
 * `order=["txtfusion.layerwise_blocks.0", ...]` names the blocks that run first, in that order, and the others follow
   in the plan's order. With it, the file is neither read nor written.
+* `record_order(build, path, args=(...), kwargs={...})` finds the order of a model that has never run, without a real
+  run: it calls the model once on the meta device, so no weights are read and nothing runs on the GPU, and writes the
+  file that the first `stage()` then reads. `args` and `kwargs` are the inputs of one call, as small as the model
+  accepts; tensors in them are moved to the meta device. The order can depend on the inputs, so give ones like the real
+  run's. It replaces a file that is already there. If the call cannot run on the meta device (an operation without a
+  meta version, or code that reads a tensor's values), it warns, returns `None` and saves nothing, and the first run
+  goes on as it did without the call. `skip_prefixes` and `order_file_destination` are the same as for `stage()`.
 
 The file is named after the checkpoint file, so two checkpoints with the same file name (diffusers models are
 usually all `diffusion_pytorch_model.safetensors`) share a name if `order_file_destination` is one folder, and then
@@ -243,9 +250,35 @@ are read, so they need room there while the running model holds its own. The rea
 reading from it. With `TRASH_PANDA_PROFILE=1` it prints how long the background read took and how long the model waited
 for it.
 
+With `after=`, the GPU blocks of the next model are loaded early too, into the VRAM that the running model's final pass
+frees:
+
+```python
+with stage(build_first, "first.safetensors") as (first, p, handle):
+    releases = handle.subscribe()
+    pending = preload(build_second, "second.safetensors", max_vram="11GB", max_ram="8GB", after=releases)
+    handle.final_pass()
+    result = run(first, ...)        # the second model's GPU blocks load as the first one frees its own
+with pending as (second, p, _):
+    output = run(second, result)
+```
+
+`after` is the queue that `handle.subscribe()` returns. The loader reads it, so nothing else should. It loads a block
+of the next model, in the order the blocks will run, when the GPU blocks announced on the queue add up to more than what
+it has loaded so far plus the block, and when the GPU really has room for it: the memory the driver reports free plus
+what PyTorch holds cached and unused must cover the block and leave 5% of the GPU's memory (at least 256 MB) free for
+the running model. Each block goes through two small pinned buffers (64 MB each, separate from the running model's) and
+a copy stream of its own. The destination is allocated on the compute stream, so it can reuse the memory the running
+model freed there, and the copy waits for the event of the last block that was freed. Copying straight from the
+memory-mapped file instead held up the running model's compute, also on a separate stream. The blocks that were not
+loaded early load when the `with` block is entered, and a failure in the early loading only gives a warning. It loads
+GPU blocks only: the RAM tier is read as before, and a block larger than the memory freed waits for room. The loader
+reads from the drive, so it keeps pace with the running model only when the next model's file is in the file cache or
+the model computes for long enough.
+
 It can only help where something computes for a long time while the drive is idle. On the test pipeline the text
-encoder computes for 0.2 s, so there is nothing to hide the reads behind, and it has not been run on a real pipeline
-yet: it is tested on the CPU only.
+encoder computes for 0.2 s, so there is nothing to hide the reads behind. It has not been run on the test pipeline yet:
+it is tested on the CPU, and early loading also on a GPU with stand-in models.
 
 ### Storage dtype
 
@@ -459,6 +492,10 @@ direction, or come after it, and are not planned for now:
 * **Starting the next model's reads behind compute in a pipeline that runs the same stages for many inputs in a row**:
   the first model of the next input would be read while the last stage of the current one computes. It goes beyond
   `preload()`, which covers one run through the stages
+* **Reading the order of the blocks from the source of `forward()`** with the `ast` module, to know the order of a
+  model that has never run without calling it. It fails on code that is not plain (helper methods, dynamic
+  dispatch, branches that depend on the inputs), and a wrong order is prefetched with confidence, which is worse
+  than the definition order. `record_order()` calls the model on the meta device instead and sees the real order
 * **Cheaper expansion**: reuse preallocated buffers and fuse the fp8 to bf16 conversion and scaling, instead of
   creating new tensors for every weight on every pass
 * **A cost model** that chooses between GPU, RAM and disk from measured disk and PCIe speed
@@ -487,13 +524,6 @@ before the next one starts loading. `release()` does the whole-model version by 
 that focus, roughly in the order they are planned. Nothing here is promised or scheduled.
 
 **Speed**
-* a better first order for a model that has never run. The first run uses the order the model defines its blocks in,
-  which `forward()` can override (a diffusion model can define its four text blocks after its 28 main blocks and
-  run them first), so that run warns and is prefetched less well. The effect measured so far is small: the first step
-  of that model went from 25 s to 22 s, which is within the variation between runs. Two ways to know the real order
-  before the first call: a helper that records it without a real run (a call on the meta device with small inputs
-  that the caller gives), or reading the source of `forward()` with the `ast` module, which fails on code that is not
-  plain
 * the loader thread of `stage(overlap=True)` reads with plain seek-and-read, which ran at 0.25 to 0.28 GB/s against
   0.41 GB/s for the memory-mapped reads that `stream_load()` does for the same blocks (12 blocks, 5.21 GB: 18.5 to
   21.2 s against 12.7 s). Memory-mapped reads in the loader would remove most of that gap. The loader would have to open
@@ -515,29 +545,16 @@ the VAE was built stopped the decode of a 2048 x 1024 image from spilling into s
 logged). A final pass already announces each block it frees on a queue (`handle.subscribe()`, see "Running a stage").
 What is left is to let memory move between stages while they run. The steps below are small, each can be tested on
 its own, and they are listed in the order they depend on one another:
-* load the next model's blocks into the VRAM that a final pass has freed. A block would move in its stored form (fp8,
-  for example) and be expanded in the stream buffer only when it runs. Compare the next stage's time with its time
-  when it is loaded after the release. A background thread would take the events from the queue and load the next
-  planned blocks, waiting for each event's CUDA event first. Loading early would compete with the running stage for the
-  drive when that stage reads from disk. Tensors allocated on the copy stream do not reuse memory freed on the compute
-  stream (probes with 12 freed blocks and a second model's blocks allocated as space frees, on torch 2.5.1 and 2.8 with
-  identical results: the reserved memory roughly doubled). Tensors allocated while the compute stream is current do
-  reuse it, also from another thread, but only when they are no larger than the freed blocks (2.6 to 2.8 GB reserved
-  for 2.6 GB of blocks), because the freed segments are not merged; larger blocks need new memory (4.9 to 5.3 GB). The
-  destination of a copy would then be allocated on the compute stream, and the copy stream fills it after it waits for
-  an event recorded after the allocation, with `record_stream` on each tensor. For larger blocks,
-  `torch.cuda.empty_cache()` after the freed blocks' events gave full reuse for every shape (2.7 GB), at about 12 to
-  30 ms per call on the thread that calls it, with no stalled launches from another thread and a few percent less
-  throughput on a stand-in workload. On the test pipeline the text encoder's blocks (0.10 GB) are smaller than the
-  diffusion model's (0.43 GB), so the step into the diffusion model is the larger case, and the step into the VAE is
-  the smaller one. None of this has been measured with the real blocks, and the prefetcher and the loader thread
-  allocate on the copy stream today. On the test pipeline the 12 GPU blocks (5.21 GB) of the diffusion model are freed
-  2.8 s into its last step, which takes about 6.3 s
 * plan a stage with the memory that is expected to be free when it starts. `plan()` uses the memory that is free when
   it runs, so it needs a way to be given the memory that the running stage will release. The stage would be planned
   once for that end state, with the activation headroom from an earlier measurement, and the loading above would only
   fill the plan in as memory frees up; if the free memory at the start differs from the prediction, it is planned once
-  more then. Planning again on every event is the alternative if this proves too coarse
+  more then. Planning again on every event is the alternative if this proves too coarse. The same holds for the RAM
+  tier: when only part of it fits in the RAM that is free while the running stage holds its own, the stage is planned
+  for the final budget, the blocks that fit are read early, in the order the plan lists them, and the rest are read
+  after the release. `preload()` reads the whole RAM tier or none of it today, and plans for the `max_ram` the caller
+  gives. Reading early moves reads, it does not remove them, so it saves time only where the drive would otherwise be
+  idle or the reads overlap work that does not use it; the result has to be compared by the total time of the pipeline
 * let the depth of the staging follow the profile: a look-ahead above 2 only where the main thread waits for blocks,
   and the spare VRAM to the next model where it does not
 * one pinned pool for the whole pipeline, sized for the largest block of any stage and kept until the pipeline ends,

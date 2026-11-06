@@ -12,6 +12,7 @@ Each tensor is read lazily from the checkpoint and placed according to its tier:
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -50,14 +51,22 @@ class DeferredLoad:
     def __init__(self, items: Dict[str, list], store: Callable) -> None:
         self.items  = items           # block prefix -> [(key, target, has_scale, scale_key), ...]
         self._store = store
+        self.loaded = set()           # prefixes that are on the compute device already
+        self._lock  = threading.Lock()
 
     def prefixes(self) -> list:
         return list(self.items)
 
-    def load(self, prefix: str) -> None:
-        """Read the block's tensors from the checkpoint and put them on the compute device."""
-        for key, target, has_scale, scale_key in self.items.get(prefix, ()):
-            self._store(key, target, "gpu_raw", has_scale, scale_key)
+    def load(self, prefix: str, copy: Optional[Callable] = None) -> None:
+        """Read the block's tensors from the checkpoint and put them on the compute device. A block that is loaded
+        already is left alone, so two threads can share the work. `copy(tensor, device)` replaces the plain
+        `tensor.to(device)` that moves a tensor to the device."""
+        with self._lock:
+            if prefix in self.loaded:
+                return
+            for key, target, has_scale, scale_key in self.items.get(prefix, ()):
+                self._store(key, target, "gpu_raw", has_scale, scale_key, copy=copy)
+            self.loaded.add(prefix)
 
 
 @dataclass
@@ -177,7 +186,7 @@ def stream_load(
     ram_jobs: list = []                                      # streamed tensors to read into memory of their own, after the rest
     ram_read = {"seconds": 0.0, "bytes": 0}                  # what that took, for the profile
 
-    def store(key: str, target: str, tier: str, has_scale: bool, scale_key: str, preloaded=None) -> None:
+    def store(key: str, target: str, tier: str, has_scale: bool, scale_key: str, preloaded=None, copy=None) -> None:
         """Put one tensor where its tier says. It is read here, unless `preloaded` already holds it and its scale."""
         if preloaded is None:
             raw = ck.get_tensor(key)
@@ -198,11 +207,12 @@ def stream_load(
                 elif not is_fp8(sdt):
                     raw = raw.to(sdt)
             dest = device if tier == "gpu_raw" else "cpu"
-            raw = raw.to(dest)
+            to_dest = copy if copy is not None and tier == "gpu_raw" else (lambda t, d: t.to(d))
+            raw = to_dest(raw, dest)
             _assign(model, target, raw)
             nbytes = raw.numel() * raw.element_size()
             if scale is not None:
-                scale = scale.to(dest)
+                scale = to_dest(scale, dest)
                 _set_scale(model, target, scale)
                 nbytes += scale.numel() * scale.element_size()
             report.add(tier, nbytes, kind.value if kind is not None else None)

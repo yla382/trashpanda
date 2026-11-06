@@ -1,13 +1,13 @@
 """trash-panda: run models bigger than your GPU by streaming weights across GPU, RAM and disk."""
 
-__version__ = "0.0.21"
+__version__ = "0.0.22"
 
 # The offload API is imported lazily so that `import trash_panda` works even where torch is not installed yet.
 _OFFLOAD_NAMES = (
     "BlockGroup", "BlockPlan", "Checkpoint", "DiskReader", "Hardware", "Kind", "LoadReport",
     "OffloadHandle", "PendingStage", "Plan", "TensorInfo", "Tier",
     "detect_hardware", "expand", "find_blocks", "install_offload", "measure_activation_vram", "module_nbytes",
-    "offload_blocks", "release", "parse_bytes", "parse_dtype", "plan", "preload", "quantize_fp8", "stream_load", "stage"
+    "offload_blocks", "release", "parse_bytes", "parse_dtype", "plan", "preload", "quantize_fp8", "record_order", "stream_load", "stage"
 )
 
 __all__ = ["__version__", *_OFFLOAD_NAMES]
