@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04      # not ubuntu-latest: setup-python has no Python 3.9 for the newest Ubuntu
     strategy:
       matrix:
         python-version: ["3.9", "3.11"]
