@@ -236,19 +236,38 @@ with pending as (second, p, _):
     output = run(second, result)
 ```
 
-It plans the next model now, with the memory you say it will have: `max_vram` is required, because the GPU is in use
-now, and `max_ram` is cut down to the RAM that is free (with a warning); `None` means the RAM that is free. The RAM tier
-is read on a background thread into memory of its own, whatever `TRASH_PANDA_RAM_IN_MEMORY` says: a memory-mapped RAM
-tier is not read until it is used, so there would be nothing to read ahead. The GPU blocks are loaded when the `with`
-block is entered, which has to happen after the running model was released; with `overlap=True` they are loaded on the
-worker thread, as `stage()` does. The `with` block waits for the reads, and an error in them is raised there. A pending
-model that will not be used has to be given up with `cancel()`, which waits for the reads and frees what they loaded.
-It can be entered once. The other arguments are those of `stage()`.
+It plans the next model now, for the memory it will have once the running one has been released. `max_vram` is that
+GPU memory (the GPU is in use now, so it cannot be measured) and `max_ram` is the RAM its RAM tier may take; `None` for
+`max_ram` means the RAM that is free now. Either can be left out when `running=p` is given, the plan of the running
+stage (the `p` in `with stage(...) as (first, p, handle)`): the memory is then what is free now plus what that stage
+holds and will give back, which is its GPU blocks and the weights outside the blocks for VRAM, and its RAM tier for RAM.
+The running stage's buffers and activations are not counted, so the VRAM figure comes out low, never high; a
+memory-mapped RAM tier gives back only the pages that were touched, so the RAM figure can be high. A figure that is
+given wins, and without `running` `max_vram` is required.
+
+Only the RAM that is free now can be read now. The RAM-tier blocks are taken in the order they run, from the first one,
+until the next one does not fit in the free RAM (less `min_free_ram` and the pinned buffers). Those are read on a
+background thread into memory of its own, whatever `TRASH_PANDA_RAM_IN_MEMORY` says: a memory-mapped RAM tier is not
+read until it is used, so there would be nothing to read ahead. The other RAM-tier blocks stay mapped from the file and
+are read when they first run, as in a model that was not preloaded. The GPU blocks are loaded when the `with` block is
+entered, which has to happen after the running model was released; with `overlap=True` they are loaded on the worker
+thread, as `stage()` does. The `with` block waits for the reads, and an error in them is raised there. A pending model
+that will not be used has to be given up with `cancel()`, which waits for the reads and frees what they loaded. It can
+be entered once. The other arguments are those of `stage()`.
+
+The prediction can be wrong (another program took VRAM, the running model kept a tensor, the earlier measurement of the
+activations was low), so when the `with` block is entered the plan is fitted to the VRAM that is really free: what the
+driver reports plus what PyTorch holds cached and unused, less the headroom the plan kept for activations and the room
+for streaming blocks. A block planned for the GPU that is not there yet and does not fit goes to the RAM tier, mapped
+from the file, with a warning; blocks already on the GPU stay. If there is room left, RAM-tier blocks that were read
+into memory move to the GPU, in the order they run, up to the first that does not fit. Blocks that stayed mapped are not
+moved, because that would be a cold read at entry. Nothing is changed when the free VRAM is not known (no CUDA).
 
 The weights outside the blocks (640 MB for the diffusion model of the test pipeline) are put on the GPU as soon as they
 are read, so they need room there while the running model holds its own. The reads share the drive with whatever else is
 reading from it. With `TRASH_PANDA_PROFILE=1` it prints how long the background read took and how long the model waited
-for it.
+for it, how many RAM blocks were read early and how many stay mapped, what it planned for when `running` was given, and
+what the replan at entry moved.
 
 With `after=`, the GPU blocks of the next model are loaded early too, into the VRAM that the running model's final pass
 frees:
@@ -266,8 +285,9 @@ with pending as (second, p, _):
 `after` is the queue that `handle.subscribe()` returns. The loader reads it, so nothing else should. It loads a block
 of the next model, in the order the blocks will run, when the GPU blocks announced on the queue add up to more than what
 it has loaded so far plus the block, and when the GPU really has room for it: the memory the driver reports free plus
-what PyTorch holds cached and unused must cover the block and leave 5% of the GPU's memory (at least 256 MB) free for
-the running model. Each block goes through two small pinned buffers (64 MB each, separate from the running model's) and
+what PyTorch holds cached and unused must cover the block and leave free the larger of 5% of the GPU's memory (at
+least 256 MB) and what the plan counted on keeping free (the headroom for activations and the room for streaming). Each
+block goes through two small pinned buffers (64 MB each, separate from the running model's) and
 a copy stream of its own. The destination is allocated on the compute stream, so it can reuse the memory the running
 model freed there, and the copy waits for the event of the last block that was freed. Copying straight from the
 memory-mapped file instead held up the running model's compute, also on a separate stream. The blocks that were not
@@ -278,7 +298,9 @@ the model computes for long enough.
 
 It can only help where something computes for a long time while the drive is idle. On the test pipeline the text
 encoder computes for 0.2 s, so there is nothing to hide the reads behind. It has not been run on the test pipeline yet:
-it is tested on the CPU, and early loading also on a GPU with stand-in models.
+it is tested on the CPU, and early loading, `running=`, the partial RAM read and the replan also on a GPU with stand-in
+models. Reading early moves reads, it does not remove them, so it saves time only where the drive would otherwise be
+idle or the reads overlap work that does not use it; the result has to be compared by the total time of the pipeline.
 
 ### Storage dtype
 
@@ -545,16 +567,6 @@ the VAE was built stopped the decode of a 2048 x 1024 image from spilling into s
 logged). A final pass already announces each block it frees on a queue (`handle.subscribe()`, see "Running a stage").
 What is left is to let memory move between stages while they run. The steps below are small, each can be tested on
 its own, and they are listed in the order they depend on one another:
-* plan a stage with the memory that is expected to be free when it starts. `plan()` uses the memory that is free when
-  it runs, so it needs a way to be given the memory that the running stage will release. The stage would be planned
-  once for that end state, with the activation headroom from an earlier measurement, and the loading above would only
-  fill the plan in as memory frees up; if the free memory at the start differs from the prediction, it is planned once
-  more then. Planning again on every event is the alternative if this proves too coarse. The same holds for the RAM
-  tier: when only part of it fits in the RAM that is free while the running stage holds its own, the stage is planned
-  for the final budget, the blocks that fit are read early, in the order the plan lists them, and the rest are read
-  after the release. `preload()` reads the whole RAM tier or none of it today, and plans for the `max_ram` the caller
-  gives. Reading early moves reads, it does not remove them, so it saves time only where the drive would otherwise be
-  idle or the reads overlap work that does not use it; the result has to be compared by the total time of the pipeline
 * let the depth of the staging follow the profile: a look-ahead above 2 only where the main thread waits for blocks,
   and the spare VRAM to the next model where it does not
 * one pinned pool for the whole pipeline, sized for the largest block of any stage and kept until the pipeline ends,

@@ -114,11 +114,11 @@ def test_an_error_in_the_reads_is_raised_where_the_model_is_asked_for(tiny_check
     assert all(t.is_meta for t in pending.model.parameters())
 
 
-def test_max_vram_has_to_be_given(tiny_checkpoint):
+def test_max_vram_or_the_running_plan_has_to_be_given(tiny_checkpoint):
     _, path = tiny_checkpoint
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="max_vram or running"):
         preload(meta_model, path, max_ram="1GB", **PLAN)
-    with pytest.raises(ValueError, match="max_vram"):
+    with pytest.raises(ValueError, match="max_vram or running"):
         preload(meta_model, path, max_vram=None, max_ram="1GB", **PLAN)
 
 
@@ -130,11 +130,11 @@ def test_the_plan_is_made_with_the_memory_given(tiny_checkpoint):
     pending.cancel()
 
 
-def test_max_ram_is_cut_down_to_the_ram_that_is_free_now(tiny_checkpoint):
+def test_the_model_is_planned_for_the_max_ram_given_even_if_more_than_is_free_now(tiny_checkpoint, recwarn):
     _, path = tiny_checkpoint
-    with pytest.warns(RuntimeWarning, match="available"):
-        pending = preload(meta_model, path, **{**PRE, "max_ram": "50GB"})
-    assert pending.plan.ram_budget == HARDWARE.ram_available
+    pending = preload(meta_model, path, **{**PRE, "max_ram": "50GB"})
+    assert pending.plan.ram_budget == parse_bytes("50GB")
+    assert not [w for w in recwarn if "available" in str(w.message)]         # it is not cut down, and there is no warning
     pending.cancel()
 
 
@@ -226,3 +226,96 @@ def test_stream_load_can_be_told_to_read_into_memory_for_one_call(tiny_checkpoin
     monkeypatch.setenv("TRASH_PANDA_RAM_IN_MEMORY", "1")
     stream_load(meta_model(), path, plan=plan, device="cpu", ram_in_memory=False)
     assert reads.threads == []                                      # the argument wins over the environment
+
+
+# -- reading only the part of the RAM tier that fits in the RAM free now
+# One block of the tiny model is 4224 bytes in float32. resident_blocks=1 leaves blocks 1, 2 and 3 in the RAM tier.
+
+BLOCK = 4224
+BLOCK_TENSORS = 4                                    # norm weight and bias, lin1 and lin2
+SMALL = dict(PRE, resident_blocks=1)
+
+
+def _free(nbytes):
+    return Hardware(vram_total=0, vram_free=0, ram_total=16 * 10 ** 9, ram_available=nbytes)
+
+
+def test_the_blocks_that_fit_in_the_free_ram_are_read_now_and_the_rest_stay_mapped(tiny_checkpoint, reads, monkeypatch):
+    ref, path = tiny_checkpoint
+    monkeypatch.delenv("TRASH_PANDA_RAM_IN_MEMORY", raising=False)
+    x = torch.randn(3, 16)
+    pending = preload(meta_model, path, **{**SMALL, "hardware": _free(2 * BLOCK + 100)})
+    assert pending.plan.prefixes("ram") == ("blocks.1.", "blocks.2.", "blocks.3.")        # planned for the whole budget
+    assert pending._memory == ("blocks.1.", "blocks.2.")
+    assert pending._done.wait(10)
+    assert len(reads.threads) == 2 * BLOCK_TENSORS                                         # only those two were read
+    with pending as (model, _p, _handle):
+        assert torch.allclose(model(x), ref(x), atol=1e-6)
+
+
+def test_everything_is_read_now_when_the_whole_ram_tier_fits(tiny_checkpoint, reads):
+    _, path = tiny_checkpoint
+    pending = preload(meta_model, path, **SMALL)
+    assert pending._memory == ("blocks.1.", "blocks.2.", "blocks.3.")
+    assert pending._done.wait(10)
+    assert len(reads.threads) == 3 * BLOCK_TENSORS
+    pending.cancel()
+
+
+def test_the_blocks_read_now_are_the_ones_that_run_first(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    pending = preload(meta_model, path, order=["blocks.3", "blocks.2", "blocks.1"],
+                      **{**SMALL, "hardware": _free(2 * BLOCK + 100)})
+    assert pending._memory == ("blocks.3.", "blocks.2.")
+    pending.cancel()
+
+
+def test_the_blocks_read_now_stop_at_the_first_one_that_does_not_fit(tiny_checkpoint, reads):
+    _, path = tiny_checkpoint
+    pending = preload(meta_model, path, **{**SMALL, "hardware": _free(BLOCK - 1)})
+    assert pending._memory == ()
+    assert pending._done.wait(10)
+    assert reads.threads == []                                      # all three stay mapped
+    pending.cancel()
+
+
+def test_min_free_ram_is_not_counted_as_free(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    pending = preload(meta_model, path, **{**SMALL, "hardware": _free(9000), "min_free_ram": 5000})
+    assert pending._memory == ()                                    # 9000 - 5000 is less than one block
+    pending.cancel()
+    pending = preload(meta_model, path, **{**SMALL, "hardware": _free(9000), "min_free_ram": 400})
+    assert pending._memory == ("blocks.1.", "blocks.2.")
+    pending.cancel()
+
+
+def test_everything_is_read_now_when_the_free_ram_is_not_known(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    pending = preload(meta_model, path, **{**SMALL, "hardware": _free(0)})
+    assert pending._memory == ("blocks.1.", "blocks.2.", "blocks.3.")
+    pending.cancel()
+
+
+def test_stream_load_reads_only_the_named_blocks_into_memory(tiny_checkpoint, monkeypatch, reads):
+    ref, path = tiny_checkpoint
+    monkeypatch.delenv("TRASH_PANDA_RAM_IN_MEMORY", raising=False)
+    plan = Plan.manual(compute_dtype="fp32", streamed=["blocks.2.", "blocks.3."], resident=["blocks.0.", "blocks.1."])
+    model = meta_model()
+    stream_load(model, path, plan=plan, device="cpu", ram_in_memory_prefixes=("blocks.2.",))
+    assert len(reads.threads) == BLOCK_TENSORS                      # block 3 is mapped, nothing is read for it
+    for name in ("blocks.2.lin1.weight", "blocks.3.lin1.weight"):
+        assert torch.equal(model.get_parameter(name), ref.get_parameter(name))
+    reads.threads.clear()
+    stream_load(meta_model(), path, plan=plan, device="cpu", ram_in_memory=True, ram_in_memory_prefixes=())
+    assert reads.threads == []                                      # the prefixes win over the flag
+
+
+def test_ram_overhead_is_the_reserve_and_the_pinned_buffers(tiny_checkpoint):
+    from trash_panda.offload import config
+    from trash_panda.offload.planner import _pinned_size, ram_overhead
+    plan = Plan.manual(compute_dtype="fp32", streamed=["blocks.1."], resident=["blocks.0."])
+    plan.blocks[1].stored_bytes = 1000
+    gpu = Hardware(vram_total=10 ** 9, vram_free=10 ** 9, ram_total=16 * 10 ** 9, ram_available=10 ** 10)
+    pinned = config.current().pinned_buffers * _pinned_size(1000)
+    assert ram_overhead(plan, gpu, 500) == 500 + pinned
+    assert ram_overhead(plan, HARDWARE, 500) == 500                 # no GPU, no pinned buffers

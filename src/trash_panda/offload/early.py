@@ -68,24 +68,34 @@ class _StagedCopy:
         return out
 
 
+def _vram_available(device):
+    """(VRAM that a new allocation can use, total VRAM) of a CUDA device: what the driver says is free plus what this
+    process holds in its allocator without using it."""
+    free, total = torch.cuda.mem_get_info(device)
+    cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return free + cached, total
+
+
 class _EarlyLoader:
     """Loads a pending model's GPU blocks, one at a time, as the running model frees the same number of bytes.
 
     `releases` is the queue of the running model's final pass (`handle.subscribe()`). A block is loaded when the GPU
     blocks it has announced add up to more than what was loaded here so far plus the block's size, and when the GPU has
     room for it: the memory the driver reports free plus what PyTorch holds cached and unused must cover the block and
-    leave a margin. Without that check, a GPU filled to the brim sent PyTorch into its out-of-memory recovery (freeing
+    leave a margin (at least `keep`, the headroom and streaming room that the plan counted on). Without that check, a GPU filled to the brim sent PyTorch into its out-of-memory recovery (freeing
     and allocating cached memory again) and held the running model up for seconds in a test. `run()` returns when
     every block is loaded, when `stop()` is called, or after an error (which is kept in `error`; the blocks that are
     not loaded are loaded later, when the model is asked for)."""
 
-    def __init__(self, deferred, checkpoint, order: Iterable[str], sizes: Dict[str, int], releases, device) -> None:
+    def __init__(self, deferred, checkpoint, order: Iterable[str], sizes: Dict[str, int], releases, device,
+                 keep: int = 0) -> None:
         self.deferred   = deferred
         self.checkpoint = checkpoint
         self.order      = list(order)
         self.sizes      = sizes
         self.releases   = releases
         self.device     = torch.device(device)
+        self.keep       = keep                                   # bytes of VRAM that stay free for the model's own use
         self.copier     = _StagedCopy()
         self.loaded     = 0                                      # blocks this loader put on the device
         self.error: Optional[BaseException] = None
@@ -99,9 +109,8 @@ class _EarlyLoader:
         """True if `need` bytes can be allocated on the GPU and the margin stays free. Always true without CUDA."""
         if self.device.type != "cuda":
             return True
-        free, total = torch.cuda.mem_get_info(self.device)
-        cached = torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
-        return free + cached - need >= max(int(_MARGIN_FRACTION * total), _MARGIN_MIN)
+        available, total = _vram_available(self.device)
+        return available - need >= max(int(_MARGIN_FRACTION * total), _MARGIN_MIN, self.keep)
 
     def run(self) -> None:
         freed = used = 0

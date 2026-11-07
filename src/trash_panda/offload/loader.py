@@ -68,6 +68,18 @@ class DeferredLoad:
                 self._store(key, target, "gpu_raw", has_scale, scale_key, copy=copy)
             self.loaded.add(prefix)
 
+    def demote(self, prefix: str) -> bool:
+        """Give the block to the RAM tier instead of the GPU: its tensors are put in RAM, mapped from the file like the
+        rest of the RAM tier, and the block is taken off this list. Returns False, and does nothing, if the block is on
+        the compute device already."""
+        with self._lock:
+            if prefix in self.loaded:
+                return False
+            for key, target, has_scale, scale_key in self.items.get(prefix, ()):
+                self._store(key, target, "ram", has_scale, scale_key)
+            self.items.pop(prefix, None)
+            return True
+
 
 @dataclass
 class OffloadState:
@@ -126,6 +138,7 @@ def stream_load(
     skip_prefixes: Sequence[str] = (),
     defer_prefixes: Sequence[str] = (),
     ram_in_memory: Optional[bool] = None,
+    ram_in_memory_prefixes: Optional[Sequence[str]] = None,
     compute_dtype: Union[str, torch.dtype] = "bf16",
     storage_dtype: Union[None, str, torch.dtype] = "auto",
     device: Optional[str] = None,
@@ -143,6 +156,8 @@ def stream_load(
                          does that on a worker thread, and the block waits for it)
       ram_in_memory      read the RAM tier into memory of its own, not mapped from the file (default: the
                          TRASH_PANDA_RAM_IN_MEMORY setting). A mapped RAM tier is not read at all here, only on first use
+      ram_in_memory_prefixes  only the RAM-tier blocks with these prefixes are read into memory; the others stay
+                         mapped from the file. When it is given, `ram_in_memory` is not used
     Anything else is expanded to `compute_dtype` on `device` right away.
 
     key_map  optional dict or function mapping checkpoint key -> model name.
@@ -182,6 +197,7 @@ def stream_load(
     deferred_items: Dict[str, list] = {}
     cfg = config.current()
     in_memory = cfg.ram_in_memory if ram_in_memory is None else bool(ram_in_memory)
+    memory_prefixes = None if ram_in_memory_prefixes is None else tuple(ram_in_memory_prefixes)
     spent = defaultdict(float)                               # seconds per tier, for the profile
     ram_jobs: list = []                                      # streamed tensors to read into memory of their own, after the rest
     ram_read = {"seconds": 0.0, "bytes": 0}                  # what that took, for the profile
@@ -258,7 +274,7 @@ def stream_load(
                 loaded.add(target)
                 continue
 
-            if tier == "ram" and in_memory:
+            if tier == "ram" and (in_memory if memory_prefixes is None else target.startswith(memory_prefixes)):
                 ram_jobs.append((key, target, has_scale, scale_key))
             else:
                 began = time.perf_counter()

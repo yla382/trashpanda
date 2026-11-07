@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable, List, Optional, Sequence, Tuple, Union, Dict
+from typing import Iterable, List, Optional, Sequence, Set, Tuple, Union, Dict
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,7 @@ class Plan:
     lookahead: int = field(default_factory=lambda: config.current().lookahead)   # how many blocks ahead they are staged
     vram_budget: int = 0
     ram_budget: int = 0
+    headroom_bytes: int = 0              # VRAM kept free for activations when the plan was made (taken off the VRAM budget)
     warnings: List[str] = field(default_factory=list)
     source: str = "auto"                 # "auto" or "manual"
 
@@ -202,6 +203,79 @@ def _pinned_size(nbytes: int) -> int:
     """The size PyTorch gives a pinned buffer: it rounds every pinned allocation up to the next power of two
     (measured on PyTorch 2.5.1: two buffers of 0.7 GB took 2.15 GB, and one of 1.1 GB too the same)."""
     return 1 << (nbytes - 1).bit_length() if nbytes > 0 else 0
+
+
+def ram_overhead(p: Plan, hw: Hardware, min_free_ram: Union[None, int, str] = None) -> int:
+    """The RAM that plan() keeps back from the RAM tier of `p`: `min_free_ram` for the system and the pinned staging
+    buffers of the blocks that are not on the GPU. What is free in RAM, minus this, is what the RAM tier can take."""
+    cfg = config.current()
+    min_free_ram = cfg.min_free_ram if min_free_ram is None else min_free_ram
+    if isinstance(min_free_ram, str) and min_free_ram.strip().lower() == "auto":
+        reserve = _auto_ram_reserve(hw, cfg)
+    else:
+        reserve = parse_bytes(min_free_ram) or 0
+    streamed = max((b.stored_bytes for b in p.blocks if b.tier != Tier.GPU), default=0)
+    pinned = cfg.pinned_buffers * _pinned_size(streamed) if hw.vram_total else 0
+    return reserve + pinned
+
+
+def _stream_reserves(p: Plan) -> Tuple[int, int]:
+    """(small, full): the VRAM a plan keeps for streaming blocks when everything is on the GPU (the buffer, only if the
+    blocks are expanded when they run) and when some blocks are outside it (the buffer and the staged blocks)."""
+    max_stored = max((b.stored_bytes for b in p.blocks), default=0)
+    needs_expand = any(b.stored_bytes != b.expanded_bytes for b in p.blocks)
+    return (p.stream_buffer_bytes if needs_expand else 0,
+            p.stream_buffer_bytes + max(int(p.lookahead), 0) * max_stored)
+
+
+def vram_kept_back(p: Plan) -> int:
+    """The VRAM that plan `p` keeps free: the headroom for activations and the room for streaming its blocks."""
+    small, full = _stream_reserves(p)
+    return p.headroom_bytes + (full if any(b.tier != Tier.GPU for b in p.blocks) else small)
+
+
+def refit_gpu_blocks(
+    p: Plan,
+    ordered: Sequence[BlockPlan],
+    available: int,
+    headroom: int,
+    pending: Set[str],
+    promotable: Set[str],
+) -> Tuple[List[str], List[str]]:
+    """Fit the GPU part of plan `p` to the VRAM that is really free, as the model is about to run.
+
+    `available` is the VRAM free now, which the blocks already on the GPU have used up. `headroom` is the part of it kept
+    for activations. `ordered` is the blocks in the order they run. `pending` are the blocks planned for the GPU whose
+    weights are not there yet; `promotable` are RAM-tier blocks that are in memory and could be moved to the GPU.
+    A pending block that fits stays planned for the GPU; one that does not is demoted to the RAM tier ("put what you
+    can"). What is left after the pending blocks is given to the promotable ones, in run order, up to the first that does
+    not fit. Room is kept for the buffer and the staged blocks of the streamed blocks (none if everything ends on the
+    GPU). Returns (promoted, demoted) as lists of prefixes. The plan is not changed."""
+    small, full = _stream_reserves(p)
+    streamed_now = any(b.tier != Tier.GPU for b in p.blocks)
+
+    def walk(reserve: int) -> Tuple[List[str], List[str]]:
+        room = available - headroom - reserve
+        promoted: List[str] = []
+        demoted: List[str] = []
+        for b in ordered:
+            if b.prefix in pending:
+                if b.stored_bytes <= room:
+                    room -= b.stored_bytes
+                else:
+                    demoted.append(b.prefix)
+        for b in ordered:
+            if b.prefix in promotable:
+                if b.stored_bytes > room:
+                    break
+                room -= b.stored_bytes
+                promoted.append(b.prefix)
+        return promoted, demoted
+
+    if streamed_now:
+        return walk(full)
+    promoted, demoted = walk(small)
+    return (promoted, demoted) if not demoted else walk(full)
 
 
 def plan(
@@ -390,6 +464,7 @@ def plan(
         lookahead=lookahead,
         vram_budget=vram_budget,
         ram_budget=ram_budget,
+        headroom_bytes=headroom,
         warnings=warnings,
         source="auto",
     )
