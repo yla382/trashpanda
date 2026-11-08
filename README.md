@@ -296,6 +296,13 @@ GPU blocks only: the RAM tier is read as before, and a block larger than the mem
 reads from the drive, so it keeps pace with the running model only when the next model's file is in the file cache or
 the model computes for long enough.
 
+With `running=` (the plan of the running stage) the early loader also gets the staging that the running stage does not
+use. A stage plans room for `lookahead` staged blocks; with `TRASH_PANDA_ADAPTIVE_LOOKAHEAD=1` it lowers the
+look-ahead to 1 where the main thread does not wait for blocks, and the room of the blocks it no longer stages
+(`plan.spare_staging_bytes`) counts as memory that is free already: the next model's blocks may load that many bytes
+before the running model frees anything, as long as the GPU really has room for them. The figure is read each time, so a
+later decision of the tuner counts.
+
 It can only help where something computes for a long time while the drive is idle. On the test pipeline the text
 encoder computes for 0.2 s, so there is nothing to hide the reads behind. It has not been run on the test pipeline yet:
 it is tested on the CPU, and early loading, `running=`, the partial RAM read and the replan also on a GPU with stand-in
@@ -331,6 +338,8 @@ In bash, use `export TRASH_PANDA_PROFILE=1` and `unset TRASH_PANDA_PROFILE`.
 | `TRASH_PANDA_LOOKAHEAD` | `2` | Blocks ahead whose weights are copied while one computes. `0` turns prefetching off |
 | `TRASH_PANDA_PINNED_BUFFERS` | `2` | Page-locked host buffers that blocks are copied through |
 | `TRASH_PANDA_BLOCKS_IN_FLIGHT` | `2` | The GPU may run at most this many blocks behind the copies |
+| `TRASH_PANDA_ADAPTIVE_LOOKAHEAD` | `0` | After the first passes, try a deeper look-ahead (up to `TRASH_PANDA_LOOKAHEAD_MAX`) where the main thread waits, and a look-ahead of 1 where it does not, and keep the change only if the passes do not get slower (see "What we measured"). The staging that is no longer used is lent to the next model (see "Loading the next model while one runs"). Off by default |
+| `TRASH_PANDA_LOOKAHEAD_MAX` | `4` | The deepest look-ahead that the setting above tries. The pinned buffers grow to match, and a depth is only taken if the driver reports free VRAM for the extra staged blocks |
 | `TRASH_PANDA_RAM_IN_MEMORY` | `0` | Read the tensors of the blocks that wait in RAM into memory of their own while loading, instead of keeping them mapped from the checkpoint file |
 | `TRASH_PANDA_RAM_READ_THREADS` | `1` | Threads that do that reading. Only used with `TRASH_PANDA_RAM_IN_MEMORY` |
 | `TRASH_PANDA_MIN_FREE_RAM` | `auto` | RAM kept free for the system: `auto` (the three settings below) or a size such as `2GB` |
@@ -377,7 +386,16 @@ difference smaller than that is not a result.
   only about 3 s of compute can overlap with the load, and the text encoder computes for 0.2 s against an 11.7 s load.
   The loader thread also reads with plain seek-and-read, which ran at 0.25 to 0.28 GB/s against 0.41 GB/s for the
   memory-mapped reads that `stream_load()` does for the same blocks.
-* **`TRASH_PANDA_LOOKAHEAD`:** a depth of 4 was no better than 2 for disk blocks and uses more VRAM.
+* **`TRASH_PANDA_LOOKAHEAD`:** a depth of 4 was no better than 2 for disk blocks and uses more VRAM. With stand-in
+  models (12 blocks of 0.07 to 0.54 GB, the file in the file cache, single runs) a deeper look-ahead shortened a pass by
+  3% to 8%, only where the copies and the compute took about the same time (20 ms of compute per block), and only with
+  as many pinned buffers as the look-ahead (4 with 4, not 4 with 2). Where the copies set the pace (no compute) or the
+  compute did (100 ms per block) it made no difference beyond the noise of about 5% between runs.
+  `TRASH_PANDA_ADAPTIVE_LOOKAHEAD=1` tries the depth by itself. In a check on the GPU its output was identical to the
+  fixed look-ahead and it cost nothing where compute set the pace, but it found the gain in one of nine cases (disk
+  blocks, 20 ms: 5.3% faster) and missed it in the others, so it is off by default. Where the compute sets the pace
+  (100 ms per block) it lowers the look-ahead to 1, which was 0.4% to 2% slower in the grid and 0.8% in the check on the
+  GPU, and frees one block of staging for the next model.
 * **A read-ahead of the RAM tier** through ordinary file reads, ahead of the copy, made the first step slower (34.7 s
   against 21 to 22 s) and was removed: the pages it read did not serve the memory-mapped copy.
 * **Memory after a release.** On Windows, PyTorch's own CPU allocator keeps blocks after they are freed (3 GB of
@@ -567,8 +585,6 @@ the VAE was built stopped the decode of a 2048 x 1024 image from spilling into s
 logged). A final pass already announces each block it frees on a queue (`handle.subscribe()`, see "Running a stage").
 What is left is to let memory move between stages while they run. The steps below are small, each can be tested on
 its own, and they are listed in the order they depend on one another:
-* let the depth of the staging follow the profile: a look-ahead above 2 only where the main thread waits for blocks,
-  and the spare VRAM to the next model where it does not
 * one pinned pool for the whole pipeline, sized for the largest block of any stage and kept until the pipeline ends,
   instead of one pool per model
 * `release_gpu()` / `restore_gpu()` on the handle, which move the resident blocks off the GPU and back while keeping

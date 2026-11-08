@@ -80,7 +80,8 @@ class _EarlyLoader:
     """Loads a pending model's GPU blocks, one at a time, as the running model frees the same number of bytes.
 
     `releases` is the queue of the running model's final pass (`handle.subscribe()`). A block is loaded when the GPU
-    blocks it has announced add up to more than what was loaded here so far plus the block's size, and when the GPU has
+    blocks it has announced (plus the spare staging that `credit()` reports, which the running model does not use) add up
+    to more than what was loaded here so far plus the block's size, and when the GPU has
     room for it: the memory the driver reports free plus what PyTorch holds cached and unused must cover the block and
     leave a margin (at least `keep`, the headroom and streaming room that the plan counted on). Without that check, a GPU filled to the brim sent PyTorch into its out-of-memory recovery (freeing
     and allocating cached memory again) and held the running model up for seconds in a test. `run()` returns when
@@ -88,7 +89,7 @@ class _EarlyLoader:
     not loaded are loaded later, when the model is asked for)."""
 
     def __init__(self, deferred, checkpoint, order: Iterable[str], sizes: Dict[str, int], releases, device,
-                 keep: int = 0) -> None:
+                 keep: int = 0, credit=None) -> None:
         self.deferred   = deferred
         self.checkpoint = checkpoint
         self.order      = list(order)
@@ -96,6 +97,7 @@ class _EarlyLoader:
         self.releases   = releases
         self.device     = torch.device(device)
         self.keep       = keep                                   # bytes of VRAM that stay free for the model's own use
+        self.credit     = credit or (lambda: 0)                  # bytes the running model does not use (its spare staging), read each time
         self.copier     = _StagedCopy()
         self.loaded     = 0                                      # blocks this loader put on the device
         self.error: Optional[BaseException] = None
@@ -120,7 +122,7 @@ class _EarlyLoader:
                 stack.enter_context(self.checkpoint)             # memory-mapped reads, as in stream_load()
                 for prefix in self.order:
                     need = self.sizes.get(prefix, 0)
-                    while freed - used < need:
+                    while freed + self.credit() - used < need:
                         if self._stop.is_set():
                             return
                         try:

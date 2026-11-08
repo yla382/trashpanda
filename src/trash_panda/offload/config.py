@@ -27,6 +27,8 @@ class Defaults:
     lookahead: int = 2                          # blocks ahead whose weights are copied while one computes (0 = off)
     pinned_buffers: int = 2                     # page-locked host buffers that blocks are copied through
     blocks_in_flight: int = 2                   # the GPU may run at most this many blocks behind the copies
+    adaptive_lookahead: bool = False            # try a deeper look-ahead after the first passes, and keep it only if the passes get faster
+    lookahead_max: int = 4                      # ... up to this many blocks ahead (the pinned buffers grow to match)
 
     # VRAM
     headroom_vram: str = "1.5GB"                # VRAM kept free for activations when none was measured

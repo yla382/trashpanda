@@ -59,6 +59,7 @@ class Plan:
     vram_budget: int = 0
     ram_budget: int = 0
     headroom_bytes: int = 0              # VRAM kept free for activations when the plan was made (taken off the VRAM budget)
+    spare_staging_bytes: int = 0         # VRAM of the staging above that the look-ahead no longer uses (set by the prefetcher)
     warnings: List[str] = field(default_factory=list)
     source: str = "auto"                 # "auto" or "manual"
 

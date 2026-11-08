@@ -111,7 +111,7 @@ class PendingStage:
     cancel(). It can be entered only once."""
 
     def __init__(self, model, p, path, *, key, key_map, skip_prefixes, order, order_file_destination, overlap, after=None,
-                 memory=None, vram_assumed=None):
+                 memory=None, vram_assumed=None, running=None):
         self.model  = model
         self.plan   = p
         self.key    = key
@@ -120,6 +120,7 @@ class PendingStage:
         self._order, self._order_dest, self._overlap = order, order_file_destination, overlap
         self._used   = False
         self._after  = after
+        self._running = running                              # the plan of the running stage, if given
         self._memory = p.prefixes(Tier.RAM) if memory is None else tuple(memory)    # the RAM blocks read into memory now
         self._vram_assumed = vram_assumed                    # the VRAM the plan counted on; None: do not replan at entry
         self._early  = None
@@ -154,7 +155,8 @@ class PendingStage:
         blocks = _in_run_order(self.plan, state.checkpoint.path, self._order, self._order_dest)
         sizes = {b.prefix: b.stored_bytes for b in self.plan.blocks}
         return _EarlyLoader(state.deferred, state.checkpoint, [b.prefix for b in blocks if b.prefix in state.deferred.items],
-                            sizes, self._after, state.device, keep=vram_kept_back(self.plan))
+                            sizes, self._after, state.device, keep=vram_kept_back(self.plan),
+                            credit=(lambda: self._running.spare_staging_bytes) if self._running is not None else None)
 
     def _stop_early(self) -> None:
         if self._early is not None:
@@ -307,7 +309,7 @@ def preload(build, path, *, max_vram=None, max_ram=None, running=None, key=None,
     memory = _early_ram_prefixes(p, path, hw, order, order_file_destination, plan_kwargs.get("min_free_ram"))
     return PendingStage(model, p, path, key=k, key_map=key_map, skip_prefixes=skip_prefixes, order=order,
                         order_file_destination=order_file_destination, overlap=overlap, after=after, memory=memory,
-                        vram_assumed=vram)
+                        vram_assumed=vram, running=running)
 
 
 def _on_meta(value):

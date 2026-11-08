@@ -27,6 +27,7 @@ import torch.nn as nn
 from . import config
 from .blocks import module_nbytes
 from .checkpoint import Checkpoint
+from .depth import DepthTuner
 from .formats import SCALE_SUFFIX, expand
 from .hardware import _process_memory, _read_ram
 from .loader import OffloadState, _navigate
@@ -185,6 +186,12 @@ class _PinnedPool:
         """Remember which GPU copy still reads from buffer i"""
         self.events[i] = event
 
+    def grow(self, count: int) -> None:
+        """Make room for at least `count` buffers (they are pinned when first used). Never makes the pool smaller."""
+        while len(self.buffers) < count:
+            self.buffers.append(None)
+            self.events.append(None)
+
 
 _PASS_KEYS = ("ram_copy_s", "ram_copy_gb", "disk_read_s", "disk_read_gb")      # the worker's figures that are also kept per pass
 
@@ -196,6 +203,10 @@ class _Prefetcher:
     order_path = None
     dropper    = None
     background_drop = False
+    plan       = None           # the Plan the prefetcher serves, if known: it is told how much staging is not used
+    planned    = 0              # the look-ahead the plan counted on
+    largest    = 0              # bytes of the biggest block staged so far
+    tuner      = None           # DepthTuner, when the look-ahead follows the passes (adaptive_lookahead)
 
     def __init__(self, device: torch.device, lookahead: Optional[int] = None, profile: Optional[bool] = None):
         cfg = config.current()
@@ -228,7 +239,7 @@ class _Prefetcher:
         self.profile     = cfg.profile if profile is None else bool(profile)
         self.stats       = defaultdict(float)
         self.first       = None
-        self.where       = {}                        # id(entry) -> its position in the pass, in the order first seen
+        self.where       = {}                       # id(entry) -> its position in the pass, in the order first seen
         self.block_wait  = defaultdict(float)       # position -> seconds the main thread waited for that block
         self.block_late  = defaultdict(int)         # position -> times it was not ready when asked for
         self.pass_log    = []                       # per finished pass: (seconds it took, seconds spent waiting for staged blocks)
@@ -239,6 +250,12 @@ class _Prefetcher:
         self._pass_start = None
         self._pass_end   = None
         self._pass_wait0 = 0.0
+        self.waited      = 0.0                      # seconds the main thread has waited for staged blocks; always measured
+        self.pass_waits  = deque(maxlen=64)         # per finished pass: (seconds it took, seconds spend waiting for staged blocks)
+        self.began       = None                     # when the pass in progress started
+        self.waited0     = 0.0                      # self.waited at that moment
+        if cfg.adaptive_lookahead and self.stream is not None and self.lookahead > 0:
+            self.tuner = DepthTuner(self.lookahead, cfg.lookahead_max)
         self._reported   = False
         if self.profile:
             atexit.register(self.report)
@@ -310,12 +327,38 @@ class _Prefetcher:
             except RuntimeError:                         # the interpreter is shutting down
                 pass
 
+    def _retune(self, took: float, waited: float) -> None:
+        """Show the pass that just finished to the DepthTuner and use the look-ahead it answers with from the next pass on.
+        A deeper look-ahead stages more blocks on the GPU than the plan counted on, so it is only taken when the driver
+        reports free VRAM (outside PyTorch's cache, which the activations may need) for the extra blocks and a margin of 5%
+        of the GPU (at least 256 MB); otherwise the depth stays and the tuner stops. The pinned buffers grow to match."""
+        depth = self.tuner.update(took, waited)
+        if depth == self.lookahead:
+            return
+        if depth > self.lookahead:
+            free, total = torch.cuda.mem_get_info(self.device)
+            if free - (depth - self.lookahead) * self.largest < max(int(0.05 * total), 256 << 20):
+                self.tuner.depth = self.lookahead
+                self.tuner.stop()
+                return
+            self.pool.grow(depth)
+        self.lookahead = depth
+        if self.plan is not None:                     # the staging the plan reserved and the look-ahead no longer uses
+            self.plan.spare_staging_bytes = max(self.planned - self.lookahead, 0) * self.largest
+
     def learn(self, entry) -> None:
         if entry.name is not None:
             self.note(entry.name)
+        if self.first is None:
+            self.first = entry
+        if entry is self.first:
+            now = time.perf_counter()
+            if self.began is not None:
+                self.pass_waits.append((now - self.began, self.waited - self.waited0))
+                if self.tuner is not None:
+                    self._retune(*self.pass_waits[-1])
+            self.began, self.waited0 = now, self.waited
         if self.profile:
-            if self.first is None:
-                self.first = entry
             if entry is self.first:
                 self._end_pass()
                 self.stats["passes"] += 1               # the first block starts a new pass through the model
@@ -465,6 +508,7 @@ class _Prefetcher:
                 sources.append((name, 1, scale))
 
         total = sum(_aligned(t.numel() * t.element_size()) for _n, _k, t in sources if t.device.type == "cpu")
+        self.largest = max(self.largest, total)
         got = self.pool.acquire(total) if total else None
 
         staged = {}
@@ -498,6 +542,7 @@ class _Prefetcher:
         if self.profile:
             self.stats["disk_blocks"] += 1
         total = sum(_aligned(info.nbytes) for _name, _kind, info in specs)
+        self.largest = max(self.largest, total)
         got   = self.pool.acquire(total)
 
         staged = {}
@@ -532,15 +577,16 @@ class _Prefetcher:
         if staged is None:
             return None
         ready = staged.done()
-        started = time.perf_counter() if self.profile else 0.0
+        started = time.perf_counter()
         try:
             tensors, event = staged.result()  # wait until the worker has issued the copies
         except Exception:
             import traceback
             traceback.print_exc()             # never hide a failure in the worker
             return None                       # fall back to the plain copy in bring()
+        waited = time.perf_counter() - started
+        self.waited += waited
         if self.profile:
-            waited = time.perf_counter() - started
             self.stats["wait_staged_s"] += waited
             position = self.where.get(id(entry))
             if position is not None:
@@ -958,6 +1004,7 @@ def install_offload(
     pre    = _Prefetcher(torch.device(dev or ("cuda" if torch.cuda.is_available() else "cpu")), lookahead, profile)
     handle._add(pre.close) #registered first, so it runs last on remove()
     handle._prefetcher = pre
+    pre.plan, pre.planned = plan, pre.lookahead
     if order is None and state is not None:
         pre.order_path = order_path(state.checkpoint.path, order_file_destination)
         saved = read_order(pre.order_path, {b.prefix.rstrip(".") for b in plan.blocks})
