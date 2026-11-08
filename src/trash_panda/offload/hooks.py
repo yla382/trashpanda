@@ -57,12 +57,16 @@ class OffloadHandle:
     def __init__(self) -> None:
         self._undo: List[Callable[[], None]] = []
         self._prefetcher = None
+        self._resident: List[Tuple[Callable[[], int], Callable[[], int]]] = []
+        self._released = False
+        self._deferred = 0              # blocks whose hooks are not in yet: their weights are still loading, or they have not run
 
     def _add(self, fn: Callable[[], None]) -> None:
         self._undo.append(fn)
 
     def extend(self, other: "OffloadHandle") -> None:
         self._undo.extend(other._undo)
+        self._resident.extend(other._resident)
 
     def remove(self) -> None:
         while self._undo:
@@ -76,6 +80,32 @@ class OffloadHandle:
         """A queue that gets a `Release` for every block the final pass frees, in the order they are freed. Nothing is
         queued until this is called, and nothing is queued outside a final pass. The queue is not bounded: read it."""
         return self._prefetcher.subscribe()
+
+    def release_gpu(self) -> int:
+        """Move the weights of the blocks that stay on the GPU to CPU memory and keep the hooks. Returns the bytes
+        moved. Call it between passes, not while the model runs; restore_gpu() brings the weights back, and the model
+        has to be restored before it runs again. Does nothing (returns 0) when the weights are already released."""
+        if self._released:
+            return 0
+        if self._deferred:
+            raise RuntimeError(
+                f"release_gpu(): {self._deferred} blocks have not been installed yet, because their weights are still "
+                "loading or they have not run. Run the model once after the weights are loaded."
+            )
+        self._prefetcher.quiesce()
+        moved = sum(release() for release, _restore in self._resident)
+        self._released = True
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return moved
+
+    def restore_gpu(self) -> int:
+        """Put the weights that release_gpu() moved back on the GPU. Returns the bytes moved, 0 if they were not released."""
+        if not self._released:
+            return 0
+        moved = sum(restore() for _release, restore in self._resident)
+        self._released = False
+        return moved
 
 
 class DiskReader:
@@ -326,6 +356,22 @@ class _Prefetcher:
                 self.dropper.submit(lambda: None).result()
             except RuntimeError:                         # the interpreter is shutting down
                 pass
+
+    def quiesce(self) -> None:
+        """Bring the prefetcher to rest between two passes: nothing staged, nothing copying and no block still running on
+        the GPU. Staged blocks are dropped, because they hold GPU memory. The pass in progress is not timed, since the
+        time until the next pass starts is not part of it."""
+        for entry in self.window:
+            self._drop(entry)
+        self.window = []
+        if self.worker is not None:
+            self.worker.submit(lambda: None).result()
+        if self.stream is not None:
+            self.stream.synchronize()
+        while self.in_flight:
+            self.in_flight.popleft().synchronize()
+        self.began = None
+        
 
     def _retune(self, took: float, waited: float) -> None:
         """Show the pass that just finished to the DepthTuner and use the look-ahead it answers with from the next pass on.
@@ -748,6 +794,15 @@ def _loaded_nbytes(module: nn.Module) -> int:
     """Bytes of the module's parameters and buffers that are not on the meta device, so 0 for a block already freed."""
     return sum(t.numel() * t.element_size() for t in [*module.parameters(), *module.buffers()] if not t.is_meta)
 
+def _move_entry(entry: _Entry, device) -> int:
+    """Move a wrapped block's stored weights and scales to `device`, in place. The tensors stay the same objects, so
+    the module and the entry still hold them. Returns the bytes of the block's stored weights and scales."""
+    for *_, orig in entry.slots:
+        orig.data = orig.data.to(device)
+    for scale in entry.scales.values():
+        scale.data = scale.data.to(device)
+    return entry.stored_nbytes()
+
 
 def _to_meta(module: nn.Module) -> None:
     for m in module.modules():
@@ -820,6 +875,17 @@ def offload_blocks(
             if label is not None:                        # not wrapped, so only note when it starts
                 note = block.register_forward_pre_hook(lambda _module, _args, n=label: prefetcher.note(n))
                 handle._add(note.remove)
+            if dev.type == "cuda":
+                def move_out(block=block):
+                    held = _loaded_nbytes(block)
+                    block.to("cpu")
+                    return held
+
+                def move_back(block=block):
+                    block.to(dev)
+                    return _loaded_nbytes(block)
+
+                handle._resident.append((move_out, move_back))
             continue
 
         entry  = _Entry(slots, scales, reader)
@@ -888,6 +954,14 @@ def offload_blocks(
 
         block.forward = wrapped
         handle._add(undo)
+        if entry.tier() == "gpu":
+            def move_out(entry=entry):
+                return _move_entry(entry, "cpu")
+
+            def move_back(entry=entry):
+                return _move_entry(entry, dev)
+
+            handle._resident.append((move_out, move_back))
 
     return handle
 
@@ -896,11 +970,14 @@ def _defer_block(block: nn.Module, name: str, pre: "_Prefetcher", handle: Offloa
     """Until the block's weights are loaded, calling the block waits for them; then the real hooks go in.
     `install()` puts them in and returns their handle."""
     state = {"inner": None}
+    handle._deferred += 1
 
     def gate(*args, **kwargs):
         pre.wait_ready(name)
         block.__dict__.pop("forward", None)               # so that install() sees the block's own forward
         state["inner"] = install()
+        handle._resident.extend(state["inner"]._resident)   # release_gpu() of the outer handle moves this block too
+        handle._deferred -= 1
         pre.note(name)
         if "forward" in block.__dict__:                   # wrapped: its own forward does the rest
             return block.forward(*args, **kwargs)

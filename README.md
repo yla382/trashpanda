@@ -221,6 +221,27 @@ about a second after the last call returns, and a queue read right after that ca
 Blocks that a model never runs, such as the encoder half of a VAE that only decodes, are named by the profile (see
 "Reading the profile"). `skip_prefixes` leaves them out.
 
+A model can also give up its GPU memory between two calls and take it back, with the hooks staying in.
+`handle.release_gpu()` moves the weights of the blocks that stay on the GPU (the resident blocks) to ordinary CPU memory
+and returns the bytes it moved; `handle.restore_gpu()` puts them back and returns the bytes. Call them between two calls
+of the model, not during one. Calling either one twice in a row does nothing the second time.
+
+```python
+with stage(build_diffusion, "diffusion.safetensors") as (model, p, handle):
+    for prompt in prompts:
+        latents = sample(model, prompt)
+        handle.release_gpu()          # the VRAM is free while something else runs
+        image = decode(latents)
+        handle.restore_gpu()          # before the model runs again
+```
+
+While the weights are released they take as much RAM as their stored size, in ordinary (not pinned) memory. A resident
+block that is stored in a compact format (fp8 with scales) still runs while it is released, from its CPU copy, as a
+RAM-tier block does, but slower; a resident block that is stored in the compute dtype does not, so restore before the
+model runs. The weights outside the blocks stay on the GPU. With `overlap=True` the hooks of a block go in when the block
+first runs, and `release_gpu()` raises a `RuntimeError` until every block has run once. On the test machine the
+weights moved at 3 to 5 GB/s (see "What we measured").
+
 ### Loading the next model while one runs
 
 `preload()` starts loading the next model of a pipeline while the current one is still running, so the drive works
@@ -402,6 +423,15 @@ difference smaller than that is not a result.
   tensors freed, working set unchanged), so memory read into `torch.empty` tensors still counted as taken when the next
   model was planned (a RAM budget of 2.0 to 2.6 GB, against about 9 GB). `TRASH_PANDA_RAM_IN_MEMORY` allocates through
   Python's allocator instead, which gives the memory back at once, and after the fix the next plan saw 8.2 to 9.3 GB.
+* **Taking the resident blocks off the GPU and back** (`release_gpu()` / `restore_gpu()`) cost about 0.25 s per GB to
+  release and 0.3 s per GB to restore, for blocks in the compute dtype and for fp8 blocks with scales alike. Stand-in
+  blocks of two 4096 x 4096 linear layers, built on the GPU, median of 5 cycles: 1 GB took 0.22 s and 0.27 s, 2 GB took
+  0.45 s and 0.58 s, 4 GB took 1.04 s and 1.27 s (fp8: 1.32 s), which is 3.9 to 4.6 GB/s out and 3.0 to 3.7 GB/s back.
+  The VRAM they held was free afterwards, and the first pass after the restore took as long as any other (within the
+  noise). A plain tensor moves to the GPU at 5.1 GB/s from ordinary memory and 12.9 GB/s from pinned memory, so pinned
+  copies could make the restore up to 2.5 times faster, at the price of pinned RAM as large as the weights. Nothing
+  above 4 GB was run, because the free RAM was between 2.6 and 9.7 GB during the measurement; with 2.6 GB free the copy
+  to the CPU fell to 1.2 GB/s.
 
 ### Current recommendation
 
@@ -587,8 +617,6 @@ What is left is to let memory move between stages while they run. The steps belo
 its own, and they are listed in the order they depend on one another:
 * one pinned pool for the whole pipeline, sized for the largest block of any stage and kept until the pipeline ends,
   instead of one pool per model
-* `release_gpu()` / `restore_gpu()` on the handle, which move the resident blocks off the GPU and back while keeping
-  the hooks. The cost of putting them back for each image, and the RAM they need meanwhile, have not been measured
 * something that holds these together: it runs the stages of a pipeline in order and owns the memory budgets that move
   between them. Its interface is not decided; it is better settled after the steps above have measurements
 
