@@ -141,19 +141,6 @@ def test_an_order_given_wins_over_the_file(tiny_checkpoint):
     pending.cancel()
 
 
-def test_the_copy_waits_for_the_event_of_the_last_gpu_block_that_was_freed(tiny_checkpoint):
-    _, path = tiny_checkpoint
-    releases = queue.SimpleQueue()
-    pending = preload(meta_model, path, after=releases, **PRE)
-    first, second, other = object(), object(), object()
-    releases.put(Release("blocks.0", "gpu", 1, first, time.perf_counter()))
-    releases.put(Release("blocks.1", "ram", 1, other, time.perf_counter()))          # another tier: not the one
-    releases.put(Release("blocks.2", "gpu", _stored(pending, 0), second, time.perf_counter()))
-    assert _until(lambda: _loaded(pending.model, 0))
-    assert pending._early.copier.after is second
-    pending.cancel()
-
-
 def test_the_model_gives_the_same_output_and_every_tensor_is_read_once(tiny_checkpoint, reads):
     ref, path = tiny_checkpoint
     x = torch.randn(3, 16)

@@ -206,9 +206,20 @@ def _pinned_size(nbytes: int) -> int:
     return 1 << (nbytes - 1).bit_length() if nbytes > 0 else 0
 
 
-def ram_overhead(p: Plan, hw: Hardware, min_free_ram: Union[None, int, str] = None) -> int:
+def _pinned_growth(count: int, nbytes: int, held: Sequence[int] = ()) -> int:
+    """The pinned memory a pool of `count` buffers has to add to hold blocks of `nbytes`, when its buffers already have
+    the sizes in `held` (0 for a buffer that is not allocated yet; only the first `count` buffers are used). A buffer
+    that is big enough costs nothing more, and a smaller one is replaced by a bigger one, which costs the difference."""
+    size = _pinned_size(nbytes)
+    have = list(held)[:count] + [0] * max(count - len(held), 0)
+    return sum(max(size - h, 0) for h in have)
+
+
+def ram_overhead(p: Plan, hw: Hardware, min_free_ram: Union[None, int, str] = None, pinned_held: Sequence[int] = ()) -> int:
     """The RAM that plan() keeps back from the RAM tier of `p`: `min_free_ram` for the system and the pinned staging
-    buffers of the blocks that are not on the GPU. What is free in RAM, minus this, is what the RAM tier can take."""
+    buffers of the blocks that are not on the GPU, less what a pool shared with earlier models holds already (the sizes
+    of its buffers are `pinned_held`; that memory is not in the free RAM any more). What is free in RAM, minus this, is
+    what the RAM tier can take."""
     cfg = config.current()
     min_free_ram = cfg.min_free_ram if min_free_ram is None else min_free_ram
     if isinstance(min_free_ram, str) and min_free_ram.strip().lower() == "auto":
@@ -216,7 +227,7 @@ def ram_overhead(p: Plan, hw: Hardware, min_free_ram: Union[None, int, str] = No
     else:
         reserve = parse_bytes(min_free_ram) or 0
     streamed = max((b.stored_bytes for b in p.blocks if b.tier != Tier.GPU), default=0)
-    pinned = cfg.pinned_buffers * _pinned_size(streamed) if hw.vram_total else 0
+    pinned = _pinned_growth(cfg.pinned_buffers, streamed, pinned_held) if hw.vram_total else 0
     return reserve + pinned
 
 
@@ -297,7 +308,8 @@ def plan(
     hardware: Optional[Hardware] = None,
     groups: Optional[List[BlockGroup]] = None,
     key_map=None,
-    skip_prefixes: Sequence[str] = ()
+    skip_prefixes: Sequence[str] = (),
+    pinned_held: Sequence[int] = (),
 ) -> Plan:
     """Decide where each block lives. Every argument that is set explicitly overrides the automatic choice.
     Arguments left as None take their default from config (see config.py, which also lists the TRASH_PANDA_<NAME>
@@ -314,6 +326,8 @@ def plan(
     spread_disk      put the disk blocks evenly among the others instead of at the end, so reads can overlap with compute
     key_map          checkpoint key -> model name, a dict or a function (same as stream_load)
     skip_prefixes    model entries with these prefixes are left out: not sized, not counted (same as stream_load)
+    pinned_held      the sizes of the buffers of a pinned pool shared with earlier models: that memory is in use, so it is
+                     not in the free RAM, and only what the pool still has to grow by is kept back (a Coordinator sets this)
     """
     cfg = config.current()
     headroom_vram = cfg.headroom_vram if headroom_vram is None else headroom_vram
@@ -399,15 +413,19 @@ def plan(
     resident_bytes = sum(b.stored_bytes for b in blocks[:n_res])
     reserved = (buffer + staging) if n_res < n else (buffer if needs_expand else 0)
     planned = other + resident_bytes + reserved
+    # What the fill share is measured against: the VRAM the plan was made for. That is the cap when one was given
+    # (preload() plans for the memory a running model will give back, which is not what is free now), else the free VRAM.
+    fill_base = vram_cap if vram_cap is not None else hw.vram_free
     if planned > vram_budget:
         warnings.append(
             f"The GPU part of the plan needs {fmt_bytes(planned)} but the VRAM budget is "
             f"{fmt_bytes(vram_budget)}; expect out-of-memory errors or slow spilling into shared memory."
         )
-    elif hw.vram_free and planned > cfg.vram_fill_warn_fraction * hw.vram_free:
+    elif fill_base and planned > cfg.vram_fill_warn_fraction * fill_base:
+        what = "the VRAM it may use" if vram_cap is not None else "the free VRAM"
         warnings.append(
-            f"The GPU part of the plan fills {100 * planned / hw.vram_free:.0f}% of the free VRAM "
-            f"({fmt_bytes(planned)} of {fmt_bytes(hw.vram_free)}), which leaves little room for activations. If the GPU "
+            f"The GPU part of the plan fills {100 * planned / fill_base:.0f}% of {what} "
+            f"({fmt_bytes(planned)} of {fmt_bytes(fill_base)}), which leaves little room for activations. If the GPU "
             "runs out of memory, Windows silently moves the overflow to shared memory and every step becomes much slower. "
             "Lower resident_blocks, raise headroom_vram, or pass a measured activation_vram."
         )
@@ -420,7 +438,8 @@ def plan(
         ram_reserve = parse_bytes(min_free_ram) or 0
    
     # the prefetcher's pinned staging buffers: page-locked RAM that cannot be paged out, only when there is a GPU
-    pinned     = cfg.pinned_buffers * _pinned_size(max((b.stored_bytes for b in blocks[n_res:]), default=0)) if hw.vram_total else 0
+    largest    = max((b.stored_bytes for b in blocks[n_res:]), default=0)
+    pinned     = _pinned_growth(cfg.pinned_buffers, largest, pinned_held) if hw.vram_total else 0
     ram_budget = (ram_cap if ram_cap is not None else hw.ram_available) - ram_reserve - pinned
     ram_budget = max(ram_budget, 0)
     

@@ -51,14 +51,15 @@ def _in_run_order(p, path, order, order_file_destination):
     return p.blocks if order is None else _in_order(p.blocks, order)
 
 
-def _early_ram_prefixes(p, path, hw, order, order_file_destination, min_free_ram=None):
+def _early_ram_prefixes(p, path, hw, order, order_file_destination, min_free_ram=None, pinned_held=()):
     """The RAM-tier blocks that fit in the RAM that is free now, in the order they run: blocks are taken from the first
-    one that runs until the next one does not fit. The RAM that plan() keeps back (`min_free_ram`, the pinned buffers)
-    is not counted as free. When the free RAM is unknown, all the RAM-tier blocks are taken."""
+    one that runs until the next one does not fit. The RAM that plan() keeps back (`min_free_ram`, the pinned buffers
+    less those a shared pool holds already) is not counted as free. When the free RAM is unknown, all the RAM-tier
+    blocks are taken."""
     streamed = [b for b in _in_run_order(p, path, order, order_file_destination) if b.tier == Tier.RAM]
     if not hw.ram_available:
         return tuple(b.prefix for b in streamed)
-    left = max(hw.ram_available - ram_overhead(p, hw, min_free_ram), 0)
+    left = max(hw.ram_available - ram_overhead(p, hw, min_free_ram, pinned_held), 0)
     chosen = []
     for b in streamed:
         if b.stored_bytes > left:
@@ -70,7 +71,7 @@ def _early_ram_prefixes(p, path, hw, order, order_file_destination, min_free_ram
 
 @contextmanager
 def stage(build, path, *, key=None, key_map=None, skip_prefixes=(), order=None, order_file_destination=None, overlap=False,
-          **plan_kwargs):
+          pool=None, **plan_kwargs):
     """Load one model for the `with` block and give its memory back afterwards.
     `build` returns the model on the meta device. `path` is its checkpoint. `plan_kwargs` go to plan().
     The peak GPU memory of the block is remembered under `key` (default: the checkpoint path) and used as 
@@ -81,15 +82,19 @@ def stage(build, path, *, key=None, key_map=None, skip_prefixes=(), order=None, 
     With `overlap=True` the resident blocks are loaded on a worker thread while the model already runs: a block
     that starts before its weights are on the GPU waits for them. The peak memory is not remembered then, because
     the loading falls inside the measured part of the run.
+    `pool` is a pinned pool that outlives the block, which a Coordinator shares among its stages: the plan counts the
+    pinned memory the pool holds already, and the pool is not dropped when the block ends.
     The block gets `(model, plan, handle)`; `handle.final_pass()` frees each block as it runs during the last call.
     The model cannot be used after the block."""
     k = key or str(path)
     model = build()
     plan_kwargs.setdefault("activation_vram", _activations.get(k))
+    if pool is not None:
+        plan_kwargs.setdefault("pinned_held", pool.sizes())
     p = plan(model, path, key_map=key_map, skip_prefixes=skip_prefixes, **plan_kwargs)
     stream_load(model, path, plan=p, key_map=key_map, skip_prefixes=skip_prefixes,
                 defer_prefixes=p.prefixes(Tier.GPU) if overlap else ())
-    handle = install_offload(model, order=order, order_file_destination=order_file_destination)
+    handle = install_offload(model, order=order, order_file_destination=order_file_destination, pool=pool)
     state = getattr(model, "_trash_panda_state", None)
     loading = state is not None and state.deferred is not None       # the weights are still arriving
     before = _start_peak() if torch.cuda.is_available() and not loading else None
@@ -111,8 +116,9 @@ class PendingStage:
     cancel(). It can be entered only once."""
 
     def __init__(self, model, p, path, *, key, key_map, skip_prefixes, order, order_file_destination, overlap, after=None,
-                 memory=None, vram_assumed=None, running=None):
+                 memory=None, vram_assumed=None, running=None, pool=None):
         self.model  = model
+        self._pool  = pool                                   # the pinned pool the model's prefetcher will use, if shared
         self.plan   = p
         self.key    = key
         self.handle = None
@@ -154,9 +160,13 @@ class PendingStage:
         state = self.model._trash_panda_state
         blocks = _in_run_order(self.plan, state.checkpoint.path, self._order, self._order_dest)
         sizes = {b.prefix: b.stored_bytes for b in self.plan.blocks}
+        # what the running stage keeps free for itself: its plan's headroom and streaming room, or the configured
+        # headroom when only a budget was given and its plan is not known
+        hold = vram_kept_back(self._running) if self._running is not None else (parse_bytes(config.current().headroom_vram) or 0)
         return _EarlyLoader(state.deferred, state.checkpoint, [b.prefix for b in blocks if b.prefix in state.deferred.items],
                             sizes, self._after, state.device, keep=vram_kept_back(self.plan),
-                            credit=(lambda: self._running.spare_staging_bytes) if self._running is not None else None)
+                            credit=(lambda: self._running.spare_staging_bytes) if self._running is not None else None,
+                            hold=hold)
 
     def _stop_early(self) -> None:
         if self._early is not None:
@@ -230,7 +240,8 @@ class PendingStage:
                 for prefix in state.deferred.prefixes():
                     state.deferred.load(prefix)
             state.deferred = None
-        self.handle = install_offload(self.model, order=self._order, order_file_destination=self._order_dest)
+        self.handle = install_offload(self.model, order=self._order, order_file_destination=self._order_dest,
+                                      pool=self._pool)
         loading = state.deferred is not None               # the weights are still arriving
         self._before = _start_peak() if torch.cuda.is_available() and not loading else None
         return self.model, self.plan, self.handle
@@ -255,12 +266,14 @@ class PendingStage:
 
 
 def preload(build, path, *, max_vram=None, max_ram=None, running=None, key=None, key_map=None, skip_prefixes=(),
-            order=None, order_file_destination=None, overlap=False, after=None, **plan_kwargs) -> PendingStage:
+            order=None, order_file_destination=None, overlap=False, after=None, pool=None, ram_preload=True,
+            **plan_kwargs) -> PendingStage:
     """Start loading the next model of a pipeline while the current one is still running.
 
-    The model is planned now and its RAM tier is read on a background thread, so the drive works while the running model
-    computes. Nothing is put on the GPU for its blocks until the `with` block of the returned object is entered, which
-    must happen after the running model has been released:
+    The model is planned now and its RAM tier is read on a background thread (unless `ram_preload` is False), so the
+    drive works while the running model computes. Nothing is put on the GPU for its blocks until the `with` block of the
+    returned object is entered, which must happen after the running model has been released, unless `after` is given
+    (below):
 
         with stage(build_a, path_a) as (a, p, handle):
             pending = preload(build_b, path_b, max_vram="8GB", max_ram="6GB")
@@ -286,11 +299,19 @@ def preload(build, path, *, max_vram=None, max_ram=None, running=None, key=None,
     blocks stay mapped from the file and are read when they first run, as in a model that was not preloaded. The weights
     outside the blocks are put on the GPU as soon as they are read, so they need room there while the running model
     holds its own. The reads share the drive with whatever else is reading from it.
+    `ram_preload=False` reads none of the RAM tier now: all of it stays mapped from the file and is read when the blocks
+    first run, as in a model that was not preloaded. That is the better choice when the running stage is too short to
+    hide the read (the read into memory is also slower per byte than the mapped one on a SATA drive), and there is
+    nothing to move up to the GPU at entry then.
     `after` is the queue that `handle.subscribe()` of the running stage gave. When it is given, the model's GPU blocks
-    are loaded, in the order they will run, as the running model's final pass frees the same number of bytes of GPU
-    memory, through two small pinned buffers on a copy stream of their own, so they do not wait for the running model to
-    be released. The queue is read by the loader: do not read it elsewhere. The blocks that were not loaded early are
-    loaded when the model is asked for, and a failure in the early loading only gives a warning.
+    are loaded early, in the order they will run, through two small pinned buffers on a copy stream of their own, so
+    they do not wait for the running model to be released: into VRAM that is free now, as far as the running stage keeps
+    its own headroom and streaming room (its plan from `running`, else the configured headroom), and into the memory
+    the running model's final pass frees, byte for byte. The queue is read by the loader: do not read it elsewhere. The
+    blocks that were not loaded early are loaded when the model is asked for, and a failure in the early loading only
+    gives a warning.
+    `pool` is the pinned pool that the model will use once it is entered, if the running stage's pool is kept (see
+    stage()); the plan and the choice of the blocks read now count the pinned memory it holds already.
     The other arguments are those of stage(); `plan_kwargs` go to plan()."""
     if max_vram is None and running is None:
         raise ValueError("preload() needs max_vram or running: the GPU is in use by the running model, so the free VRAM "
@@ -304,12 +325,15 @@ def preload(build, path, *, max_vram=None, max_ram=None, running=None, key=None,
               f"(free now: {fmt_bytes(hw.vram_free)} of VRAM, {fmt_bytes(hw.ram_available)} of RAM)")
     model = build()
     plan_kwargs.setdefault("activation_vram", _activations.get(k))
+    if pool is not None:
+        plan_kwargs.setdefault("pinned_held", pool.sizes())
     p = plan(model, path, key_map=key_map, skip_prefixes=skip_prefixes, max_vram=vram, max_ram=ram,
              hardware=hw, **plan_kwargs)
-    memory = _early_ram_prefixes(p, path, hw, order, order_file_destination, plan_kwargs.get("min_free_ram"))
+    memory = _early_ram_prefixes(p, path, hw, order, order_file_destination, plan_kwargs.get("min_free_ram"),
+                                 plan_kwargs.get("pinned_held", ())) if ram_preload else ()
     return PendingStage(model, p, path, key=k, key_map=key_map, skip_prefixes=skip_prefixes, order=order,
                         order_file_destination=order_file_destination, overlap=overlap, after=after, memory=memory,
-                        vram_assumed=vram, running=running)
+                        vram_assumed=vram, running=running, pool=pool)
 
 
 def _on_meta(value):

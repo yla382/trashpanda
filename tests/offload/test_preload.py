@@ -7,7 +7,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from .tiny_model import meta_model  # noqa: E402
-from trash_panda.offload import PendingStage, Plan, parse_bytes, preload, stage, stream_load  # noqa: E402
+from trash_panda.offload import PendingStage, Plan, Tier, parse_bytes, preload, stage, stream_load  # noqa: E402
 from trash_panda.offload.checkpoint import Checkpoint  # noqa: E402
 from trash_panda.offload.hardware import Hardware  # noqa: E402
 
@@ -67,6 +67,25 @@ def test_the_ram_tier_is_read_on_other_threads_before_the_model_is_asked_for(tin
     model = pending.model
     assert not model.blocks[2].lin1.weight.is_meta and not model.blocks[3].lin2.weight.is_meta     # the RAM tier is in
     assert model.blocks[0].lin1.weight.is_meta and model.blocks[1].lin2.weight.is_meta             # the GPU blocks are not
+    pending.cancel()
+
+
+def test_ram_preload_false_reads_nothing_into_memory(tiny_checkpoint, reads):
+    ref, path = tiny_checkpoint
+    x = torch.randn(3, 16)
+    pending = preload(meta_model, path, ram_preload=False, **PRE)
+    assert pending._done.wait(10)
+    assert reads.threads == [] and pending._memory == ()            # every RAM-tier tensor stays mapped from the file
+    assert pending.plan.prefixes(Tier.RAM)                          # ... and there is a RAM tier to map
+    with pending as (model, _p, _handle):
+        assert torch.allclose(model(x), ref(x), atol=1e-6)
+
+
+def test_ram_preload_true_is_the_default_and_reads_the_ram_tier(tiny_checkpoint, reads):
+    _, path = tiny_checkpoint
+    pending = preload(meta_model, path, **PRE)
+    assert pending._done.wait(10)
+    assert reads.threads and pending._memory == tuple(pending.plan.prefixes(Tier.RAM))
     pending.cancel()
 
 

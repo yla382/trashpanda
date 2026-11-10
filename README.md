@@ -157,7 +157,8 @@ The block gets the model, its plan and the handle that `install_offload()` retur
 `stream_load()`. Use them when the checkpoint's names differ from the model's, or when part of the model should not be
 loaded (for example the vision tower of a text encoder). The peak GPU memory of the block is remembered under `key` (by
 default the checkpoint path) and used as `activation_vram` the next time the same key is planned in the same process.
-The model cannot be used after the block, and adapters are not applied.
+The model cannot be used after the block, and adapters are not applied. `pool=` is a pinned pool that outlives the block
+(a `Coordinator` passes one, see "Running a pipeline"); the plan then counts the pinned memory the pool holds already.
 
 The prefetcher stages the next blocks ahead of the one that runs, so it has to know the order the blocks run in. It
 used to learn that during the first pass, which left the first pass without prefetching. Now the order is known
@@ -276,6 +277,11 @@ thread, as `stage()` does. The `with` block waits for the reads, and an error in
 that will not be used has to be given up with `cancel()`, which waits for the reads and frees what they loaded. It can
 be entered once. The other arguments are those of `stage()`.
 
+`ram_preload=False` reads none of the RAM tier early: all of it stays mapped from the file and is read when its blocks
+first run, as in a model that was not preloaded, and no RAM-tier block moves to the GPU at entry. On the test machine
+reading the RAM tier into memory ran slower per byte than the mapped read (0.33 GB/s against 0.38 to 0.42), and it only
+pays off if the running stage is long enough to hide the read (see "What we measured").
+
 The prediction can be wrong (another program took VRAM, the running model kept a tensor, the earlier measurement of the
 activations was low), so when the `with` block is entered the plan is fitted to the VRAM that is really free: what the
 driver reports plus what PyTorch holds cached and unused, less the headroom the plan kept for activations and the room
@@ -290,8 +296,8 @@ reading from it. With `TRASH_PANDA_PROFILE=1` it prints how long the background 
 for it, how many RAM blocks were read early and how many stay mapped, what it planned for when `running` was given, and
 what the replan at entry moved.
 
-With `after=`, the GPU blocks of the next model are loaded early too, into the VRAM that the running model's final pass
-frees:
+With `after=`, the GPU blocks of the next model are loaded early too, into VRAM that is free already and into the VRAM
+that the running model's final pass frees:
 
 ```python
 with stage(build_first, "first.safetensors") as (first, p, handle):
@@ -303,19 +309,26 @@ with pending as (second, p, _):
     output = run(second, result)
 ```
 
-`after` is the queue that `handle.subscribe()` returns. The loader reads it, so nothing else should. It loads a block
-of the next model, in the order the blocks will run, when the GPU blocks announced on the queue add up to more than what
-it has loaded so far plus the block, and when the GPU really has room for it: the memory the driver reports free plus
-what PyTorch holds cached and unused must cover the block and leave free the larger of 5% of the GPU's memory (at
-least 256 MB) and what the plan counted on keeping free (the headroom for activations and the room for streaming). Each
-block goes through two small pinned buffers (64 MB each, separate from the running model's) and
-a copy stream of its own. The destination is allocated on the compute stream, so it can reuse the memory the running
-model freed there, and the copy waits for the event of the last block that was freed. Copying straight from the
-memory-mapped file instead held up the running model's compute, also on a separate stream. The blocks that were not
-loaded early load when the `with` block is entered, and a failure in the early loading only gives a warning. It loads
-GPU blocks only: the RAM tier is read as before, and a block larger than the memory freed waits for room. The loader
-reads from the drive, so it keeps pace with the running model only when the next model's file is in the file cache or
-the model computes for long enough.
+`after` is the queue that `handle.subscribe()` returns. The loader reads it, so nothing else should. It loads the
+blocks of the next model in the order they will run, in two cases. A block goes into VRAM that is free already when it
+fits there and what is left still covers the margin below and what the running stage keeps free for itself (its plan's
+headroom and streaming room, or the configured `headroom_vram` when only a budget was given as `max_vram`). Otherwise it
+waits until the GPU blocks announced on the queue add up to more than what has been loaded that way so far plus the
+block, and loads when the GPU really has room for it. Room means that the memory the driver reports free plus what
+PyTorch holds cached and unused covers the block and leaves free the larger of 5% of the GPU's memory (at least 256 MB)
+and what the new model's plan counted on keeping free. Without a GPU there is no free VRAM to fill, and only the
+announced releases count. Each block goes through two small pinned buffers (64 MB each, separate from the running
+model's) and a copy stream of its own. The destination is allocated on the compute stream, so it can reuse the memory
+the running model freed there, and the copy waits for an event recorded right after that allocation, which covers
+everything the running model has queued so far. The allocator can hand out memory that was freed on the CPU side while
+kernels that use it are still queued, because the CPU runs ahead of the GPU. A copy that waited only for the event of
+the last block that was announced could land before those kernels: on the test pipeline a VAE loaded that way decoded
+to a black image. The cost is that a copy starts when the GPU has caught up with the point the CPU had reached. Copying
+straight from the memory-mapped file instead held up the running model's compute, also on a separate stream. The
+blocks that were not loaded early load when the `with` block is entered, and a failure in the early loading only gives
+a warning. It loads GPU blocks only, and a block larger than the free memory waits for room. The loader reads from the
+drive, so it keeps pace with the running model only when the next model's file is in the file cache or the model
+computes for long enough.
 
 With `running=` (the plan of the running stage) the early loader also gets the staging that the running stage does not
 use. A stage plans room for `lookahead` staged blocks; with `TRASH_PANDA_ADAPTIVE_LOOKAHEAD=1` it lowers the
@@ -324,11 +337,62 @@ look-ahead to 1 where the main thread does not wait for blocks, and the room of 
 before the running model frees anything, as long as the GPU really has room for them. The figure is read each time, so a
 later decision of the tuner counts.
 
-It can only help where something computes for a long time while the drive is idle. On the test pipeline the text
-encoder computes for 0.2 s, so there is nothing to hide the reads behind. It has not been run on the test pipeline yet:
-it is tested on the CPU, and early loading, `running=`, the partial RAM read and the replan also on a GPU with stand-in
-models. Reading early moves reads, it does not remove them, so it saves time only where the drive would otherwise be
-idle or the reads overlap work that does not use it; the result has to be compared by the total time of the pipeline.
+Reading early moves reads, it does not remove them, so it saves time only where the drive would otherwise be idle or
+the reads overlap work that does not use it; compare the total time of the whole pipeline. On the test pipeline (text
+encoder, diffusion model and VAE, on a SATA SSD) preparing the diffusion model while the encoder runs did not shorten
+the run: the encoder computes for 2.7 s and the diffusion model's RAM tier takes 24 s to read, so with `ram_preload`
+the run was 9 s longer than with three plain `stage()` calls, and with only the GPU blocks loaded early it was within
+the noise. Preparing the VAE while the diffusion model runs did pay, by 2 to 3 s, because that model computes for about
+50 s and the VAE is small (see "What we measured").
+
+### Running a pipeline
+
+A `Coordinator` runs the models of a pipeline one after another. It owns one pinned pool for all of them and prepares
+each next model while the running one computes:
+
+```python
+from trash_panda import Coordinator, Step
+
+co = Coordinator(
+    Step("text", lambda: encoder.qwen, encoder.weights_path, skip_prefixes=SKIP_PREFIXES),
+    Step("unet", build_unet, "unet.safetensors", resident_blocks=12),
+    Step("vae", lambda: ae.ae, ae.weights_path, skip_prefixes=("encoder.",)),
+)
+with co:
+    with co.stage("text", ram_preload=False) as (text, p, handle):
+        cond = encode(text, ...)
+    with co.stage("unet") as (unet, p, handle):
+        latents = denoise(unet, cond, before_last=handle.final_pass)
+    with co.stage("vae") as (vae, p, handle):
+        image = decode(vae, latents)
+```
+
+A `Step` is a name and the arguments of `stage()` for one model (`build`, `path`, `key`, `key_map`, `skip_prefixes`,
+`order`, `overlap`, `max_vram`, `max_ram`, and the arguments of `plan()`). `pool`, `running` and `after` are set by the
+`Coordinator` and cannot be given. `co.stage(name)` yields what `stage()` yields, `(model, plan, handle)`, and releases
+the model when the block ends. It must be used inside `with co:`, and a stage cannot start inside another stage of the
+same `Coordinator`. A step can run again (a loop over images). The order of the `Step`s in the constructor is the
+order used for "next", not the order of the `co.stage()` calls.
+
+* **One pinned pool.** `with co:` makes one `_PinnedPool` that every model uses, instead of each model pinning its own
+  buffers again, and it is dropped, with its pinned memory given back, when the block ends. Its buffers grow to the
+  largest block of any model and do not shrink. Each plan counts the buffers the pool has already (`pinned_held`, the
+  size of each buffer), so only what the buffers still have to grow by is kept back from the RAM tier. Buffers that a
+  model added to the pool (the look-ahead tuner does) are dropped when its stage ends, so the next model cycles through
+  the configured number of buffers. `stage()` and `preload()` take `pool=` too.
+* **Preparing the next step.** While a stage runs, the next model is planned for the memory the running one will give
+  back (`preload(running=p)`). Three arguments of `co.stage()` say what is prepared. `then` names the step: by default
+  the next one in the order of the `Coordinator`, a step's name for another one, `None` when there is none (nothing
+  follows the last step). `ram_preload=True` (the default) reads the next model's RAM tier into memory on a background
+  thread; `False` leaves it mapped from the file. `vram_preload=True` (the default) loads its GPU blocks early, into VRAM
+  that is free and, if the running model calls `handle.final_pass()`, into the memory the final pass frees; `False`
+  loads them when the step starts. With both `False` nothing is prepared and the next step loads like `stage()` does.
+  The queue of `handle.subscribe()` belongs to the loader then, so do not read it in a stage that prepares a next step.
+* **A different step than the prepared one** gives the prepared model up (its reads finish first) and loads the asked
+  one as `stage()` does. Leaving `with co:` gives up a prepared model nobody asked for.
+
+On the test machine's SATA drive, pass `ram_preload=False` for a stage that is shorter than the read of the next
+model's RAM tier (see "What we measured" and "Current recommendation").
 
 ### Storage dtype
 
@@ -432,6 +496,30 @@ difference smaller than that is not a result.
   copies could make the restore up to 2.5 times faster, at the price of pinned RAM as large as the weights. Nothing
   above 4 GB was run, because the free RAM was between 2.6 and 9.7 GB during the measurement; with 2.6 GB free the copy
   to the CPU fell to 1.2 GB/s.
+* **The Coordinator on the test pipeline** (one 1024 x 1024 image, 7 steps, no overlap, single runs; the start RAM and
+  the state of the file cache differed from run to run, which moved the totals by several seconds). Three plain
+  `stage()` calls took 98.4 s (start RAM 9.7 GB). A `Coordinator` with the defaults (both preload arguments on, every
+  stage) took 107.3 s (9.5 GB), 111.7 s and 113.9 s (6.5 to 7.1 GB). At matched RAM the whole 8.9 s gap between the
+  first two is in the diffusion model's phase (76.1 s against 84.9 s). Preparing it during the encoder read its RAM tier
+  into memory, 7.29 GB in 21.6 s (0.33 GB/s), of which the 2.7 s encoder hid 3.6 s, so the model waited 18 to 20 s at
+  entry; the first denoise step then took 9.7 s instead of 22.3 s, which was not enough to make up for it. The mapped
+  read overlaps the cold read with the compute of the first step. Preparing the VAE while the diffusion model ran
+  loaded 5 or 6 of its 6 blocks early and shortened the steps after the diffusion model by 2 to 3 s.
+* **`ram_preload=False` for the encoder, `vram_preload` left on** took 99.5 s (start RAM 8.2 GB): 2 of the diffusion
+  model's 12 GPU blocks (0.87 GB) loaded during the encoder, its load took 12.2 s instead of 15.7 s, and the encoder
+  phase took about 3 s longer (the prompt was encoded in 3.9 s instead of 1.1 s). The window is the encoder's 3 to 4 s
+  and the drive reads 0.4 GB/s, so it can hide about 1.5 GB at most. The cost in the encoder was not traced; one
+  possibility is that loading into free VRAM makes the allocator ask the driver for new memory while the encoder runs.
+  One run with the diffusion model's weights in the file cache (the encoder loaded in 2.7 s instead of 12 s) took
+  81.3 s, but it is not comparable with the others.
+* **Where the time goes** (the 107.3 s run, from the time between the stages): loading weights took 48.3 s (the
+  encoder 12.0 s, the diffusion model 36.3 s, 45% of the run), the compute 52.6 s (49%), the rest about 6 s. A run reads
+  about 16 GB through the drive. On a drive that reads 3 GB/s that part would take a few seconds, and preparing the
+  next model while the encoder runs should pay off then.
+* **`overlap=True` in a `Coordinator`** with the defaults took 105.1 s (start RAM 6.5 GB, no table), against 107.3 to
+  113.9 s without it. The encoder's blocks load on a worker thread while the diffusion model's RAM tier is read, so the
+  model waited 1.2 s at entry instead of 18 s, at the price of a longer first step. The difference from the runs
+  without it is within the spread of those runs.
 
 ### Current recommendation
 
@@ -443,6 +531,9 @@ difference smaller than that is not a result.
 * A slow first step is the first read of the RAM tier from the drive. The profile shows it as a first pass with a low
   GB/s in the RAM copies and a large "waited". Only a faster drive shortens it.
 * Set `TRASH_PANDA_PROFILE=1` when you want to see where the time goes.
+* In a `Coordinator`, pass `ram_preload=False` for a stage that is shorter than the read of the next model's RAM tier
+  (the encoder before a diffusion model on a SATA drive), or `then=None` to prepare nothing. Preparing the VAE while the
+  diffusion model runs is worth keeping on.
 
 ### Reading the profile
 
@@ -479,9 +570,8 @@ are indicative only, and they do not show that trash-panda is faster than the ot
 
 * coordinating memory between several models that are loaded at the same time (for example a text encoder
   and a diffusion model). Each model is planned on its own from the memory that is free when you plan it, so
-  plan them one after the other, or free the first model before loading the next
-* a helper that runs the stages of a pipeline in order and reports memory before and after each one. `stage()` handles
-  one model at a time, so call it once per model (see "Running a stage")
+  plan them one after the other, or free the first model before loading the next. Models that run one after another
+  are what `Coordinator` is for (see "Running a pipeline")
 * full overlap of reading and computing for disk blocks: blocks waiting in RAM and on disk are prefetched through
   pinned buffers by a background thread, two blocks ahead by default, but the drive's speed sets a floor that no
   amount of prefetching removes (see "Known issues")
@@ -526,6 +616,11 @@ are indicative only, and they do not show that trash-panda is faster than the ot
   `order_file_destination` they overwrite each other's file. With the default location, next to the checkpoint, this
   does not happen. A file that names a block the model does not have is ignored, so nothing breaks, but the file is
   rewritten on every run
+* **A PyTorch warning with the profile on.** With `TRASH_PANDA_PROFILE=1`, a release may print
+  `Deallocating Tensor that still has live PyObject references`. The memory trace of the
+  profile keeps a weak reference to every large tensor it finds, and PyTorch warns when one of them is freed. It is
+  harmless, nothing reads those tensors afterwards, and it appears from run to run only by chance. Without the profile
+  it should not appear
 * **Tested on one setup so far:** a 12B diffusion model (fp8 with scales) on Windows with an RTX 3060 (12 GB) and
   16 GB of RAM. Other models, GPUs and operating systems are not covered yet. The unit tests run on the CPU, and
   `examples/sdxl_benchmark.py` has a path for machines without CUDA (the Apple GPU or the CPU) that is untested
@@ -606,19 +701,6 @@ that focus, roughly in the order they are planned. Nothing here is promised or s
     should be loaded in the order they are needed; today they are loaded before the first call
 * the number of pinned buffers as a tested option (`TRASH_PANDA_PINNED_BUFFERS`, 3 or 4 instead of 2), if the
   profile's "worker waited for a free pinned buffer" line shows the worker is held up by them
-
-**Planner**
-`stage()` and `release()` run the models of a pipeline one at a time today (see "Running a stage"), and `stage()` runs
-the text encoder, the diffusion model and the VAE of the Krea2 pipeline. In single runs, releasing the text encoder
-before the diffusion model was planned gave the planner several GB more RAM, and releasing the diffusion model before
-the VAE was built stopped the decode of a 2048 x 1024 image from spilling into shared GPU memory (watched by eye, not
-logged). A final pass already announces each block it frees on a queue (`handle.subscribe()`, see "Running a stage").
-What is left is to let memory move between stages while they run. The steps below are small, each can be tested on
-its own, and they are listed in the order they depend on one another:
-* one pinned pool for the whole pipeline, sized for the largest block of any stage and kept until the pipeline ends,
-  instead of one pool per model
-* something that holds these together: it runs the stages of a pipeline in order and owns the memory budgets that move
-  between them. Its interface is not decided; it is better settled after the steps above have measurements
 
 **Compatibility**
 * `diffusers` pipelines: build the large components with `stream_load` and hand them to the pipeline class, so

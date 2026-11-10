@@ -10,10 +10,11 @@ from .planner import BlockPlan, Plan, Tier, parse_bytes, plan
 from .report import LoadReport
 from .measure import measure_activation_vram
 from .stage import PendingStage, preload, record_order, stage
+from .coordinator import Coordinator, Step
 
 __all__ = [
-    "BlockGroup", "BlockPlan", "Checkpoint", "DiskReader", "Hardware", "Kind", "LoadReport",
-    "OffloadHandle", "PendingStage", "Plan", "TensorInfo", "Tier",
+    "BlockGroup", "BlockPlan", "Checkpoint", "Coordinator", "DiskReader", "Hardware", "Kind", "LoadReport",
+    "OffloadHandle", "PendingStage", "Plan", "Step", "TensorInfo", "Tier",
     "detect_hardware", "expand", "find_blocks", "install_offload", "measure_activation_vram", "module_nbytes",
     "offload_blocks", "release", "parse_bytes", "parse_dtype", "plan", "preload", "quantize_fp8", "record_order", "stream_load", "stage"
 ]

@@ -32,7 +32,7 @@ from .formats import SCALE_SUFFIX, expand
 from .hardware import _process_memory, _read_ram
 from .loader import OffloadState, _navigate
 from .order_file import order_path, read_order, write_order
-from .planner import Plan, Tier
+from .planner import Plan, Tier, _pinned_size
 
 
 class Release(NamedTuple):
@@ -216,6 +216,27 @@ class _PinnedPool:
         """Remember which GPU copy still reads from buffer i"""
         self.events[i] = event
 
+    def sizes(self) -> List[int]:
+        """The pinned memory each buffer takes, at the size PyTorch gives it (see planner._pinned_size); 0 for a buffer
+        that is not allocated yet."""
+        return [_pinned_size(b.numel()) if b is not None else 0 for b in self.buffers]
+
+    def trim(self, count: int) -> bool:
+        """Drop the buffers after the first `count` (at least one stays), once the GPU copies that read from them are done.
+        The buffers are used in turn, so a pool that was enlarged for one model would make the next one cycle through
+        buffers it does not need. True if any were dropped; their pinned memory is given back by emptying PyTorch's host
+        cache. Call it when no model is using the pool."""
+        count = max(count, 1)
+        if len(self.buffers) <= count:
+            return False
+        for event in self.events[count:]:
+            if event is not None:
+                event.synchronize()
+        del self.buffers[count:]
+        del self.events[count:]
+        self.cursor %= count
+        return True
+
     def grow(self, count: int) -> None:
         """Make room for at least `count` buffers (they are pinned when first used). Never makes the pool smaller."""
         while len(self.buffers) < count:
@@ -238,7 +259,8 @@ class _Prefetcher:
     largest    = 0              # bytes of the biggest block staged so far
     tuner      = None           # DepthTuner, when the look-ahead follows the passes (adaptive_lookahead)
 
-    def __init__(self, device: torch.device, lookahead: Optional[int] = None, profile: Optional[bool] = None):
+    def __init__(self, device: torch.device, lookahead: Optional[int] = None, profile: Optional[bool] = None,
+                 pool: Optional[_PinnedPool] = None):
         cfg = config.current()
         self.device      = device
         self.lookahead   = cfg.lookahead if lookahead is None else lookahead
@@ -257,7 +279,12 @@ class _Prefetcher:
         self.failure     = None                      # why the loader stopped, if it did
         self.window      = []
         self.in_flight   = deque()
-        self.pool        = _PinnedPool(cfg.pinned_buffers) if self.stream is not None else None
+        self.shared      = pool is not None          # somebody else owns the pool: close() only lets go of its reference
+        if self.stream is None:
+            self.pool = None
+        else:
+            self.pool = pool if pool is not None else _PinnedPool(cfg.pinned_buffers)
+            self.pool.wait_s = 0.0                   # the report divides it by the passes of this model
         self.worker      = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda") if self.stream is not None else None
         self.final       = False
         self.dropper     = None                      # thread that lets go of RAM-tier tensors in a final pass, made when needed
@@ -1059,8 +1086,11 @@ def install_offload(
     profile: Optional[bool] = None,
     order: Optional[Iterable[str]] = None,
     order_file_destination: Union[str, Path, None] = None,
+    pool: Optional[_PinnedPool] = None,
 ) -> OffloadHandle:
     """Install the offload hooks for every block in the plan (defaults to the plan used by stream_load).
+    `pool` is a pinned pool that the caller owns and that outlives the handle (a Coordinator passes one); by default the
+    handle makes its own and drops it when it is removed.
     `order` names blocks (by prefix) that run first, in that order; the others follow in the plan's order. It tells the
     prefetcher what to stage before the first pass has shown the real order.
     When `order` is None, the order the blocks ran in is saved when the handle is removed, in
@@ -1078,7 +1108,7 @@ def install_offload(
     lookahead = plan.lookahead if lookahead is None else lookahead
 
     handle = OffloadHandle()
-    pre    = _Prefetcher(torch.device(dev or ("cuda" if torch.cuda.is_available() else "cpu")), lookahead, profile)
+    pre    = _Prefetcher(torch.device(dev or ("cuda" if torch.cuda.is_available() else "cpu")), lookahead, profile, pool=pool)
     handle._add(pre.close) #registered first, so it runs last on remove()
     handle._prefetcher = pre
     pre.plan, pre.planned = plan, pre.lookahead
@@ -1218,11 +1248,15 @@ def release(model: nn.Module, handle: Optional[OffloadHandle] = None) -> None:
     trace.mark("gc")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        # PyTorch keeps freed pinned (page-locked) memory for reuse, and empty_cache() does not touch it. Measured
-        # on the test machine, the pinned buffers stayed in RAM until this call. It is a private function of
-        # PyTorch, so it is only called when it exists.
-        empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
-        if empty_host_cache is not None:
-            empty_host_cache()
+        _empty_host_cache()
     trace.mark("caches emptied")
     trace.report()
+
+
+def _empty_host_cache() -> None:
+    """Give back the pinned (page-locked) memory that PyTorch keeps for reuse after it was freed: empty_cache() does
+    not touch it. Measured on the test machine, the pinned buffers stayed in RAM until this call. It is a private
+    function of PyTorch, so it is only called when it exists. Pinned buffers that are still referenced stay."""
+    empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+    if empty_host_cache is not None:
+        empty_host_cache()

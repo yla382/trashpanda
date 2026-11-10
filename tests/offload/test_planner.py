@@ -259,6 +259,40 @@ def test_no_pinned_buffers_when_every_block_is_on_the_gpu(tiny_checkpoint):
     assert p.ram_budget == 10 * _GB                                    # nothing to stage, so nothing is pinned
 
 
+def test_pinned_growth_is_counted_buffer_by_buffer():
+    from trash_panda.offload.planner import _pinned_growth
+    assert _pinned_growth(2, 1000) == 2 * 1024                             # no pool yet: both buffers are new
+    assert _pinned_growth(2, 1000, [1024, 1024]) == 0                      # big enough
+    assert _pinned_growth(2, 1000, [1024, 0]) == 1024                      # one is missing
+    assert _pinned_growth(2, 1000, [512, 512]) == 2 * 512                  # smaller ones are replaced: the difference
+    assert _pinned_growth(2, 1000, [1024, 1024, 1 << 20]) == 0             # buffers after the first two are not used
+    assert _pinned_growth(2, 1000, [4096, 256]) == 768                     # a big buffer does not pay for a small one
+    assert _pinned_growth(2, 0) == 0
+
+
+def test_pinned_memory_a_shared_pool_holds_is_not_kept_back_twice(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    largest = max(b.stored_bytes for b in auto(path, hw(0, 10 ** 9)).blocks)
+    size = _pinned_size(largest)
+    hardware = machine(16 * _GB, 10 * _GB, vram_free=1)
+    half = plan_with(path, hardware, resident_blocks=0, min_free_ram=0, pinned_held=[size, size // 2])
+    assert half.ram_budget == 10 * _GB - (size - size // 2)                # only what the pool still has to grow by
+    enough = plan_with(path, hardware, resident_blocks=0, min_free_ram=0, pinned_held=[size] * _PINNED_BUFFERS)
+    assert enough.ram_budget == 10 * _GB                                   # a pool that is big enough costs nothing more
+    uneven = plan_with(path, hardware, resident_blocks=0, min_free_ram=0, pinned_held=[10 * size, size // 2])
+    assert uneven.ram_budget == 10 * _GB - (size - size // 2)              # a big buffer does not pay for a small one
+
+
+def test_ram_overhead_counts_only_the_growth_of_a_shared_pool():
+    from trash_panda.offload.planner import ram_overhead
+    p = Plan.manual(compute_dtype="fp32", streamed=["blocks.1."], resident=["blocks.0."])
+    p.blocks[1].stored_bytes = 1000
+    gpu = Hardware(vram_total=10 ** 9, vram_free=10 ** 9, ram_total=16 * 10 ** 9, ram_available=10 ** 10)
+    assert ram_overhead(p, gpu, 500, [1024, 1000]) == 500 + 24
+    assert ram_overhead(p, gpu, 500, [1024, 1024]) == 500
+    assert ram_overhead(p, gpu, 500, [4096, 256]) == 500 + 768
+
+
 def test_the_lookahead_reserves_vram_for_the_staged_blocks(tiny_checkpoint):
     _, path = tiny_checkpoint
     probe = auto(path, hw(10 ** 9, 10 ** 9))
@@ -350,6 +384,22 @@ def test_the_fill_warning_follows_the_configured_share(tiny_checkpoint, monkeypa
     _, path = tiny_checkpoint
     monkeypatch.setenv("TRASH_PANDA_VRAM_FILL_WARN_FRACTION", "2.0")      # never reached
     assert _gpu_warnings(auto(path, hw(10 ** 9, 10 ** 9))) == []
+
+
+def test_the_fill_share_is_measured_against_max_vram_when_it_is_given(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    # little VRAM is free now, but the plan was made for a lot: preload() plans for what a running model will give back
+    p = auto(path, hw(1000, 10 ** 9), max_vram=10 ** 9, resident_blocks=4)
+    assert _gpu_warnings(p) == []
+
+
+def test_the_fill_warning_says_it_counted_against_max_vram(tiny_checkpoint, monkeypatch):
+    _, path = tiny_checkpoint
+    monkeypatch.setenv("TRASH_PANDA_VRAM_FILL_WARN_FRACTION", "0.0")      # any use counts as filling
+    found = _gpu_warnings(auto(path, hw(1000, 10 ** 9), max_vram=10 ** 9, resident_blocks=4))
+    assert len(found) == 1 and "% of the VRAM it may use" in found[0] and "free VRAM" not in found[0]
+    found = _gpu_warnings(auto(path, hw(10 ** 9, 10 ** 9)))               # no cap: still the free VRAM
+    assert len(found) == 1 and "% of the free VRAM" in found[0]
 
 
 def test_a_plan_over_the_budget_gets_one_warning_not_two(tiny_checkpoint):

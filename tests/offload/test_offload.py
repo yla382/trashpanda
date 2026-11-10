@@ -395,9 +395,9 @@ def test_lookahead_reaches_the_prefetcher(tiny_checkpoint, monkeypatch):
     seen = []
     original_init = hooks._Prefetcher.__init__
 
-    def recording_init(self, device, lookahead=2, profile=None):
+    def recording_init(self, device, lookahead=2, profile=None, **kw):
         seen.append(lookahead)
-        original_init(self, device, lookahead, profile)
+        original_init(self, device, lookahead, profile, **kw)
 
     monkeypatch.setattr(hooks._Prefetcher, "__init__", recording_init)
 
@@ -481,9 +481,9 @@ def test_install_offload_follows_the_plans_lookahead_unless_told_otherwise(tiny_
     seen = []
     original_init = hooks._Prefetcher.__init__
 
-    def recording_init(self, device, lookahead=2, profile=None):
+    def recording_init(self, device, lookahead=2, profile=None, **kw):
         seen.append(lookahead)
-        original_init(self, device, lookahead, profile)
+        original_init(self, device, lookahead, profile, **kw)
 
     monkeypatch.setattr(hooks._Prefetcher, "__init__", recording_init)
     p = Plan.manual(compute_dtype="fp32", streamed=ALL)
