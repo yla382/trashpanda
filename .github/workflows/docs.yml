@@ -1,0 +1,57 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - mkdocs.yml
+      - src/**                   # the API reference is generated from the docstrings
+      - .github/workflows/docs.yml
+  pull_request:                  # a pull request only builds the site (strictly), it does not publish it
+    paths:
+      - docs/**
+      - mkdocs.yml
+      - src/**
+      - .github/workflows/docs.yml
+  workflow_dispatch:             # a run by hand, from the Actions tab
+
+concurrency:
+  group: pages
+  cancel-in-progress: false      # let a deployment that is running finish
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+      - name: Install the documentation tools      # no torch needed: mkdocstrings reads the source without importing it
+        run: pip install -r docs/requirements.txt
+      - name: Build the site (warnings are errors)
+        run: mkdocs build --strict
+      - name: Upload the site
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write           # lets this workflow publish to GitHub Pages
+      id-token: write        # lets Pages verify that the deployment comes from this workflow
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

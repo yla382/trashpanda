@@ -1,0 +1,111 @@
+site_name: trash-panda
+site_description: Run models bigger than your GPU by streaming weights across GPU, RAM and disk.
+site_url: https://yla382.github.io/trashpanda/
+repo_url: https://github.com/yla382/trashpanda
+repo_name: yla382/trashpanda
+
+docs_dir: docs
+# Not part of the site (yet): the design notes, and the list of packages that builds it.
+exclude_docs: |
+  pipeline-design.md
+  requirements.txt
+
+theme:
+  name: material
+  logo: assets/logo.png
+  favicon: assets/favicon.png
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - content.code.copy
+  palette:
+    - scheme: default
+      primary: blue grey
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: blue grey
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/yla382/trashpanda
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/dumpsterpanda/
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid                    # diagrams written as text, drawn in the browser
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: null          # the docstrings are plain prose, not Google or NumPy style
+            show_root_heading: true
+            show_root_full_path: false         # the heading is "stage", not "trash_panda.offload.stage.stage"
+            show_source: false
+            heading_level: 2
+            merge_init_into_class: true
+            separate_signature: true
+            members_order: source
+
+nav:
+  - Home: index.md
+  - Quick start: quickstart.md
+  - Guides:
+      - Running a stage: guides/running-a-stage.md
+      - Running a pipeline: guides/running-a-pipeline.md
+      - Storage dtype: guides/storage-dtype.md
+  - Reference:
+      - Overview: reference/index.md
+      - Stages and pipelines: reference/stages.md
+      - Planning: reference/planning.md
+      - Loading: reference/loading.md
+      - Hooks and handles: reference/handles.md
+      - Settings: reference/settings.md
+  - Design:
+      - Overview: design/index.md
+      - Planning in practice: design/planning.md
+      - Stages in detail: design/stages.md
+      - Loading the next model early: design/loading-the-next-model.md
+      - Pipelines in detail: design/pipelines.md
+      - Settings in detail: design/settings.md
+      - What we measured: design/measurements.md
+      - Reading the profile: design/profile.md
+  - Project:
+      - Known issues: project/known-issues.md
+      - Limitations and scope: project/limitations.md
+      - Roadmap: project/roadmap.md

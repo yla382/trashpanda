@@ -10,6 +10,9 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# Built documentation site (mkdocs build)
+site/
+
 # Model files and outputs: never commit these
 *.safetensors
 *.pth

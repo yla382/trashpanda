@@ -1,0 +1,5 @@
+# What builds the documentation site (not a dependency of the package). Install with:  pip install -r docs/requirements.txt
+mkdocs>=1.6,<2          # MkDocs 2.0 removes the plugin system that mkdocstrings needs
+mkdocs-material
+mkdocstrings[python]
+ruff                    # lets mkdocstrings format long signatures
