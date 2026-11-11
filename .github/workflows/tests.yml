@@ -23,6 +23,6 @@ jobs:
       - name: Install dependencies (from poetry.lock, CPU-only torch)
         run: |
           poetry env use python
-          poetry install --no-interaction
+          poetry install --no-interaction --extras cli
       - name: Run tests
         run: poetry run pytest -q

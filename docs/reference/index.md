@@ -10,6 +10,7 @@ what it returns, and an example. All of them can be imported from the top level,
 | [Planning](planning.md) | `plan`, `Plan`, `BlockPlan`, `Tier`, `Hardware`, `detect_hardware`, `parse_bytes`, `measure_activation_vram`, `find_blocks`, `BlockGroup`, `module_nbytes` |
 | [Loading](loading.md) | `stream_load`, `LoadReport`, `Checkpoint`, `TensorInfo`, `Kind`, `parse_dtype`, `expand`, `quantize_fp8` |
 | [Hooks and handles](handles.md) | `install_offload`, `offload_blocks`, `OffloadHandle`, `Release`, `DiskReader`, `release` |
+| [Command line](cli.md) | `trash-panda plan` and `trash-panda info`, with their options |
 | [Settings](settings.md) | the tuning settings and their `TRASH_PANDA_*` environment variables |
 
 Start with `stage()` for one model, or a `Coordinator` for several. `plan()`, `stream_load()` and `install_offload()` are

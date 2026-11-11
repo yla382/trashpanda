@@ -57,7 +57,8 @@ Install PyTorch first (the build that matches your GPU, see https://pytorch.org)
 pip install dumpsterpanda
 ```
 
-The package is imported as `trash_panda`. To try the latest development version straight from GitHub instead:
+The package is imported as `trash_panda`. For the command line (`trash-panda plan` and `trash-panda info`), install the
+extra: `pip install "dumpsterpanda[cli]"`. To try the latest development version straight from GitHub instead:
 
 ```
 pip install git+https://github.com/yla382/trashpanda.git
@@ -110,12 +111,51 @@ with co:
         image = decode(vae, latents)
 ```
 
+## Command line
+
+Look at a checkpoint without loading it. `plan` shows where each block would live on this machine, and `info` shows what is
+in the file:
+
+```
+trash-panda plan model.safetensors
+trash-panda info model.safetensors
+```
+
+For a small example checkpoint (16 blocks, 424.5 MB), with the limits set low on purpose so that all three tiers are
+used (`--max-vram 400MB --headroom-vram 50MB --max-ram 150MB --min-free-ram 0`), `plan` prints this (the hardware
+lines and the warnings are left out):
+
+```text
+example.safetensors: 16 blocks, 424.5 MB
+┌─────────────┬─────────┬────────┬──────────────┬─────────────┬──────────────┐
+│ Group       │       N │ Blocks │          GPU │         RAM │         Disk │
+├─────────────┼─────────┼────────┼──────────────┼─────────────┼──────────────┤
+│ blocks.<N>. │ 0 to 15 │     16 │ 9 (226.5 MB) │ 3 (75.5 MB) │ 4 (100.7 MB) │
+└─────────────┴─────────┴────────┴──────────────┴─────────────┴──────────────┘
+┌──────┬──────────┬───────────────────────────────────┬──────────┐
+│      │ Budget   │ What it holds                     │     Size │
+├──────┼──────────┼───────────────────────────────────┼──────────┤
+│ GPU  │ 350.0 MB │ 9 blocks kept on the GPU          │ 226.5 MB │
+│      │          │ Input and output layers           │  21.8 MB │
+│      │          │ Workspace for streaming blocks in │  83.1 MB │
+│      │          │ Unused                            │  18.7 MB │
+├──────┼──────────┼───────────────────────────────────┼──────────┤
+│ RAM  │ 82.9 MB  │ 3 blocks                          │  75.5 MB │
+│      │          │ Unused                            │   7.4 MB │
+├──────┼──────────┼───────────────────────────────────┼──────────┤
+│ Disk │ none     │ 4 blocks that did not fit in RAM  │ 100.7 MB │
+└──────┴──────────┴───────────────────────────────────┴──────────┘
+GPU budget: 400.0 MB allowed by --max-vram, less 50.0 MB kept for activations
+RAM budget: 150.0 MB allowed by --max-ram, less 67.1 MB kept for the system and copy buffers
+```
+
 ## Documentation
 
 * [Quick start](https://yla382.github.io/trashpanda/quickstart/): from install to a first run
 * Guides: [running a stage](https://yla382.github.io/trashpanda/guides/running-a-stage/),
-  [running a pipeline](https://yla382.github.io/trashpanda/guides/running-a-pipeline/) and
-  [storage dtype](https://yla382.github.io/trashpanda/guides/storage-dtype/)
+  [running a pipeline](https://yla382.github.io/trashpanda/guides/running-a-pipeline/),
+  [storage dtype](https://yla382.github.io/trashpanda/guides/storage-dtype/) and the
+  [command line](https://yla382.github.io/trashpanda/guides/command-line/)
 * [API reference](https://yla382.github.io/trashpanda/reference/): every public function and class, with its
   parameters and defaults, and the [settings](https://yla382.github.io/trashpanda/reference/settings/) with their
   `TRASH_PANDA_*` environment variables

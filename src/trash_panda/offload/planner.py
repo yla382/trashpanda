@@ -470,8 +470,9 @@ def plan(
     ram_used = sum(b.stored_bytes for b in blocks if b.tier == Tier.RAM)
     if hw.commit_available is not None and ram_used > cfg.commit_warn_fraction * hw.commit_available:
         warnings.append(
-            f"Streamed blocks need {fmt_bytes(ram_used)} but only {fmt_bytes(hw.commit_available)} can still be "
-            "committed (RAM + page file); loading may fail with 'paging file too small'."
+            f"Streamed blocks need {fmt_bytes(ram_used)} but the system will only let programs reserve "
+            f"{fmt_bytes(hw.commit_available)} more (RAM plus page file or swap); loading may fail because the system "
+            "refuses to reserve that much memory."
         )
 
     return Plan(

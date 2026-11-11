@@ -89,12 +89,14 @@ nav:
       - Running a stage: guides/running-a-stage.md
       - Running a pipeline: guides/running-a-pipeline.md
       - Storage dtype: guides/storage-dtype.md
+      - Command line: guides/command-line.md
   - Reference:
       - Overview: reference/index.md
       - Stages and pipelines: reference/stages.md
       - Planning: reference/planning.md
       - Loading: reference/loading.md
       - Hooks and handles: reference/handles.md
+      - Command line: reference/cli.md
       - Settings: reference/settings.md
   - Design:
       - Overview: design/index.md

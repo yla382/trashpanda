@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "dumpsterpanda"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run models bigger than your GPU: layer-by-layer weight streaming across GPU, RAM and disk."
 authors = ["yla382"]
 readme = "README.md"
@@ -16,11 +16,19 @@ classifiers = [
 ]
 packages = [{ include = "trash_panda", from = "src" }]
 
+[tool.poetry.scripts]
+trash-panda = "trash_panda.cli:main"
+
 [tool.poetry.dependencies]
 python = ">=3.9"
 safetensors = ">=0.4.3"
+typer = { version = ">=0.12", optional = true }
+rich = { version = ">=13", optional = true }
 # torch is deliberately NOT listed: install the build that matches your GPU/CUDA first
 # (pip install torch --index-url https://download.pytorch.org/whl/cu121), then install this package.
+
+[tool.poetry.extras]
+cli = ["typer", "rich"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional
 
 import torch.nn as nn
 
 from . import config
+from .checkpoint import Checkpoint
 
 
 @dataclass
@@ -51,4 +53,45 @@ def find_blocks(model: nn.Module, *, min_fraction: Optional[float] = None, min_b
         nbytes = module_nbytes(mod)
         if total and nbytes / total >= min_fraction:
             groups.append(BlockGroup(name, [f"{name}.{cname}." for cname, _ in children], nbytes))
+    return groups
+
+
+class CheckpointNames:
+    """Stands in for a model when only the checkpoint is known: plan() asks it for the parameter names."""
+
+    def __init__(self, names):
+        self._names = list(names)
+
+    def named_parameters(self):
+        return ((n, None) for n in self._names)
+
+    def named_buffers(self):
+        return iter(())
+
+
+def find_blocks_in_checkpoint(ck: Checkpoint, skip_prefixes=(), min_fraction=None, min_blocks=None) -> List[BlockGroup]:
+    """Like find_blocks(), but from the key names: a container whose children are numbered 0, 1, 2 ... and
+    all hold the same tensors. Outermost groups win."""
+    cfg = config.current()
+    min_fraction = cfg.find_blocks_min_fraction if min_fraction is None else min_fraction
+    min_blocks = cfg.find_blocks_min_blocks if min_blocks is None else min_blocks
+    total = ck.total_bytes()
+    found = defaultdict(lambda: defaultdict(dict))       # container -> index -> {rest of the key: bytes}
+    for key in ck.keys():
+        parts = key.split(".")
+        for i, part in enumerate(parts[:-1]):
+            if part.isdigit():
+                found[".".join(parts[:i])][int(part)][".".join(parts[i + 1:])] = ck.info(key).nbytes
+    groups: List[BlockGroup] = []
+    for name in sorted(found, key=lambda n: (n.count("."), n)):          # outermost first
+        if not name or (name + ".").startswith(tuple(skip_prefixes)) or any(name.startswith(g.name + ".") for g in groups):
+            continue
+        blocks = found[name]
+        if sorted(blocks) != list(range(len(blocks))) or len(blocks) < min_blocks:
+            continue
+        if len({frozenset(b) for b in blocks.values()}) != 1:             # every block holds the same tensors
+            continue
+        nbytes = sum(sum(b.values()) for b in blocks.values())
+        if total and nbytes / total >= min_fraction:
+            groups.append(BlockGroup(name, [f"{name}.{i}." for i in range(len(blocks))], nbytes))
     return groups

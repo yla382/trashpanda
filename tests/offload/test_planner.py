@@ -407,3 +407,12 @@ def test_a_plan_over_the_budget_gets_one_warning_not_two(tiny_checkpoint):
     p = auto(path, hw(1000, 10 ** 9), resident_blocks=4)                  # forced onto a card that cannot hold them
     found = _gpu_warnings(p)
     assert len(found) == 1 and "needs" in found[0] and "budget" in found[0]
+
+
+def test_the_commit_warning_does_not_name_an_operating_system(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    h = hw(0, 10 ** 9)
+    h.commit_available = 100                                              # far less than the blocks need
+    found = [w for w in auto(path, h).warnings if "reserve" in w]
+    assert len(found) == 1
+    assert "Windows" not in found[0] and "paging file too small" not in found[0]

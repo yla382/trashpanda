@@ -11,6 +11,8 @@ pip install dumpsterpanda
 The package is imported as `trash_panda`. The weights have to be in safetensors format: one file, a folder of shards,
 or the index json of a sharded checkpoint.
 
+For the command line (`trash-panda plan` and `trash-panda info`), install `dumpsterpanda[cli]` instead.
+
 ## One model: `stage()`
 
 `stage()` builds the model, plans where each block should live, loads it, installs the hooks, and gives all of its
@@ -97,6 +99,18 @@ out = model(x)
 release(model, handle)                                       # RAM and VRAM are free again
 ```
 
+## Look at a checkpoint first
+
+The command line shows a plan without writing a script or loading anything:
+
+```
+trash-panda plan model.safetensors
+trash-panda info model.safetensors
+```
+
+`plan` prints where each block would live on this machine and how the GPU and RAM budgets are used. `info` prints what
+is in the file. See the [command line guide](guides/command-line.md).
+
 ## Several models, one after another
 
 Run each model in its own `stage()` and the memory of the first is free when the second is planned:
@@ -132,4 +146,5 @@ The other settings are listed on the [settings](reference/settings.md) page.
 ## Next
 
 * [Running a stage](guides/running-a-stage.md) and [Running a pipeline](guides/running-a-pipeline.md)
+* [Command line](guides/command-line.md)
 * [API reference](reference/index.md)
