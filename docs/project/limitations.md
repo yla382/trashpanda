@@ -57,16 +57,6 @@ direction, or come after it, and are not planned for now:
 * **Cheaper expansion**: reuse preallocated buffers and fuse the fp8 to bf16 conversion and scaling, instead of
   creating new tensors for every weight on every pass
 * **A cost model** that chooses between GPU, RAM and disk from measured disk and PCIe speed
-* **A command-line interface**, for example `trash-panda plan model.safetensors` to print a plan without writing a
-  script, and a hardware report for bug reports
-* **Visualizing the data flow, with a trace of a run**: the events the profile adds up today (block copies from RAM or
-  disk, waits for a copy, waits for the GPU, block runs, loader-thread loads, release steps) would be recorded with
-  their start and end times and written to a file in the Chrome trace-event format, which Perfetto and
-  `chrome://tracing` open as a timeline with a track per thread and stream. It would show each block moving between
-  tiers, the overlap of copying and compute, the stalls, the time each block of a final pass was freed, and blocks that
-  never start, which show as a gap in the timeline. It would be switched on by its own environment variable and be off
-  by default. A web interface of our own would only be needed for what a timeline cannot show, such as a view of the
-  plan, and a live interface would be a later step
 * **Logging**: an optional log through Python's `logging` module, and an optional structured file (for example
   `TRASH_PANDA_LOG=run.jsonl`) with the plan, memory and timings of a run. The visualization and a comparison of two
   runs could read it
