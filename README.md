@@ -1,10 +1,31 @@
-# trash-panda
-
-<p align="left">
+<p align="center">
   <img src="https://raw.githubusercontent.com/yla382/trashpanda/main/assets/raccoon_1.png" width="260" alt="A raccoon holding a circuit board in a trash can">
 </p>
 
-Run models bigger than your GPU: stream weights layer by layer across GPU, RAM and disk.
+<h1 align="center">trash-panda</h1>
+
+<p align="center">
+  <strong>Run models bigger than your GPU: stream weights layer by layer across GPU, RAM and disk.</strong>
+</p>
+
+<p align="center">
+  <a href="https://yla382.github.io/trashpanda/">Documentation</a> &middot;
+  <a href="https://yla382.github.io/trashpanda/quickstart/">Quick start</a> &middot;
+  <a href="https://yla382.github.io/trashpanda/guides/running-a-stage/">Guides</a> &middot;
+  <a href="https://yla382.github.io/trashpanda/reference/">API Guide</a> &middot;
+  <a href="https://yla382.github.io/trashpanda/design/">Design</a> &middot;
+  <a href="https://yla382.github.io/trashpanda/project/roadmap/">Roadmap</a> &middot;
+  <a href="CHANGELOG.md">Changelog</a> &middot;
+  <a href="https://pypi.org/project/dumpsterpanda/">PyPI</a>
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/dumpsterpanda/"><img src="https://img.shields.io/pypi/v/dumpsterpanda?color=607d8b" alt="PyPI"></a>
+  <img src="https://img.shields.io/badge/python-3.9%2B-607d8b" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/license-AGPL--3.0-607d8b" alt="AGPL-3.0 License">
+  <a href="https://github.com/yla382/trashpanda/actions/workflows/tests.yml"><img src="https://img.shields.io/github/actions/workflow/status/yla382/trashpanda/tests.yml?branch=main&label=tests" alt="Tests"></a>
+  <a href="https://yla382.github.io/trashpanda/project/known-issues/"><img src="https://img.shields.io/badge/status-pre--alpha-f59e0b" alt="Pre-alpha"></a>
+</p>
 
 > **Status: early (Phase 1).** The API may change. The package name is temporary. It has been tested on one setup so
 > far: a 12B diffusion model with fp8 weights on Windows, with an RTX 3060 (12 GB) and 16 GB of RAM.
