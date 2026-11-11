@@ -27,8 +27,7 @@
   <a href="https://yla382.github.io/trashpanda/project/known-issues/"><img src="https://img.shields.io/badge/status-pre--alpha-f59e0b" alt="Pre-alpha"></a>
 </p>
 
-> **Status: early (Phase 1).** The API may change. The package name is temporary. It has been tested on one setup so
-> far: a 12B diffusion model with fp8 weights on Windows, with an RTX 3060 (12 GB) and 16 GB of RAM.
+> **Status: early (Phase 1).** The API may change. The package name is temporary
 
 **Documentation: [yla382.github.io/trashpanda](https://yla382.github.io/trashpanda/)**
 
