@@ -135,6 +135,36 @@
   color: var(--md-accent-fg-color);
 }
 
+/* Box-drawing characters in code blocks (the tables that the command line prints). The font the site loads for code
+   has no glyphs for them, so the browser takes them from another font, whose characters are narrower than the letters
+   and the table borders drift. These faces take the box characters from a font installed on the reader's machine and
+   scale it to the width of a letter of the code font (0.6 em). The first face found wins. */
+@font-face {
+  font-family: "Box drawing";
+  src: local("Cascadia Mono"), local("Cascadia Code");
+  unicode-range: U+2500-257F;
+  size-adjust: 102.4%;
+}
+
+@font-face {
+  font-family: "Box drawing";
+  src: local("Menlo"), local("DejaVu Sans Mono"), local("Liberation Mono");
+  unicode-range: U+2500-257F;
+  size-adjust: 99.7%;
+}
+
+@font-face {
+  font-family: "Box drawing";
+  src: local("Consolas");
+  unicode-range: U+2500-257F;
+  size-adjust: 109.1%;
+}
+
+.md-typeset code,
+.md-typeset pre {
+  font-family: "JetBrains Mono", "Box drawing", SFMono-Regular, Consolas, Menlo, monospace;
+}
+
 /* Admonitions: a little rounder. */
 .md-typeset .admonition,
 .md-typeset details {
