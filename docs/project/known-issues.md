@@ -1,8 +1,5 @@
 # Known issues
 
-* **Automatic plans change from run to run.** `plan()` uses the RAM that is free at the moment you call it, and
-  free RAM varies. On a 16 GB machine the same script gave a RAM budget of 6.2 GB in one run and 8.0 GB in
-  another, which moved several blocks between RAM and disk
 * **Load other models before you plan.** If a second model (a text encoder, a VAE) is loaded after `plan()`, the
   memory the plan counted on is taken. In RAM, Windows pages the weights out and the first step is very slow. On the
   GPU, too many blocks stay resident and the overflow spills into shared memory, which can make every step several

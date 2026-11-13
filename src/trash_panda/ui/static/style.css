@@ -1,0 +1,78 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --text: #1f1f1d;
+  --muted: #6b6a64;
+  --surface: #f6f5f0;
+  --line: #d9d7cd;
+  --line-strong: #b4b2a9;
+  --amber: #ef9f27;
+  --teal-f: #e1f5ee;   --teal-s: #0f6e56;   --teal-t: #085041;
+  --purple-f: #eeedfe; --purple-s: #534ab7; --purple-t: #3c3489;
+  --gray-f: #f1efe8;   --gray-s: #5f5e5a;   --gray-t: #444441;
+  --red-f: #fcebeb;    --red-s: #a32d2d;    --red-t: #791f1f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1a;
+    --text: #e8e6dc;
+    --muted: #9c9a92;
+    --surface: #262624;
+    --line: #3a3a37;
+    --line-strong: #5a5955;
+    --teal-f: #085041;   --teal-s: #5dcaa5;   --teal-t: #9fe1cb;
+    --purple-f: #3c3489; --purple-s: #afa9ec; --purple-t: #cecbf6;
+    --gray-f: #444441;   --gray-s: #b4b2a9;   --gray-t: #d3d1c7;
+    --red-f: #791f1f;    --red-s: #f09595;    --red-t: #f7c1c1;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 17px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* The drawings are SVG with a fixed width of 680 units, so they, and the text in them, grow with the page width. */
+main { max-width: 1040px; margin: 0 auto; padding: 28px 20px 56px; }
+h1 { font-size: 24px; font-weight: 600; margin: 0 0 4px; }
+#meta { margin: 0 0 24px; color: var(--muted); font-size: 15px; }
+#error { padding: 12px 14px; border-radius: 8px; background: var(--red-f); color: var(--red-t); border: 1px solid var(--red-s); }
+svg { display: block; width: 100%; height: auto; margin: 0 0 8px; }
+#caption { min-height: 46px; margin: 8px 0 4px; }
+
+.controls { display: flex; align-items: center; gap: 12px; margin: 0 0 12px; }
+.controls input { flex: 1; }
+#clock { min-width: 100px; text-align: right; color: var(--muted); font-size: 15px; font-variant-numeric: tabular-nums; }
+button {
+  font: inherit; color: var(--text); background: transparent; cursor: pointer;
+  border: 1px solid var(--line-strong); border-radius: 8px; padding: 6px 14px; min-width: 76px;
+}
+button:hover { background: var(--surface); }
+
+text { fill: var(--text); font-family: inherit; font-size: 13px; }
+.th { font-size: 15px; font-weight: 600; }
+.t { font-size: 15px; }
+.muted { fill: var(--muted); }
+.box { fill: var(--surface); stroke: var(--line-strong); stroke-width: 0.5; }
+.outline { fill: none; stroke: var(--line-strong); stroke-width: 0.5; stroke-dasharray: 4 3; }
+
+.c-teal > rect, rect.c-teal { fill: var(--teal-f); stroke: var(--teal-s); }
+.c-teal > text { fill: var(--teal-t); }
+.c-purple > rect, rect.c-purple { fill: var(--purple-f); stroke: var(--purple-s); }
+.c-purple > text { fill: var(--purple-t); }
+.c-gray > rect, rect.c-gray { fill: var(--gray-f); stroke: var(--gray-s); }
+.c-gray > text { fill: var(--gray-t); }
+.c-red > rect, rect.c-red { fill: var(--red-f); stroke: var(--red-s); }
+.c-red > text { fill: var(--red-t); }
+
+.tile { transition: opacity 0.2s; }
+.tile.hide { opacity: 0; }
+.tile.dim { opacity: 0.3; }
+.tile.run > rect { stroke: var(--amber); stroke-width: 2.5; }
+.tile > rect.bar { fill: var(--amber); stroke: none; }
+#tl { cursor: pointer; }

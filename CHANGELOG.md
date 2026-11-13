@@ -3,6 +3,22 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+### Added
+- `trash-panda trace [FILE]` (`cli/trace.py`): shows a recorded run as a replay in the browser. A small server runs on this machine only (`127.0.0.1`, Python's `http.server`, no new dependency) until Ctrl+C; `--port` picks the port (0, the default, picks a free one) and `--no-open` prints the address without opening the browser. Without a file it shows the demo trace and says that it is made-up data. A file that is not a usable trace exits with code 1 and a message, before anything is served. The command does not import `torch`
+- A new package `trash_panda/ui/`: `load.py` reads and checks a trace (`load_trace`, `check_trace`, `TraceError`), `server.py` (`make_server`, `serve`) serves exactly four addresses (`/`, `/replay.js`, `/style.css` and `/trace.json`; anything else is a 404, `../` included) and reads the trace again on each request, so a refresh shows a new recording; a trace that cannot be read gives a 422 with a message that the page shows. `static/` holds the page (`index.html`, `style.css`, `replay.js`), and `dummy_trace.json` is made-up data to work on it with
+- The trace is a Chrome trace-event JSON file, so Perfetto opens it as a timeline, with one extra top-level section, `trashPanda`: the blocks and the tier each one is kept in, the number of pinned buffers, the duration, and optional `phases`. A slice has a category (`run`, `wait`, `read`, `stage`, `copy`), a track, and `args` with the block and, for a move, where it goes from and to (`disk`, `ram`, `pinned:N`, `gpu`). The format is a draft: nothing records a trace yet
+- The replay: the memory is stacked from the top down as Disk, RAM (with the pinned buffers inside it) and GPU memory (the blocks kept there and the streaming slot), and the labeled blocks move between them. Every block starts in the file, and the load puts the blocks that are kept in RAM or on the GPU where they stay, before the first pass. Below it a timeline with a track for each thread, the phases, a playhead (play, drag the slider, or click the timeline), and bars that show where each block's time went. A panel adds up loading, computing and waiting and says whether the sum matches the elapsed time, which is how a trace that misses events shows. It follows the light or dark setting of the browser
+- Tests for the trace file, the server and the command (43 new)
+
+### Changed
+- Docs: the code blocks that hold the tables of the command line now keep their box characters at the width of the letters (a font fallback for `U+2500` to `U+257F` in `stylesheets/extra.css`); the known issue "Automatic plans change from run to run" is removed, because the plan follows the memory that is free by design (`max_ram` or `resident_blocks` make it the same every time)
+
+### Notes
+- Only the viewer exists. No trace is recorded by `stage()`, `Coordinator` or the hooks yet, and where a recorded file will be written is not decided
+- Tried with the demo trace (8 blocks, 2 pinned buffers, one pass) in one browser, in dark mode. A model with many blocks or many passes is not handled well yet: the bands of slots wrap into more rows, there is no pass selector, no zoom on the timeline, and the list of bars grows with the number of blocks
+- Not in the docs yet. A RAM block that is mapped, not read into memory, is drawn as being in RAM; the trace has no field for that yet
+
 ## [0.2.0] - 2026-11-11
 ### Added
 - A command line, `trash-panda` (new package `trash_panda/cli/`: `app.py`, `plan.py`, `info.py`, `names.py`), installed with the extra `dumpsterpanda[cli]` (Typer and Rich, both optional: without them the command says which extra to install, and `import trash_panda` does not need them). `import trash_panda.cli` does not import `torch`; the commands do, when they run. The script is `trash_panda.cli:main`

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>trash-panda trace</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>trash-panda trace</h1>
+    <p id="meta"></p>
+  </header>
+  <p id="error" role="alert" hidden></p>
+  <section id="view" hidden>
+    <svg id="mem" role="img" aria-label="Disk, RAM with its pinned buffers, and the GPU, with the blocks moving between them"></svg>
+    <p id="caption" aria-live="polite"></p>
+    <div class="controls">
+      <button id="play" type="button">Play</button>
+      <input id="scrub" type="range" min="0" max="1" value="0" step="any" aria-label="Time in the run">
+      <span id="clock"></span>
+    </div>
+    <svg id="tl" role="img" aria-label="Timeline of the run, one track per thread"></svg>
+    <svg id="bars" role="img" aria-label="Time per block, split into reads, copies, waits and runs"></svg>
+  </section>
+</main>
+<script src="/replay.js"></script>
+</body>
+</html>
