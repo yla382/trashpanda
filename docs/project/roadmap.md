@@ -31,14 +31,6 @@ planned. Nothing here is promised or scheduled.
 
 * **More command-line commands**, such as a hardware report for bug reports. `trash-panda plan` and `trash-panda info`
   exist already (see the [command line guide](../guides/command-line.md))
-* **Visualizing the data flow, with a trace of a run**: the events the profile adds up today (block copies from RAM or
-  disk, waits for a copy, waits for the GPU, block runs, loader-thread loads, release steps) would be recorded with
-  their start and end times and written to a file in the Chrome trace-event format, which Perfetto and
-  `chrome://tracing` open as a timeline with a track per thread and stream. It would show each block moving between
-  tiers, the overlap of copying and compute, the stalls, the time each block of a final pass was freed, and blocks that
-  never start, which show as a gap in the timeline. It would be switched on by its own environment variable and be off
-  by default. A web interface of our own would only be needed for what a timeline cannot show, such as a view of the
-  plan, and a live interface would be a later step
 
 ## Reliability and project
 
