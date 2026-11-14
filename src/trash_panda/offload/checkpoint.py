@@ -150,6 +150,11 @@ class Checkpoint:
             self._stack.close()
         self._stack, self._handles = None, {}
 
+    @property
+    def mapped(self) -> bool:
+        """True inside `with checkpoint:`, when tensors are read through a memory map."""
+        return bool(self._handles)
+
     @staticmethod
     def _read_one(fh, info: TensorInfo) -> torch.Tensor:
         fh.seek(info.start)

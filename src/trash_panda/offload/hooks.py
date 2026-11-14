@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 
 from . import config
+from . import trace as _trace
 from .blocks import module_nbytes
 from .checkpoint import Checkpoint
 from .depth import DepthTuner
@@ -57,7 +58,7 @@ class OffloadHandle:
     def __init__(self) -> None:
         self._undo: List[Callable[[], None]] = []
         self._prefetcher = None
-        self._resident: List[Tuple[Callable[[], int], Callable[[], int]]] = []
+        self._resident: List[Tuple[Callable[[], int], Callable[[], int], Optional[str]]] = []      # (move out, move back, the block's name)
         self._released = False
         self._deferred = 0              # blocks whose hooks are not in yet: their weights are still loading, or they have not run
 
@@ -93,7 +94,7 @@ class OffloadHandle:
                 "loading or they have not run. Run the model once after the weights are loaded."
             )
         self._prefetcher.quiesce()
-        moved = sum(release() for release, _restore in self._resident)
+        moved = self._move_all(0, "release_gpu")
         self._released = True
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -103,8 +104,20 @@ class OffloadHandle:
         """Put the weights that release_gpu() moved back on the GPU. Returns the bytes moved, 0 if they were not released."""
         if not self._released:
             return 0
-        moved = sum(restore() for _release, restore in self._resident)
+        moved = self._move_all(1, "restore_gpu")
         self._released = False
+        return moved
+
+    def _move_all(self, which: int, what: str) -> int:
+        """Run the `which`-th function of every resident block (0 moves it out, 1 back); with a recording on, each move is an event."""
+        tr = getattr(self._prefetcher, "tr", None)
+        moved = 0
+        for item in self._resident:
+            began = tr.now() if tr is not None else 0
+            n = item[which]()
+            if tr is not None and item[2] is not None:
+                tr.move(item[2], what, n, began, tr.now())
+            moved += n
         return moved
 
 
@@ -185,18 +198,24 @@ class _PinnedPool:
         self.cursor  = 0
         self.wait_s  = 0.0             #seconds the worker spent waiting for a buffer's last GPU copy to finish
         self._warned = False
+        self.trace_kind = "stage"      #in a trace: "stage" (one model's pool) or "shared" (a Coordinator's)
 
-    def acquire(self, nbytes: int):
-        """(index, buffer) with room for nbytes, or None if pinned memory could not be allocated."""
+    def acquire(self, nbytes: int, tr=None):
+        """(index, buffer) with room for nbytes, or None if pinned memory could not be allocated. `tr` is the trace of the
+        model that asks, if one is recorded: it gets the wait and the allocation."""
         i = self.cursor
         self.cursor = (i + 1) % len(self.buffers)
         if self.events[i] is not None:
+            began = tr.now() if tr is not None else 0
             started = time.perf_counter()
             self.events[i].synchronize()
             self.wait_s += time.perf_counter() - started
             self.events[i] = None
+            if tr is not None:
+                tr.wait("pinned buffer", began, tr.now())
         buf = self.buffers[i]
         if buf is None or buf.numel() < nbytes:
+            began = tr.now() if tr is not None else 0
             try:
                 buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
             except RuntimeError as err: # pinning failed (not enough memory, or no CUDA)
@@ -209,6 +228,8 @@ class _PinnedPool:
                     )
                 return None
             self.buffers[i] = buf
+            if tr is not None:
+                tr.alloc(self, i, buf.numel(), began, tr.now())
         return i, buf
 
 
@@ -251,6 +272,7 @@ class _Prefetcher:
     """Copies the next block's compact tensors to the device on a second CUDA stream"""
 
     profile    = False
+    tr         = None                            # the trace of the model, when a recording is on
     order_path = None
     dropper    = None
     background_drop = False
@@ -267,6 +289,11 @@ class _Prefetcher:
         self.index      = (device.index if device.index is not None else torch.cuda.current_device()) if device.type == "cuda" else None
         self.stream      = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.last        = None
+        self.pass_no     = 0                         # the number of the pass in progress, from 1
+        self.tr          = None                      # the trace of the model, when a recording is on
+        self.run_begin   = None                      # the CUDA event before the block that is called, and when its call began
+        self.call_began  = 0
+        self.unwrapped_began, self.unwrapped_run = {}, {}      # the same, for the blocks that are not wrapped
         self.head        = None                      # the first block in the order the blocks were given
         self.hinted      = None                      # the last block handed over, in the order the blocks were given
         self.warned      = False
@@ -350,7 +377,7 @@ class _Prefetcher:
             if self.releases is not None:
                 self.release_peak = max(self.release_peak, self.releases.qsize())
 
-    def drop(self, held, tier: str, freed) -> None:
+    def drop(self, held, tier: str, freed, traced=None) -> None:
         """Final pass: let go of the tensors a block stored (`held`: the entry's slots and scales, already taken out of
         the entry) and announce the block (`freed`: its name, tier and bytes, or None if nobody is watching).
 
@@ -363,13 +390,16 @@ class _Prefetcher:
             event = self._compute_event() if freed is not None and self.releases is not None else None
             if self.dropper is None:
                 self.dropper = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trash-panda-drop")
-            self.dropper.submit(self._drop_job, held, freed, event)
+            self.dropper.submit(self._drop_job, held, freed, event, traced)
             return
         self._drop_job(held, freed, None)
 
-    def _drop_job(self, held, freed, event) -> None:
+    def _drop_job(self, held, freed, event, traced=None) -> None:
+        began = self.tr.now() if traced is not None and self.tr is not None else 0
         for part in held:
             part.clear()
+        if traced is not None and self.tr is not None:                    # (name, bytes) of a RAM-tier block, dropped on the drop thread
+            self.tr.drop(traced[0], traced[1], began, self.tr.now())
         if freed is not None:
             if event is None:
                 self.announce(*freed)
@@ -415,6 +445,9 @@ class _Prefetcher:
                 self.tuner.stop()
                 return
             self.pool.grow(depth)
+            _trace.pool_changed(self.pool)
+        if self.tr is not None:
+            self.tr.lookahead(self.lookahead, depth)
         self.lookahead = depth
         if self.plan is not None:                     # the staging the plan reserved and the look-ahead no longer uses
             self.plan.spare_staging_bytes = max(self.planned - self.lookahead, 0) * self.largest
@@ -425,6 +458,7 @@ class _Prefetcher:
         if self.first is None:
             self.first = entry
         if entry is self.first:
+            self.pass_no += 1
             now = time.perf_counter()
             if self.began is not None:
                 self.pass_waits.append((now - self.began, self.waited - self.waited0))
@@ -485,7 +519,10 @@ class _Prefetcher:
         if event is None:
             return
         started = time.perf_counter() if self.profile else 0.0
+        began = self.tr.now() if self.tr is not None else 0
         event.wait()
+        if self.tr is not None:
+            self.tr.wait("loader", began, self.tr.now(), name)
         if self.profile:
             self.stats["wait_loader_s"] += time.perf_counter() - started
         if name not in self.ready:
@@ -552,7 +589,10 @@ class _Prefetcher:
         limit = config.current().blocks_in_flight if limit is None else limit
         started = time.perf_counter() if self.profile else 0.0
         while len(self.in_flight) >= limit:
+            began = self.tr.now() if self.tr is not None else 0
             self.in_flight.popleft().synchronize()
+            if self.tr is not None:
+                self.tr.wait("gpu", began, self.tr.now())
         if self.profile:
             self.stats["wait_gpu_s"] += time.perf_counter() - started
 
@@ -582,10 +622,12 @@ class _Prefetcher:
 
         total = sum(_aligned(t.numel() * t.element_size()) for _n, _k, t in sources if t.device.type == "cpu")
         self.largest = max(self.largest, total)
-        got = self.pool.acquire(total) if total else None
+        got = (self.pool.acquire(total) if self.tr is None else self.pool.acquire(total, self.tr)) if total else None
+        began_job = self.tr.now() if self.tr is not None else 0
 
         staged = {}
         with torch.cuda.stream(self.stream):
+            copy_begin = self.tr.gpu_event() if self.tr is not None else None
             offset = 0
             for name, kind, t  in sources:
                 if t.device.type != "cpu" or got is None:
@@ -601,10 +643,13 @@ class _Prefetcher:
                     offset += _aligned(n)
                     staged[(name, kind)] = view.to(self.device, non_blocking=True)
             
-            event = torch.cuda.Event()
+            event = (torch.cuda.Event(enable_timing=True) if self.tr is not None else torch.cuda.Event())
             event.record(self.stream)
         if got is not None:
             self.pool.release(got[0], event)
+            if self.tr is not None:
+                self.tr.job(self.pool, "stage", entry.name, got[0], entry.stored_nbytes(), began_job, self.tr.now())
+                self.tr.copy(self.pool, entry.name, got[0], entry.stored_nbytes(), copy_begin, event)
 
         tensors = {name: (staged[(name, 0)], staged.get((name, 1))) for name, *_ in entry.slots}
         return tensors, event
@@ -616,10 +661,12 @@ class _Prefetcher:
             self.stats["disk_blocks"] += 1
         total = sum(_aligned(info.nbytes) for _name, _kind, info in specs)
         self.largest = max(self.largest, total)
-        got   = self.pool.acquire(total)
+        got   = self.pool.acquire(total) if self.tr is None else self.pool.acquire(total, self.tr)
+        began_job = self.tr.now() if self.tr is not None else 0
 
         staged = {}
         with torch.cuda.stream(self.stream):
+            copy_begin = self.tr.gpu_event() if self.tr is not None else None
             offset = 0
             for name, kind, info in specs:
                 if got is None:
@@ -634,10 +681,14 @@ class _Prefetcher:
                     self.stats["disk_read_gb"] += info.nbytes / 1e9
                 tensor = part.view(info.torch_dtype).reshape(info.shape)
                 staged[(name, kind)] = tensor.to(self.device, non_blocking=True)
-            event = torch.cuda.Event()
+            event = (torch.cuda.Event(enable_timing=True) if self.tr is not None else torch.cuda.Event())
             event.record(self.stream)
         if got is not None:
             self.pool.release(got[0], event)
+            if self.tr is not None:
+                nbytes = sum(info.nbytes for _name, _kind, info in specs)
+                self.tr.job(self.pool, "read", entry.name, got[0], nbytes, began_job, self.tr.now())
+                self.tr.copy(self.pool, entry.name, got[0], nbytes, copy_begin, event)
 
         tensors = {name: (staged[(name, 0)], staged.get((name, 1))) for name in entry.reader.entries}
         return tensors, event
@@ -651,6 +702,7 @@ class _Prefetcher:
             return None
         ready = staged.done()
         started = time.perf_counter()
+        began = self.tr.now() if self.tr is not None else 0
         try:
             tensors, event = staged.result()  # wait until the worker has issued the copies
         except Exception:
@@ -658,6 +710,8 @@ class _Prefetcher:
             traceback.print_exc()             # never hide a failure in the worker
             return None                       # fall back to the plain copy in bring()
         waited = time.perf_counter() - started
+        if self.tr is not None:
+            self.tr.wait("staged", began, self.tr.now(), entry.name)
         self.waited += waited
         if self.profile:
             self.stats["wait_staged_s"] += waited
@@ -891,16 +945,30 @@ def offload_blocks(
         reader = disk(block) if disk is not None else None
         if not _needs_wrapping(slots, scales, dev, compute_dtype, reader):
             def free_after_run(module, _inputs, _output, _label=label):
+                tr = prefetcher.tr
+                ran = None
+                if tr is not None and _label is not None:
+                    pass_no = tr.pass_for_unwrapped(prefetcher.pass_no, _label)
+                    ran = tr.run_end(prefetcher.unwrapped_run.pop(_label, None), _label, pass_no)
+                    tr.call(_label, pass_no, prefetcher.unwrapped_began.pop(_label, 0), tr.now())
                 if prefetcher.final:
-                    held = _loaded_nbytes(module) if prefetcher.watching else 0
+                    held = _loaded_nbytes(module) if (prefetcher.watching or tr is not None) else 0
                     _to_meta(module)
-                    if held:
+                    if tr is not None and _label is not None:
+                        tr.free(_label, "gpu", held, ran)
+                    if held and prefetcher.watching:
                         prefetcher.announce(_label, "gpu", held)
 
             hook = block.register_forward_hook(free_after_run)
             handle._add(hook.remove)
             if label is not None:                        # not wrapped, so only note when it starts
-                note = block.register_forward_pre_hook(lambda _module, _args, n=label: prefetcher.note(n))
+                def noted(_module, _args, n=label):
+                    prefetcher.note(n)
+                    if prefetcher.tr is not None:
+                        prefetcher.unwrapped_began[n] = prefetcher.tr.now()
+                        prefetcher.unwrapped_run[n] = prefetcher.tr.run_begin()
+
+                note = block.register_forward_pre_hook(noted)
                 handle._add(note.remove)
             if dev.type == "cuda":
                 def move_out(block=block):
@@ -912,7 +980,7 @@ def offload_blocks(
                     block.to(dev)
                     return _loaded_nbytes(block)
 
-                handle._resident.append((move_out, move_back))
+                handle._resident.append((move_out, move_back, label))
             continue
 
         entry  = _Entry(slots, scales, reader)
@@ -925,6 +993,9 @@ def offload_blocks(
             if staged is None and prefetcher.lookahead > 0 and entry.needs_copy():
                 prefetcher.stage(entry)
                 staged = prefetcher.take(entry)
+            if prefetcher.tr is not None:                      # the waits are over: the block's work begins
+                prefetcher.run_begin = prefetcher.tr.run_begin()
+                prefetcher.call_began = prefetcher.tr.now()
             data = None
             if staged is None and entry.reader is not None:
                 data = entry.reader.read()
@@ -960,14 +1031,22 @@ def offload_blocks(
             try:
                 return _orig(*args, **kwargs)
             finally:
+                tr = prefetcher.tr
+                ran = None
+                if tr is not None:                             # the block's kernels are queued: its run on the GPU ends at this event
+                    ran = tr.run_end(prefetcher.run_begin, _entry.name, prefetcher.pass_no)
+                    tr.call(_entry.name, prefetcher.pass_no, prefetcher.call_began, tr.now())
                 if prefetcher.final:
                     tier = _entry.tier()
-                    freed = (_entry.name, tier, _entry.stored_nbytes()) if prefetcher.watching else None
+                    stored = _entry.stored_nbytes()
+                    freed = (_entry.name, tier, stored) if prefetcher.watching else None
                     held = [list(_entry.slots), dict(_entry.scales)]   # the entry holds the original tensors: these keep the memory alive
                     _entry.slots.clear()
                     _entry.scales.clear()
                     _to_meta(_block)
-                    prefetcher.drop(held, tier, freed)
+                    if tr is not None and tier != "ram":
+                        tr.free(_entry.name, tier, stored if tier == "gpu" else 0, ran if tier == "gpu" else None)
+                    prefetcher.drop(held, tier, freed, (_entry.name, stored) if tr is not None and tier == "ram" else None)
                 else:
                     _restore()
                 prefetcher.block_done()
@@ -988,7 +1067,7 @@ def offload_blocks(
             def move_back(entry=entry):
                 return _move_entry(entry, dev)
 
-            handle._resident.append((move_out, move_back))
+            handle._resident.append((move_out, move_back, entry.name))
 
     return handle
 
@@ -1008,11 +1087,20 @@ def _defer_block(block: nn.Module, name: str, pre: "_Prefetcher", handle: Offloa
         pre.note(name)
         if "forward" in block.__dict__:                   # wrapped: its own forward does the rest
             return block.forward(*args, **kwargs)
+        tr = pre.tr                                       # not wrapped: the hooks that record it start with the next call, so this one is recorded here
+        began, begin = (tr.now(), tr.run_begin()) if tr is not None else (0, None)
         out = block.forward(*args, **kwargs)              # not wrapped: the hook that frees it starts with the next call
+        ran = None
+        if tr is not None:
+            pass_no = tr.pass_for_unwrapped(pre.pass_no, name)
+            ran = tr.run_end(begin, name, pass_no)
+            tr.call(name, pass_no, began, tr.now())
         if pre.final:
-            held = _loaded_nbytes(block) if pre.watching else 0
+            held = _loaded_nbytes(block) if (pre.watching or tr is not None) else 0
             _to_meta(block)
-            if held:
+            if tr is not None:
+                tr.free(name, "gpu", held, ran)
+            if held and pre.watching:
                 pre.announce(name, "gpu", held)
         return out
 
@@ -1112,6 +1200,7 @@ def install_offload(
     handle._add(pre.close) #registered first, so it runs last on remove()
     handle._prefetcher = pre
     pre.plan, pre.planned = plan, pre.lookahead
+    pre.tr = getattr(state, "trace", None)
     if order is None and state is not None:
         pre.order_path = order_path(state.checkpoint.path, order_file_destination)
         saved = read_order(pre.order_path, {b.prefix.rstrip(".") for b in plan.blocks})

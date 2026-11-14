@@ -2,7 +2,7 @@
 
 Two commands look at a checkpoint without loading it. `trash-panda info` says what is in the file, and
 `trash-panda plan` says where the blocks of the model would live on this machine. Both read only the headers of the
-safetensors file; no weights are loaded.
+safetensors file; no weights are loaded. A third, `trash-panda trace`, shows a run that was recorded, in the browser.
 
 ## Install
 
@@ -135,6 +135,83 @@ WARNING: 4 blocks will be read from disk on every pass; this is slow unless the 
 `--blocks` also prints one row for every block with its tier. All options are on the
 [command line reference](../reference/cli.md); they are the arguments of
 [`plan()`](../reference/planning.md#trash_panda.offload.planner.plan).
+
+## `trash-panda trace`
+
+`plan` says what would happen. `trace` shows what did happen: a run that was recorded, replayed in the browser.
+
+### Recording a run
+
+Set `TRASH_PANDA_TRACE` to `1` before the run:
+
+```powershell
+$env:TRASH_PANDA_TRACE = "1"
+```
+
+In bash, use `export TRASH_PANDA_TRACE=1`. The run is recorded from the start of a `stage()` block, or of a
+`with Coordinator` block, until that block ends. The file is written then, also when the block raises, and its path is
+printed:
+
+```text
+trash-panda: trace written to C:\Users\you\.cache\trash_panda\traces\20261114-143310-869.json
+```
+
+* The file goes to the trace folder: `TRASH_PANDA_TRACE_DIR`, or by default the `traces` folder of the cache folder
+  (`TRASH_PANDA_HOME`, or by default `~/.cache/trash_panda`). The folder is made if it is missing.
+* The name is the time the recording began, to the millisecond, so every recording is a new file and the names sort by
+  time.
+* A file holds one recording. A `Coordinator` records all its models in one file. A `stage()` that runs while another
+  recording is open adds its model to that recording. Two `stage()` calls one after the other each write a file.
+* Recording adds CUDA timing events and a timestamp to each block, copy and wait. The cost has not been measured, so take
+  timings from a run without it.
+* Without `TRASH_PANDA_TRACE` nothing is recorded, and the recording hooks do nothing.
+
+### Viewing it
+
+```
+trash-panda trace            # the newest recording
+trash-panda trace FILE       # one file
+```
+
+A small server runs on this machine only (`127.0.0.1`) and the browser opens; press Ctrl+C to stop it. `--port` picks the
+port and `--no-open` only prints the address. The page shows, from the top:
+
+* **Models in this run**: a lane for each model on one time axis, with its phases (`load`, `pass 1`, ...) and the work it
+  did in the background before its turn. Click a lane to select the model.
+* **Disk, RAM and GPU**: the blocks of every model, each model in its own color and tag, moving between the tiers while
+  the run plays or when you drag the slider. RAM holds the pinned buffers of each pool: a model's own, the shared pool of
+  a `Coordinator`, and the two buffers of an early loader. A tile that is being read through ordinary memory stands in RAM,
+  in no slot of its own.
+* **Timeline**: a track for each thread and CUDA stream (the main thread, the worker, the loader threads, the compute
+  stream, the copy streams). The wheel zooms, a drag pans and a click moves the playhead. A gap in the GPU's work is drawn as
+  idle; it is worked out from the runs, not recorded.
+* **Memory in use**: VRAM, RAM and pinned memory over time, stacked by model, against the budgets of the plans. It is
+  worked out from the events; activations and what other programs use are not counted.
+* **The time of each block**, and the panels at the sides: what happens at the playhead, the totals of the selected model
+  (loading, running, waiting) and of the whole run, and the plan of the selected model.
+
+At the left is the list of the recordings in the trace folder, newest first. Click one to open it; the button at the top
+folds the list away. The list only reads: nothing on the page changes a file. What the page does not show is listed at the
+bottom of the page, and in [the viewer notes](../design/trace-viewer.md).
+
+### Listing and removing recordings
+
+```
+trash-panda trace --list
+```
+
+prints a table of the trace folder: the file, when it was written, its size, its duration and its models. A file that is not
+a trace shows `invalid`.
+
+```
+trash-panda trace --clean --keep 10
+trash-panda trace --clean --older-than 30d
+```
+
+removes recordings. `--keep N` keeps the newest N and removes the others. `--older-than` takes a number and `m`, `h`, `d` or
+`w` (`90m`, `12h`, `30d`, `2w`). With both, a file is removed only if it is beyond the newest N and older than the age;
+with neither, every file is removed. The command lists the files and asks before it deletes them, unless you pass `--yes`.
+Recording never deletes anything. All the options are on the [command line reference](../reference/cli.md).
 
 ## Good to know
 

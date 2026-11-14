@@ -17,12 +17,13 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from . import config
+from . import trace as _trace
 from .checkpoint import Checkpoint, name_resolver
 from .formats import (
     SCALE_SUFFIX,
@@ -45,12 +46,20 @@ def _read_pair(ck: Checkpoint, key: str, scale_key: Optional[str]):
     return ck.read_tensor(key), (ck.read_tensor(scale_key) if scale_key is not None else None)
 
 
+def _read_pair_timed(ck: Checkpoint, key: str, scale_key: Optional[str], tr):
+    """The same, for a recording: (the pair, when it began, when it ended, the track of this thread)."""
+    began = tr.now()
+    pair = _read_pair(ck, key, scale_key)
+    return pair, began, tr.now(), tr.thread_track()
+
+
 class DeferredLoad:
     """The tensors of resident blocks that stream_load() left on the meta device, to be loaded one block at a time."""
 
-    def __init__(self, items: Dict[str, list], store: Callable) -> None:
+    def __init__(self, items: Dict[str, list], store: Callable, trace: Any = None) -> None:
         self.items  = items           # block prefix -> [(key, target, has_scale, scale_key), ...]
         self._store = store
+        self.trace  = trace           # the trace of the model, when a recording is on
         self.loaded = set()           # prefixes that are on the compute device already
         self._lock  = threading.Lock()
 
@@ -90,6 +99,7 @@ class OffloadState:
     checkpoint: Checkpoint
     disk_keys: Dict[str, Tuple[str, Optional[str]]] = field(default_factory=dict)   # param name -> (key, scale key)
     deferred: Optional[DeferredLoad] = None
+    trace: Any = None                 # the trace of the model, when a recording is on
 
 
 def _navigate(module: nn.Module, name: str) -> Tuple[nn.Module, str]:
@@ -164,6 +174,7 @@ def stream_load(
     Returns a LoadReport (print it) and remembers the settings on the model for install_offload().
     """
     began_all = time.perf_counter()
+    tr = _trace.loading_model()                              # the trace of the model that this thread is loading, if one is recorded
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     if plan is not None:
         cdt, sdt = plan.compute_dtype, plan.storage_dtype
@@ -204,6 +215,7 @@ def stream_load(
 
     def store(key: str, target: str, tier: str, has_scale: bool, scale_key: str, preloaded=None, copy=None) -> None:
         """Put one tensor where its tier says. It is read here, unless `preloaded` already holds it and its scale."""
+        began = tr.now() if tr is not None else 0
         if preloaded is None:
             raw = ck.get_tensor(key)
             scale = ck.get_tensor(scale_key) if has_scale else None
@@ -232,6 +244,10 @@ def stream_load(
                 _set_scale(model, target, scale)
                 nbytes += scale.numel() * scale.element_size()
             report.add(tier, nbytes, kind.value if kind is not None else None)
+            if tr is not None and tier == "gpu_raw":
+                tr.load(target, nbytes, began, tr.now(), "chunked" if copy is not None else "mmap" if ck.mapped else "read")
+            elif tr is not None and tier == "ram" and preloaded is None:     # left mapped from the file: nothing is read now
+                tr.mapped(target, nbytes)
 
     with ck:
         for key in ck.keys():
@@ -285,9 +301,16 @@ def stream_load(
         if ram_jobs:                                        # one big read per tensor, several at a time, in the order of the file
             began = time.perf_counter()
             with ThreadPoolExecutor(max_workers=max(cfg.ram_read_threads, 1)) as pool:
-                reads = [pool.submit(_read_pair, ck, key, scale_key if has_scale else None) for key, _t, has_scale, scale_key in ram_jobs]
+                def submit(key, has_scale, scale_key):
+                    scale = scale_key if has_scale else None
+                    return pool.submit(_read_pair, ck, key, scale) if tr is None else pool.submit(_read_pair_timed, ck, key, scale, tr)
+
+                reads = [submit(key, has_scale, scale_key) for key, _t, has_scale, scale_key in ram_jobs]
                 for (key, target, has_scale, scale_key), read in zip(ram_jobs, reads):
                     pair = read.result()
+                    if tr is not None:
+                        pair, read_began, read_ended, read_track = pair
+                        tr.read_ram(target, sum(t.numel() * t.element_size() for t in pair if t is not None), read_began, read_ended, read_track)
                     ram_read["bytes"] += sum(t.numel() * t.element_size() for t in pair if t is not None)
                     store(key, target, "ram", has_scale, scale_key, preloaded=pair)
             ram_read["seconds"] = time.perf_counter() - began
@@ -321,6 +344,6 @@ def stream_load(
 
     model._trash_panda_state = OffloadState(
         plan=plan, device=device, compute_dtype=cdt, checkpoint=ck, disk_keys=disk_keys,
-        deferred=DeferredLoad(deferred_items, store) if deferred_items else None,
+        deferred=DeferredLoad(deferred_items, store, tr) if deferred_items else None, trace=tr,
     )
     return report

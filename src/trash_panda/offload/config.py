@@ -53,6 +53,7 @@ class Defaults:
 
     # diagnostics
     profile: bool = False                       # print where the prefetching spent its time
+    trace: bool = False                         # record the run in a trace file (docs/design/trace-format.md), in TRASH_PANDA_TRACE_DIR
 
 
 DEFAULTS = Defaults()

@@ -149,6 +149,23 @@ GPU budget: 400.0 MB allowed by --max-vram, less 50.0 MB kept for activations
 RAM budget: 150.0 MB allowed by --max-ram, less 67.1 MB kept for the system and copy buffers
 ```
 
+### Trace viewer
+
+To see what a run really did, switch recording on and open the recording afterwards. With `TRASH_PANDA_TRACE=1` set, a
+trace file is written when the `stage()` or `Coordinator` block ends, into `TRASH_PANDA_TRACE_DIR` (by default
+`~/.cache/trash_panda/traces`):
+
+```
+trash-panda trace            # open the newest recording in the browser
+trash-panda trace --list     # list the recordings
+```
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/yla382/trashpanda/main/assets/trace-viewer-demo.gif" width="800" alt="The trace viewer replaying a pipeline of three models: blocks moving between disk, RAM and the GPU, and a timeline">
+</p>
+
+The recording above is an example trace (made-up data, not a measurement).
+
 ## Documentation
 
 * [Quick start](https://yla382.github.io/trashpanda/quickstart/): from install to a first run

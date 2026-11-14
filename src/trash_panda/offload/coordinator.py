@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Optional, Tuple
 
 from . import config
+from . import trace as _trace
 from .hooks import _PinnedPool, _empty_host_cache
 from .stage import PendingStage, preload
 from .stage import stage as open_stage
@@ -81,11 +82,14 @@ class Coordinator:
         self.pool: Optional[_PinnedPool] = None
         self._pending: Optional[Tuple[str, PendingStage]] = None        # (name of the step, the model loading for it)
         self._busy = False
+        self._recording = False
 
     def __enter__(self) -> "Coordinator":
         if self.pool is not None:
             raise RuntimeError("this Coordinator is already in a `with` block")
         self.pool = _PinnedPool()
+        self.pool.trace_kind = "shared"
+        self._recording = _trace.open_session(coordinated=True)       # one recording for the whole `with` block
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -95,6 +99,7 @@ class Coordinator:
             self.pool = None
             gc.collect()
             _empty_host_cache()
+            _trace.close_session(self._recording)
         return False
 
     def _step(self, name: str) -> Step:
@@ -162,4 +167,5 @@ class Coordinator:
         cycles through all the buffers there are, so extra ones would be pinned for nothing. The pool keeps the
         configured number of buffers, at the size they grew to."""
         if self.pool is not None and self.pool.trim(config.current().pinned_buffers):
+            _trace.pool_changed(self.pool)
             _empty_host_cache()

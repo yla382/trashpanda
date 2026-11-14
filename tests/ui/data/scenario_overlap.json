@@ -1,0 +1,1782 @@
+{
+ "displayTimeUnit": "ms",
+ "trashPanda": {
+  "version": 2,
+  "note": "stage(overlap=True): the loader thread loads the kept blocks while the model already runs; two passes",
+  "duration_us": 1312500,
+  "models": [
+   {
+    "id": "m",
+    "name": "model",
+    "started_by": "stage",
+    "checkpoint": {
+     "path": "model.safetensors",
+     "bytes": 201326592
+    },
+    "dtypes": {
+     "stored": "fp16",
+     "compute": "bf16"
+    },
+    "blocks": [
+     {
+      "id": 0,
+      "name": "blocks.0.",
+      "tier": "gpu",
+      "stored_bytes": 25165824,
+      "expanded_bytes": 50331648
+     },
+     {
+      "id": 1,
+      "name": "blocks.1.",
+      "tier": "gpu",
+      "stored_bytes": 25165824,
+      "expanded_bytes": 50331648
+     },
+     {
+      "id": 2,
+      "name": "blocks.2.",
+      "tier": "gpu",
+      "stored_bytes": 25165824,
+      "expanded_bytes": 50331648
+     },
+     {
+      "id": 3,
+      "name": "blocks.3.",
+      "tier": "ram",
+      "stored_bytes": 25165824,
+      "expanded_bytes": 50331648
+     },
+     {
+      "id": 4,
+      "name": "blocks.4.",
+      "tier": "disk",
+      "stored_bytes": 25165824,
+      "expanded_bytes": 50331648
+     },
+     {
+      "id": 5,
+      "name": "blocks.5.",
+      "tier": "ram",
+      "stored_bytes": 25165824,
+      "expanded_bytes": 50331648
+     },
+     {
+      "id": 6,
+      "name": "blocks.6.",
+      "tier": "disk",
+      "stored_bytes": 25165824,
+      "expanded_bytes": 50331648
+     },
+     {
+      "id": 7,
+      "name": "blocks.7.",
+      "tier": "ram",
+      "stored_bytes": 25165824,
+      "expanded_bytes": 50331648
+     }
+    ],
+    "outside_bytes": 12582912,
+    "plan": {
+     "vram_budget": 1006632960,
+     "ram_budget": 301989888,
+     "headroom_bytes": 25165824,
+     "stream_buffer_bytes": 65431142,
+     "staging_bytes": 50331648,
+     "lookahead": 2,
+     "warnings": [
+      "2 blocks will be read from disk on every pass; this is slow unless the drive is fast (NVMe)."
+     ]
+    },
+    "options": {
+     "overlap": true,
+     "ram_in_memory": true,
+     "pinned_buffers": 2,
+     "blocks_in_flight": 2,
+     "adaptive_lookahead": false
+    },
+    "pool": "pool-m"
+   }
+  ],
+  "tracks": [
+   {
+    "id": 1,
+    "name": "main thread",
+    "kind": "cpu",
+    "role": "main"
+   },
+   {
+    "id": 2,
+    "name": "compute stream",
+    "kind": "gpu",
+    "role": "compute_stream"
+   },
+   {
+    "id": 3,
+    "name": "model worker thread",
+    "kind": "cpu",
+    "role": "worker",
+    "model": "m"
+   },
+   {
+    "id": 4,
+    "name": "model copy stream",
+    "kind": "gpu",
+    "role": "copy_stream",
+    "model": "m"
+   },
+   {
+    "id": 5,
+    "name": "model stream_load reader",
+    "kind": "cpu",
+    "role": "reader",
+    "model": "m"
+   },
+   {
+    "id": 6,
+    "name": "model loader thread",
+    "kind": "cpu",
+    "role": "loader",
+    "model": "m"
+   }
+  ],
+  "pools": [
+   {
+    "id": "pool-m",
+    "kind": "stage",
+    "buffers": 2,
+    "models": [
+     "m"
+    ]
+   }
+  ],
+  "phases": [
+   {
+    "model": "m",
+    "name": "load",
+    "start_us": 0,
+    "end_us": 120000
+   },
+   {
+    "model": "m",
+    "name": "pass 1",
+    "start_us": 120000,
+    "end_us": 593750
+   },
+   {
+    "model": "m",
+    "name": "pass 2",
+    "start_us": 730750,
+    "end_us": 1154500
+   }
+  ]
+ },
+ "traceEvents": [
+  {
+   "name": "thread_name",
+   "ph": "M",
+   "pid": 1,
+   "tid": 1,
+   "args": {
+    "name": "main thread"
+   }
+  },
+  {
+   "name": "thread_name",
+   "ph": "M",
+   "pid": 1,
+   "tid": 2,
+   "args": {
+    "name": "compute stream"
+   }
+  },
+  {
+   "name": "thread_name",
+   "ph": "M",
+   "pid": 1,
+   "tid": 3,
+   "args": {
+    "name": "model worker thread"
+   }
+  },
+  {
+   "name": "thread_name",
+   "ph": "M",
+   "pid": 1,
+   "tid": 4,
+   "args": {
+    "name": "model copy stream"
+   }
+  },
+  {
+   "name": "thread_name",
+   "ph": "M",
+   "pid": 1,
+   "tid": 5,
+   "args": {
+    "name": "model stream_load reader"
+   }
+  },
+  {
+   "name": "thread_name",
+   "ph": "M",
+   "pid": 1,
+   "tid": 6,
+   "args": {
+    "name": "model loader thread"
+   }
+  },
+  {
+   "name": "read b3",
+   "cat": "read",
+   "ph": "X",
+   "pid": 1,
+   "tid": 5,
+   "ts": 0,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "bytes": 25165824,
+    "from": "disk",
+    "to": "ram"
+   }
+  },
+  {
+   "name": "read b5",
+   "cat": "read",
+   "ph": "X",
+   "pid": 1,
+   "tid": 5,
+   "ts": 40000,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 5,
+    "bytes": 25165824,
+    "from": "disk",
+    "to": "ram"
+   }
+  },
+  {
+   "name": "read b7",
+   "cat": "read",
+   "ph": "X",
+   "pid": 1,
+   "tid": 5,
+   "ts": 80000,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 7,
+    "bytes": 25165824,
+    "from": "disk",
+    "to": "ram"
+   }
+  },
+  {
+   "name": "load b0",
+   "cat": "load",
+   "ph": "X",
+   "pid": 1,
+   "tid": 6,
+   "ts": 120000,
+   "dur": 50000,
+   "args": {
+    "model": "m",
+    "block": 0,
+    "bytes": 25165824,
+    "source": "read",
+    "from": "disk",
+    "via": "ram",
+    "to": "gpu"
+   }
+  },
+  {
+   "name": "wait for b0 to load",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 120000,
+   "dur": 50000,
+   "args": {
+    "model": "m",
+    "block": 0,
+    "reason": "loader"
+   }
+  },
+  {
+   "name": "load b1",
+   "cat": "load",
+   "ph": "X",
+   "pid": 1,
+   "tid": 6,
+   "ts": 170000,
+   "dur": 50000,
+   "args": {
+    "model": "m",
+    "block": 1,
+    "bytes": 25165824,
+    "source": "read",
+    "from": "disk",
+    "via": "ram",
+    "to": "gpu"
+   }
+  },
+  {
+   "name": "pin a buffer",
+   "cat": "alloc",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 170000,
+   "dur": 6000,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "bytes": 33554432
+   }
+  },
+  {
+   "name": "call b0 (pass 1)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 170000,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 0,
+    "pass": 1
+   }
+  },
+  {
+   "name": "run b0 (pass 1)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 170750,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 0,
+    "pass": 1
+   }
+  },
+  {
+   "name": "wait for b1 to load",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 173000,
+   "dur": 47000,
+   "args": {
+    "model": "m",
+    "block": 1,
+    "reason": "loader"
+   }
+  },
+  {
+   "name": "acquire pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 176000,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 3
+   }
+  },
+  {
+   "name": "stage b3 (pass 1)",
+   "cat": "stage",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 176000,
+   "dur": 30000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "ram",
+    "to": "pinned:1",
+    "source": "memory"
+   }
+  },
+  {
+   "name": "copy b3 (pass 1)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 206000,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:1",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "pin a buffer",
+   "cat": "alloc",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 206000,
+   "dur": 6000,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "bytes": 33554432
+   }
+  },
+  {
+   "name": "acquire pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 212000,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 4
+   }
+  },
+  {
+   "name": "read b4 (pass 1)",
+   "cat": "read",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 212000,
+   "dur": 120000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "disk",
+    "to": "pinned:2"
+   }
+  },
+  {
+   "name": "load b2",
+   "cat": "load",
+   "ph": "X",
+   "pid": 1,
+   "tid": 6,
+   "ts": 220000,
+   "dur": 50000,
+   "args": {
+    "model": "m",
+    "block": 2,
+    "bytes": 25165824,
+    "source": "read",
+    "from": "disk",
+    "via": "ram",
+    "to": "gpu"
+   }
+  },
+  {
+   "name": "call b1 (pass 1)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 220000,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 1,
+    "pass": 1
+   }
+  },
+  {
+   "name": "wait for b2 to load",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 223000,
+   "dur": 47000,
+   "args": {
+    "model": "m",
+    "block": 2,
+    "reason": "loader"
+   }
+  },
+  {
+   "name": "run b1 (pass 1)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 240750,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 1,
+    "pass": 1
+   }
+  },
+  {
+   "name": "release pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 246000,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 3
+   }
+  },
+  {
+   "name": "call b2 (pass 1)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 270000,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 2,
+    "pass": 1
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 273000,
+   "dur": 37750,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "run b2 (pass 1)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 310750,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 2,
+    "pass": 1
+   }
+  },
+  {
+   "name": "call b3 (pass 1)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 310750,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "pass": 1
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 313750,
+   "dur": 67000,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "copy b4 (pass 1)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 332000,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:2",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "acquire pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 332000,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 5
+   }
+  },
+  {
+   "name": "stage b5 (pass 1)",
+   "cat": "stage",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 332000,
+   "dur": 30000,
+   "args": {
+    "model": "m",
+    "block": 5,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "ram",
+    "to": "pinned:1",
+    "source": "memory"
+   }
+  },
+  {
+   "name": "release pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 372000,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 4
+   }
+  },
+  {
+   "name": "copy b5 (pass 1)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 372000,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 5,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:1",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "run b3 (pass 1)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 380750,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "pass": 1
+   }
+  },
+  {
+   "name": "acquire pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 380750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 6
+   }
+  },
+  {
+   "name": "read b6 (pass 1)",
+   "cat": "read",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 380750,
+   "dur": 120000,
+   "args": {
+    "model": "m",
+    "block": 6,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "disk",
+    "to": "pinned:2"
+   }
+  },
+  {
+   "name": "call b4 (pass 1)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 380750,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "pass": 1
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 383750,
+   "dur": 67000,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "release pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 412000,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 5
+   }
+  },
+  {
+   "name": "run b4 (pass 1)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 450750,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "pass": 1
+   }
+  },
+  {
+   "name": "call b5 (pass 1)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 450750,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 5,
+    "pass": 1
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 453750,
+   "dur": 67000,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "copy b6 (pass 1)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 500750,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 6,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:2",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "acquire pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 500750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 7
+   }
+  },
+  {
+   "name": "stage b7 (pass 1)",
+   "cat": "stage",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 500750,
+   "dur": 30000,
+   "args": {
+    "model": "m",
+    "block": 7,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "ram",
+    "to": "pinned:1",
+    "source": "memory"
+   }
+  },
+  {
+   "name": "run b5 (pass 1)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 520750,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 5,
+    "pass": 1
+   }
+  },
+  {
+   "name": "call b6 (pass 1)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 520750,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 6,
+    "pass": 1
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 523750,
+   "dur": 67000,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "release pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 540750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 6
+   }
+  },
+  {
+   "name": "copy b7 (pass 1)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 540750,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 7,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:1",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "release pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 580750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 7
+   }
+  },
+  {
+   "name": "run b6 (pass 1)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 590750,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 6,
+    "pass": 1
+   }
+  },
+  {
+   "name": "call b7 (pass 1)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 590750,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 7,
+    "pass": 1
+   }
+  },
+  {
+   "name": "run b7 (pass 1)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 660750,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 7,
+    "pass": 1
+   }
+  },
+  {
+   "name": "acquire pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 730750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 3
+   }
+  },
+  {
+   "name": "stage b3 (pass 2)",
+   "cat": "stage",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 730750,
+   "dur": 30000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "ram",
+    "to": "pinned:2",
+    "source": "memory"
+   }
+  },
+  {
+   "name": "call b0 (pass 2)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 730750,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 0,
+    "pass": 2
+   }
+  },
+  {
+   "name": "run b0 (pass 2)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 731500,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 0,
+    "pass": 2
+   }
+  },
+  {
+   "name": "call b1 (pass 2)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 733750,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 1,
+    "pass": 2
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 736750,
+   "dur": 64750,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "copy b3 (pass 2)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 760750,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:2",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "acquire pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 760750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 4
+   }
+  },
+  {
+   "name": "read b4 (pass 2)",
+   "cat": "read",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 760750,
+   "dur": 120000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "disk",
+    "to": "pinned:1"
+   }
+  },
+  {
+   "name": "release pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 800750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 3
+   }
+  },
+  {
+   "name": "run b1 (pass 2)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 801500,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 1,
+    "pass": 2
+   }
+  },
+  {
+   "name": "call b2 (pass 2)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 801500,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 2,
+    "pass": 2
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 804500,
+   "dur": 67000,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "run b2 (pass 2)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 871500,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 2,
+    "pass": 2
+   }
+  },
+  {
+   "name": "call b3 (pass 2)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 871500,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "pass": 2
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 874500,
+   "dur": 67000,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "copy b4 (pass 2)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 880750,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:1",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "acquire pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 880750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 5
+   }
+  },
+  {
+   "name": "stage b5 (pass 2)",
+   "cat": "stage",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 880750,
+   "dur": 30000,
+   "args": {
+    "model": "m",
+    "block": 5,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "ram",
+    "to": "pinned:2",
+    "source": "memory"
+   }
+  },
+  {
+   "name": "release pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 920750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 4
+   }
+  },
+  {
+   "name": "copy b5 (pass 2)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 920750,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 5,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:2",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "run b3 (pass 2)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 941500,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "pass": 2
+   }
+  },
+  {
+   "name": "acquire pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 941500,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 6
+   }
+  },
+  {
+   "name": "read b6 (pass 2)",
+   "cat": "read",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 941500,
+   "dur": 120000,
+   "args": {
+    "model": "m",
+    "block": 6,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "disk",
+    "to": "pinned:1"
+   }
+  },
+  {
+   "name": "call b4 (pass 2)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 941500,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "pass": 2
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 944500,
+   "dur": 67000,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "release pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 960750,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 5
+   }
+  },
+  {
+   "name": "run b4 (pass 2)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 1011500,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "pass": 2
+   }
+  },
+  {
+   "name": "call b5 (pass 2)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 1011500,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 5,
+    "pass": 2
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 1014500,
+   "dur": 67000,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "copy b6 (pass 2)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 1061500,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 6,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:1",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "acquire pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 1061500,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 7
+   }
+  },
+  {
+   "name": "stage b7 (pass 2)",
+   "cat": "stage",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 1061500,
+   "dur": 30000,
+   "args": {
+    "model": "m",
+    "block": 7,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "ram",
+    "to": "pinned:2",
+    "source": "memory"
+   }
+  },
+  {
+   "name": "run b5 (pass 2)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 1081500,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 5,
+    "pass": 2
+   }
+  },
+  {
+   "name": "call b6 (pass 2)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 1081500,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 6,
+    "pass": 2
+   }
+  },
+  {
+   "name": "wait for the GPU",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 1084500,
+   "dur": 67000,
+   "args": {
+    "model": "m",
+    "reason": "gpu"
+   }
+  },
+  {
+   "name": "wait for a pinned buffer",
+   "cat": "wait",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 1091500,
+   "dur": 10000,
+   "args": {
+    "model": "m",
+    "reason": "pinned buffer"
+   }
+  },
+  {
+   "name": "release pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 1101500,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 6
+   }
+  },
+  {
+   "name": "copy b7 (pass 2)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 1101500,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 7,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:2",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "acquire pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 1101500,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 3
+   }
+  },
+  {
+   "name": "stage b3 (pass 3)",
+   "cat": "stage",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 1101500,
+   "dur": 30000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "ram",
+    "to": "pinned:1",
+    "source": "memory"
+   }
+  },
+  {
+   "name": "release pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 1141500,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 7
+   }
+  },
+  {
+   "name": "copy b3 (pass 3)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 1141500,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 3,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:1",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "run b6 (pass 2)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 1151500,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 6,
+    "pass": 2
+   }
+  },
+  {
+   "name": "acquire pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 3,
+   "ts": 1151500,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 4
+   }
+  },
+  {
+   "name": "read b4 (pass 3)",
+   "cat": "read",
+   "ph": "X",
+   "pid": 1,
+   "tid": 3,
+   "ts": 1151500,
+   "dur": 120000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "disk",
+    "to": "pinned:2"
+   }
+  },
+  {
+   "name": "call b7 (pass 2)",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 1151500,
+   "dur": 3000,
+   "args": {
+    "model": "m",
+    "block": 7,
+    "pass": 2
+   }
+  },
+  {
+   "name": "release pinned:1",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 1181500,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 1,
+    "block": 3
+   }
+  },
+  {
+   "name": "run b7 (pass 2)",
+   "cat": "run",
+   "ph": "X",
+   "pid": 1,
+   "tid": 2,
+   "ts": 1221500,
+   "dur": 70000,
+   "args": {
+    "model": "m",
+    "block": 7,
+    "pass": 2
+   }
+  },
+  {
+   "name": "copy b4 (pass 3)",
+   "cat": "copy",
+   "ph": "X",
+   "pid": 1,
+   "tid": 4,
+   "ts": 1271500,
+   "dur": 40000,
+   "args": {
+    "model": "m",
+    "block": 4,
+    "bytes": 25165824,
+    "pool": "pool-m",
+    "from": "pinned:2",
+    "to": "staged"
+   }
+  },
+  {
+   "name": "release pinned:2",
+   "cat": "buffer",
+   "ph": "i",
+   "s": "t",
+   "pid": 1,
+   "tid": 4,
+   "ts": 1311500,
+   "args": {
+    "model": "m",
+    "pool": "pool-m",
+    "buffer": 2,
+    "block": 4
+   }
+  }
+ ]
+}

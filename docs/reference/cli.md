@@ -44,6 +44,33 @@ tensors of one block. Sizes are as stored in the file.
 |---|---|---|
 | `--keys` | off | also list every tensor with its dtype, shape and size |
 
+## `trash-panda trace`
+
+```
+trash-panda trace [FILE] [OPTIONS]
+```
+
+Replay a recorded run in the browser, list the recordings, or remove old ones. Without `FILE` it opens the newest file of
+the trace folder (`TRASH_PANDA_TRACE_DIR`, see [settings](settings.md#trace-files)). A recording is made by running with
+`TRASH_PANDA_TRACE=1`. The command does not import PyTorch.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `FILE` | the newest recording | a trace file written by trash-panda |
+| `--port INTEGER` | `0` | the port to serve on; `0` picks a free one |
+| `--no-open` | off | do not open the browser, only print the address |
+| `--list` | off | list the trace files of the trace folder and stop |
+| `--clean` | off | remove trace files from the trace folder; it asks first |
+| `--keep INTEGER` | none | with `--clean`: keep the newest N files and remove the others |
+| `--older-than TEXT` | none | with `--clean`: remove files older than this: `90m`, `12h`, `30d` or `2w` |
+| `--yes` | off | with `--clean`: do not ask first |
+
+`--list` and `--clean` work on the trace folder and take no file. `--keep`, `--older-than` and `--yes` belong to `--clean`.
+With both limits a file is removed only if it is beyond the newest N and older than the age; with neither limit every file is
+removed. How to read the page is on the [command line guide](../guides/command-line.md#trash-panda-trace).
+
 ## Exit codes
 
-`0` when the command ran. `2` when the arguments are wrong, for example a checkpoint that does not exist.
+`0` when the command ran. `1` when `trash-panda trace` has nothing to open (no recording in the trace folder, or a file
+that is not a trace), or when a cleanup was declined. `2` when the arguments are wrong, for example a checkpoint that does
+not exist.

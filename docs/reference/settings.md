@@ -63,6 +63,20 @@ Two options are arguments of `stage()`, not settings: `overlap=True`, and `order
 | Setting | Default | Meaning |
 |---|---|---|
 | `profile` | `false` | print where the prefetching spent its time |
+| `trace` | `false` | record the run in a trace file in the trace folder (below) |
 
 In code, `trash_panda.offload.config.DEFAULTS` holds the shipped values and `config.current()` returns them with the
 environment applied.
+
+## Trace files
+
+`trace` switches recording on: `TRASH_PANDA_TRACE=1`. Where the files go is set by two more variables, which are read by
+`trash_panda.paths` and are not in `config`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TRASH_PANDA_TRACE_DIR` | `<cache folder>/traces` | the folder the trace files are written to, and the one `trash-panda trace` reads |
+| `TRASH_PANDA_HOME` | `~/.cache/trash_panda` | the cache folder |
+
+A blank value is the same as none. A file is named by the time the recording began, for example `20261114-143310-869.json`.
+How to record and read one is on the [command line guide](../guides/command-line.md#trash-panda-trace).

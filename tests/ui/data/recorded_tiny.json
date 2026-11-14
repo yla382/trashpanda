@@ -1,0 +1,324 @@
+{
+ "displayTimeUnit": "ms",
+ "trashPanda": {
+  "version": 2,
+  "note": "recorded",
+  "duration_us": 37300,
+  "models": [
+   {
+    "id": "tiny",
+    "name": "tiny",
+    "started_by": "stage",
+    "checkpoint": {
+     "path": "C:\\Users\\yoonh\\AppData\\Local\\Temp\\tmp47d3_3b8\\tiny.safetensors",
+     "bytes": 19848
+    },
+    "dtypes": {
+     "stored": "as stored",
+     "compute": "bfloat16"
+    },
+    "blocks": [
+     {
+      "id": 0,
+      "name": "blocks.0.",
+      "tier": "gpu",
+      "stored_bytes": 4224,
+      "expanded_bytes": 2112
+     },
+     {
+      "id": 1,
+      "name": "blocks.1.",
+      "tier": "gpu",
+      "stored_bytes": 4224,
+      "expanded_bytes": 2112
+     },
+     {
+      "id": 2,
+      "name": "blocks.2.",
+      "tier": "ram",
+      "stored_bytes": 4224,
+      "expanded_bytes": 2112
+     },
+     {
+      "id": 3,
+      "name": "blocks.3.",
+      "tier": "ram",
+      "stored_bytes": 4224,
+      "expanded_bytes": 2112
+     }
+    ],
+    "outside_bytes": 680,
+    "plan": {
+     "vram_budget": 0,
+     "ram_budget": 10000000000,
+     "headroom_bytes": 1500000000,
+     "stream_buffer_bytes": 2745,
+     "staging_bytes": 8448,
+     "lookahead": 2,
+     "warnings": [
+      "No CUDA GPU detected and no max_vram given: nothing can be placed on the GPU.",
+      "The GPU part of the plan needs 20.3 KB but the VRAM budget is 0 B; expect out-of-memory errors or slow spilling into shared memory."
+     ]
+    },
+    "options": {
+     "overlap": false,
+     "ram_in_memory": false,
+     "pinned_buffers": 2,
+     "blocks_in_flight": 2,
+     "adaptive_lookahead": false
+    },
+    "pool": null
+   }
+  ],
+  "tracks": [
+   {
+    "id": 1,
+    "name": "main thread",
+    "kind": "cpu",
+    "role": "main"
+   }
+  ],
+  "pools": [],
+  "phases": [
+   {
+    "model": "tiny",
+    "name": "load",
+    "start_us": 11,
+    "end_us": 31412
+   },
+   {
+    "model": "tiny",
+    "name": "pass 1",
+    "start_us": 34575,
+    "end_us": 35775
+   },
+   {
+    "model": "tiny",
+    "name": "pass 2",
+    "start_us": 35895,
+    "end_us": 36554
+   },
+   {
+    "model": "tiny",
+    "name": "pass 3",
+    "start_us": 36607,
+    "end_us": 37300
+   }
+  ]
+ },
+ "traceEvents": [
+  {
+   "name": "thread_name",
+   "ph": "M",
+   "pid": 1,
+   "tid": 1,
+   "args": {
+    "name": "main thread"
+   }
+  },
+  {
+   "name": "load blocks.0",
+   "cat": "load",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 29069,
+   "dur": 776,
+   "args": {
+    "model": "tiny",
+    "block": 0,
+    "bytes": 4224,
+    "source": "mmap",
+    "from": "disk",
+    "via": "ram",
+    "to": "gpu"
+   }
+  },
+  {
+   "name": "load blocks.1",
+   "cat": "load",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 29857,
+   "dur": 309,
+   "args": {
+    "model": "tiny",
+    "block": 1,
+    "bytes": 4224,
+    "source": "mmap",
+    "from": "disk",
+    "via": "ram",
+    "to": "gpu"
+   }
+  },
+  {
+   "name": "call blocks.0",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 34575,
+   "dur": 540,
+   "args": {
+    "model": "tiny",
+    "block": 0,
+    "pass": 1
+   }
+  },
+  {
+   "name": "call blocks.1",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 35133,
+   "dur": 149,
+   "args": {
+    "model": "tiny",
+    "block": 1,
+    "pass": 1
+   }
+  },
+  {
+   "name": "call blocks.2",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 35295,
+   "dur": 272,
+   "args": {
+    "model": "tiny",
+    "block": 2,
+    "pass": 1
+   }
+  },
+  {
+   "name": "call blocks.3",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 35590,
+   "dur": 185,
+   "args": {
+    "model": "tiny",
+    "block": 3,
+    "pass": 1
+   }
+  },
+  {
+   "name": "call blocks.0",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 35895,
+   "dur": 186,
+   "args": {
+    "model": "tiny",
+    "block": 0,
+    "pass": 2
+   }
+  },
+  {
+   "name": "call blocks.1",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 36095,
+   "dur": 155,
+   "args": {
+    "model": "tiny",
+    "block": 1,
+    "pass": 2
+   }
+  },
+  {
+   "name": "call blocks.2",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 36261,
+   "dur": 150,
+   "args": {
+    "model": "tiny",
+    "block": 2,
+    "pass": 2
+   }
+  },
+  {
+   "name": "call blocks.3",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 36421,
+   "dur": 133,
+   "args": {
+    "model": "tiny",
+    "block": 3,
+    "pass": 2
+   }
+  },
+  {
+   "name": "call blocks.0",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 36607,
+   "dur": 153,
+   "args": {
+    "model": "tiny",
+    "block": 0,
+    "pass": 3
+   }
+  },
+  {
+   "name": "call blocks.1",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 36770,
+   "dur": 178,
+   "args": {
+    "model": "tiny",
+    "block": 1,
+    "pass": 3
+   }
+  },
+  {
+   "name": "call blocks.2",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 36960,
+   "dur": 158,
+   "args": {
+    "model": "tiny",
+    "block": 2,
+    "pass": 3
+   }
+  },
+  {
+   "name": "call blocks.3",
+   "cat": "call",
+   "ph": "X",
+   "pid": 1,
+   "tid": 1,
+   "ts": 37129,
+   "dur": 171,
+   "args": {
+    "model": "tiny",
+    "block": 3,
+    "pass": 3
+   }
+  }
+ ]
+}

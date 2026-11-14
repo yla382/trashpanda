@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional
 import torch
 from . import config
+from . import trace as _trace
 from .blocks import find_blocks
 from .hardware import detect_hardware
 from .early import _EarlyLoader, _vram_available
@@ -87,14 +88,24 @@ def stage(build, path, *, key=None, key_map=None, skip_prefixes=(), order=None, 
     The block gets `(model, plan, handle)`; `handle.final_pass()` frees each block as it runs during the last call.
     The model cannot be used after the block."""
     k = key or str(path)
-    model = build()
-    plan_kwargs.setdefault("activation_vram", _activations.get(k))
-    if pool is not None:
-        plan_kwargs.setdefault("pinned_held", pool.sizes())
-    p = plan(model, path, key_map=key_map, skip_prefixes=skip_prefixes, **plan_kwargs)
-    stream_load(model, path, plan=p, key_map=key_map, skip_prefixes=skip_prefixes,
-                defer_prefixes=p.prefixes(Tier.GPU) if overlap else ())
-    handle = install_offload(model, order=order, order_file_destination=order_file_destination, pool=pool)
+    opened = _trace.open_session()                    # a recording, if TRASH_PANDA_TRACE is on and none is open
+    try:
+        model = build()
+        plan_kwargs.setdefault("activation_vram", _activations.get(k))
+        if pool is not None:
+            plan_kwargs.setdefault("pinned_held", pool.sizes())
+        p = plan(model, path, key_map=key_map, skip_prefixes=skip_prefixes, **plan_kwargs)
+        tr = _trace.add_model(k, path, p, overlap=overlap)
+        began = tr.now() if tr is not None else 0
+        with _trace.Loading(tr):
+            stream_load(model, path, plan=p, key_map=key_map, skip_prefixes=skip_prefixes,
+                        defer_prefixes=p.prefixes(Tier.GPU) if overlap else ())
+        if tr is not None:
+            tr.phase("load", began, tr.now())
+        handle = install_offload(model, order=order, order_file_destination=order_file_destination, pool=pool)
+    except BaseException:
+        _trace.close_session(opened)
+        raise
     state = getattr(model, "_trash_panda_state", None)
     loading = state is not None and state.deferred is not None       # the weights are still arriving
     before = _start_peak() if torch.cuda.is_available() and not loading else None
@@ -103,7 +114,10 @@ def stage(build, path, *, key=None, key_map=None, skip_prefixes=(), order=None, 
         if before is not None:
             _activations[k] = _peak_since(before, p)
     finally:
-        release(model, handle)
+        try:
+            release(model, handle)
+        finally:
+            _trace.close_session(opened)
 
 
 class PendingStage:
@@ -134,6 +148,7 @@ class PendingStage:
         self._error  = None
         self._read_s = 0.0
         self._done   = threading.Event()
+        self.tr      = _trace.add_model(key, path, p, started_by="preload", overlap=overlap)      # the trace of the model, if one is recorded
         self._thread = threading.Thread(target=self._read, name="trash-panda-preload", daemon=True)
         self._thread.start()
 
@@ -143,9 +158,14 @@ class PendingStage:
 
     def _read(self) -> None:
         began = time.perf_counter()
+        tr = self.tr
+        began_us = tr.now() if tr is not None else 0
         try:
-            stream_load(self.model, self._path, plan=self.plan, key_map=self._key_map, skip_prefixes=self._skip,
-                        defer_prefixes=self.plan.prefixes(Tier.GPU), ram_in_memory_prefixes=self._memory)
+            with _trace.Loading(tr):
+                stream_load(self.model, self._path, plan=self.plan, key_map=self._key_map, skip_prefixes=self._skip,
+                            defer_prefixes=self.plan.prefixes(Tier.GPU), ram_in_memory_prefixes=self._memory)
+            if tr is not None:
+                tr.preload(began_us, tr.now())
             if self._after is not None and self.model._trash_panda_state.deferred is not None:
                 self._early = self._make_early()
         except Exception as err:                           # raised again where the model is asked for
@@ -192,6 +212,8 @@ class PendingStage:
             return
         ordered = _in_run_order(self.plan, state.checkpoint.path, self._order, self._order_dest)
         promoted, demoted = refit_gpu_blocks(self.plan, ordered, available, self.plan.headroom_bytes, pending, promotable)
+        if self.tr is not None and (promoted or demoted):
+            self.tr.replan(demoted, promoted)
         tiers = {b.prefix: b for b in self.plan.blocks}
         with state.checkpoint:
             for prefix in demoted:
@@ -217,8 +239,11 @@ class PendingStage:
             raise RuntimeError("this preloaded model was already used or cancelled")
         self._used = True
         began = time.perf_counter()
+        began_us = self.tr.now() if self.tr is not None else 0
         self._done.wait()
         self._stop_early()
+        if self.tr is not None:
+            self.tr.wait("preload", began_us, self.tr.now())
         waited = time.perf_counter() - began
         if self._error is not None:
             release(self.model)
@@ -244,6 +269,8 @@ class PendingStage:
                                       pool=self._pool)
         loading = state.deferred is not None               # the weights are still arriving
         self._before = _start_peak() if torch.cuda.is_available() and not loading else None
+        if self.tr is not None:
+            self.tr.phase("load", began_us, self.tr.now())            # from the entry until the model is ready: the preload has a slice of its own
         return self.model, self.plan, self.handle
 
     def __exit__(self, exc_type, exc, tb):
@@ -260,6 +287,8 @@ class PendingStage:
         if self._used:
             return
         self._used = True
+        if self.tr is not None:
+            self.tr.cancel()
         self._done.wait()
         self._stop_early()
         release(self.model)
