@@ -69,8 +69,18 @@ the trace folder (`TRASH_PANDA_TRACE_DIR`, see [settings](settings.md#trace-file
 With both limits a file is removed only if it is beyond the newest N and older than the age; with neither limit every file is
 removed. How to read the page is on the [command line guide](../guides/command-line.md#trash-panda-trace).
 
+## `trash-panda config`
+
+```
+trash-panda config
+```
+
+No arguments or options. Prints a table of the variables trash-panda reads, with their current values. A value nobody set is
+marked `(default)`. See the [command line guide](../guides/command-line.md#trash-panda-config) and the
+[settings](settings.md).
+
 ## Exit codes
 
 `0` when the command ran. `1` when `trash-panda trace` has nothing to open (no recording in the trace folder, or a file
-that is not a trace), or when a cleanup was declined. `2` when the arguments are wrong, for example a checkpoint that does
+that is not a trace), when a cleanup was declined, or when `trash-panda config` finds a value that cannot be read. `2` when the arguments are wrong, for example a checkpoint that does
 not exist.

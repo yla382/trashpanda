@@ -29,8 +29,8 @@ planned. Nothing here is promised or scheduled.
 
 ## Tools and diagnostics
 
-* **More command-line commands**, such as a hardware report for bug reports. `trash-panda plan` and `trash-panda info`
-  exist already (see the [command line guide](../guides/command-line.md))
+* **More command-line commands**, such as `trash-panda doctor`, a hardware report for bug reports. `plan`, `info`, `trace`
+  and `config` exist already (see the [command line guide](../guides/command-line.md))
 
 ## Reliability and project
 

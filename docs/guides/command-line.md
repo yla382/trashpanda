@@ -2,7 +2,8 @@
 
 Two commands look at a checkpoint without loading it. `trash-panda info` says what is in the file, and
 `trash-panda plan` says where the blocks of the model would live on this machine. Both read only the headers of the
-safetensors file; no weights are loaded. A third, `trash-panda trace`, shows a run that was recorded, in the browser.
+safetensors file; no weights are loaded. `trash-panda trace` shows a run that was recorded, in the browser, and
+`trash-panda config` prints the settings and what they are now.
 
 ## Install
 
@@ -212,6 +213,26 @@ removes recordings. `--keep N` keeps the newest N and removes the others. `--old
 `w` (`90m`, `12h`, `30d`, `2w`). With both, a file is removed only if it is beyond the newest N and older than the age;
 with neither, every file is removed. The command lists the files and asks before it deletes them, unless you pass `--yes`.
 Recording never deletes anything. All the options are on the [command line reference](../reference/cli.md).
+
+## `trash-panda config`
+
+```
+trash-panda config
+```
+
+prints a table with every environment variable that trash-panda reads and the value it has now: the two folders
+(`TRASH_PANDA_HOME` and `TRASH_PANDA_TRACE_DIR`, shown as the paths they resolve to) and then each tuning setting. A value
+that nobody set is followed by `(default)`; a value that comes from the environment is shown without it, in bold.
+
+```
+| TRASH_PANDA_LOOKAHEAD       | 0           |
+| TRASH_PANDA_PINNED_BUFFERS  | 2 (default) |
+```
+
+Two things are called out under the table. A variable that starts with `TRASH_PANDA_` but is not one of these (usually a typo)
+is listed as ignored. A value that cannot be read, such as `TRASH_PANDA_LOOKAHEAD=many`, is marked `(invalid)` and the command
+exits with `1`, because the library would raise an error when it ran. What each setting does is on the
+[settings reference](../reference/settings.md).
 
 ## Good to know
 

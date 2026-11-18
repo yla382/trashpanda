@@ -3,6 +3,10 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.2.2] - 2026-11-17
+### Added
+- `trash-panda config` (`cli/config.py`): a table of every variable the library reads (`TRASH_PANDA_HOME`, `TRASH_PANDA_TRACE_DIR` and each tuning setting) with its current value; a value that is not set is marked `(default)`. A `TRASH_PANDA_` variable that nothing reads is listed as ignored, and a value that cannot be read is marked `(invalid)` and makes the exit code 1. The command imports `torch` only when it runs
+
 ## [0.2.1] - 2026-11-14
 ### Added
 - `TRASH_PANDA_TRACE=1` records a run as a trace file. `stage()` opens a recording if none is open, a `Coordinator` opens one for its whole `with` block, and the file is written when that block ends, also when it raises; the path is printed (`trash-panda: trace written to ...`). The file goes to `TRASH_PANDA_TRACE_DIR` (default: the `traces` folder of `TRASH_PANDA_HOME`, default `~/.cache/trash_panda`) and is named by the time the recording began, to the millisecond (`20261114-143310-869.json`). `trash_panda/paths.py` (standard library only) holds the folders, the names and the rules for removing files. The setting `trace` is a boolean
