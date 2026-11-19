@@ -23,6 +23,8 @@ class Hardware:
     compute_capability: Optional[Tuple[int, int]] = None
     bf16_supported: bool = False
     native_fp8: bool = False
+    device: str = "cpu"                         # where a model runs by default: "cuda", "mps" or "cpu"
+    unified_memory: bool = False                # the device shares its memory with the CPU
 
     def summary(self) -> str:
         lines = []
@@ -127,6 +129,7 @@ def _read_ram() -> Tuple[int, int, Optional[int]]:
 def detect_hardware(device_index: int = 0) -> Hardware:
     hw = Hardware()
     if torch.cuda.is_available():
+        hw.device = "cuda"
         props = torch.cuda.get_device_properties(device_index)
         free, total = torch.cuda.mem_get_info(device_index)
         hw.vram_total, hw.vram_free = int(total), int(free)
@@ -134,5 +137,9 @@ def detect_hardware(device_index: int = 0) -> Hardware:
         hw.compute_capability = (props.major, props.minor)
         hw.bf16_supported = bool(torch.cuda.is_bf16_supported())
         hw.native_fp8 = hw.compute_capability >= (8, 9)
+        hw.unified_memory = bool(getattr(props, "is_integrated", False))
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        hw.device = "mps"
+        hw.unified_memory = True
     hw.ram_total, hw.ram_available, hw.commit_available = _read_ram()
     return hw

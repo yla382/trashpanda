@@ -79,6 +79,17 @@ No arguments or options. Prints a table of the variables trash-panda reads, with
 marked `(default)`. See the [command line guide](../guides/command-line.md#trash-panda-config) and the
 [settings](settings.md).
 
+## `trash-panda hardware`
+
+```
+trash-panda hardware
+```
+
+No arguments or options. Prints a table with the columns Item, Value and Note: the versions of trash-panda, Python and
+PyTorch, the operating system, the device (`cuda`, `mps` or `cpu`), whether the memory is unified, the RAM, the commit
+headroom on Windows, and with CUDA the GPU, its VRAM, the CUDA version, the compute capability, and bf16 and fp8 support.
+See the [command line guide](../guides/command-line.md#trash-panda-hardware).
+
 ## Exit codes
 
 `0` when the command ran. `1` when `trash-panda trace` has nothing to open (no recording in the trace folder, or a file

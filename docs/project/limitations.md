@@ -4,10 +4,6 @@ What trash-panda does not do yet, and what is out of scope for now.
 
 ## What it does not do (yet)
 
-* coordinating memory between several models that are loaded at the same time (for example a text encoder
-  and a diffusion model). Each model is planned on its own from the memory that is free when you plan it, so
-  plan them one after the other, or free the first model before loading the next. Models that run one after another
-  are what `Coordinator` is for (see "Running a pipeline")
 * full overlap of reading and computing for disk blocks: blocks waiting in RAM and on disk are prefetched through
   pinned buffers by a background thread, two blocks ahead by default, but the drive's speed sets a floor that no
   amount of prefetching removes (see "Known issues")
@@ -18,11 +14,11 @@ What trash-panda does not do yet, and what is out of scope for now.
 * int8 / 4-bit formats (fp8 and ordinary float dtypes only)
 * LoRA/LoKr adapters, multi-GPU, model definitions
 
-## Out of scope for now
+## Planned, but not prioritized yet
 
 The current direction is sequential model chaining: each model of a pipeline is loaded, run and released before the
 next one is planned (for example text encoder, then diffusion model, then VAE). The following are not part of that
-direction, or come after it, and are not planned for now:
+direction, or come after it. They are planned, but not prioritized yet:
 
 * **ControlNet**: an extra network that steers a diffusion model with a guide image (edges, pose, depth). It runs
   alongside the diffusion model at every denoising step, so both models must be loaded at the same time
@@ -39,10 +35,6 @@ direction, or come after it, and are not planned for now:
 * **fp8 checkpoints with block-wise scales** (the `weight_scale_inv` layout used on the Hugging Face Hub), with one
   scale per 128 x 128 block of weights. It touches the scale lookup, the expansion and the staging of the scales
 * **LoRA and other adapters** on offloaded blocks
-* **A `from_pretrained`-style helper for `transformers` models** (find the weight files, build on the meta device with
-  real buffers, plan, load and install the hooks in one call), ignoring buffers that are not in the checkpoint (rotary
-  tables, position ids) instead of failing, and making `model.dtype`, `model.device` and `model.to(...)` behave on
-  offloaded models so `generate()` and `pipeline()` work
 * **A ComfyUI custom node** that loads and runs a model through trash-panda inside a ComfyUI workflow
 * **A memory-mapped disk tier** as an experiment: map the checkpoint once and let the operating system keep recently
   used blocks cached, instead of an explicit split between RAM and disk. To be measured against explicit read-ahead,
@@ -61,4 +53,4 @@ direction, or come after it, and are not planned for now:
   `TRASH_PANDA_LOG=run.jsonl`) with the plan, memory and timings of a run. The visualization and a comparison of two
   runs could read it
 
-These may be considered in the future. They are not part of the immediate plan.
+They will be built, in an order that follows what is needed. They are not part of the immediate plan.

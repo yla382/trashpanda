@@ -3,6 +3,16 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.2.3] - 2026-11-18
+### Added
+- `trash-panda hardware` (`cli/hardware.py`): a table (Item, Value, Note) of the versions of trash-panda, Python and PyTorch, the operating system, the device, whether the memory is unified, the RAM, the commit headroom (Windows), and with CUDA the GPU, VRAM, CUDA version, compute capability and bf16 and fp8 support. Sizes are in GiB (1024 ** 3 bytes), as memory is sold, unlike the decimal GB of `plan`. A machine with no CUDA shows `none detected`, and one with `mps` says its GPU memory is shared with RAM. It imports `torch` only when it runs
+
+### Changed
+- `Hardware` has two new fields, `device` (`"cuda"`, `"mps"` or `"cpu"`) and `unified_memory`. `detect_hardware()` sets them: `cuda` with `unified_memory` from the device's `is_integrated` property, and `mps` with `unified_memory` true. VRAM stays 0 on `mps`, so no plan changes
+
+### Notes
+- The `mps` branch of `detect_hardware()` is tested with a faked answer only; it has not run on a Mac. Whether a CUDA machine with shared memory (a Jetson board, the DGX Spark) reports `is_integrated` was not checked
+
 ## [0.2.2] - 2026-11-17
 ### Added
 - `trash-panda config` (`cli/config.py`): a table of every variable the library reads (`TRASH_PANDA_HOME`, `TRASH_PANDA_TRACE_DIR` and each tuning setting) with its current value; a value that is not set is marked `(default)`. A `TRASH_PANDA_` variable that nothing reads is listed as ignored, and a value that cannot be read is marked `(invalid)` and makes the exit code 1. The command imports `torch` only when it runs

@@ -26,11 +26,10 @@ planned. Nothing here is promised or scheduled.
 
 * `diffusers` pipelines: build the large components with `stream_load` and hand them to the pipeline class, so
   `from_pretrained` does not load everything into RAM first.
-
-## Tools and diagnostics
-
-* **More command-line commands**, such as `trash-panda doctor`, a hardware report for bug reports. `plan`, `info`, `trace`
-  and `config` exist already (see the [command line guide](../guides/command-line.md))
+* **A `from_pretrained`-style helper for `transformers` models**: find the weight files, build on the meta device with
+  real buffers, plan, load and install the hooks in one call. Buffers that are not in the checkpoint (rotary tables,
+  position ids) would be ignored instead of failing, and `model.dtype`, `model.device` and `model.to(...)` would behave on
+  offloaded models, so `generate()` and `pipeline()` work.
 
 ## Reliability and project
 

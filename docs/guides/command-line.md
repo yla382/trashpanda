@@ -3,7 +3,8 @@
 Two commands look at a checkpoint without loading it. `trash-panda info` says what is in the file, and
 `trash-panda plan` says where the blocks of the model would live on this machine. Both read only the headers of the
 safetensors file; no weights are loaded. `trash-panda trace` shows a run that was recorded, in the browser, and
-`trash-panda config` prints the settings and what they are now.
+`trash-panda config` prints the settings and what they are now. `trash-panda hardware` prints what this machine has, for
+a bug report.
 
 ## Install
 
@@ -233,6 +234,43 @@ Two things are called out under the table. A variable that starts with `TRASH_PA
 is listed as ignored. A value that cannot be read, such as `TRASH_PANDA_LOOKAHEAD=many`, is marked `(invalid)` and the command
 exits with `1`, because the library would raise an error when it ran. What each setting does is on the
 [settings reference](../reference/settings.md).
+
+## `trash-panda hardware`
+
+```
+trash-panda hardware
+```
+
+prints a table of what this machine has: the versions of trash-panda, Python and PyTorch, the operating system, the device
+a model would run on, and the memory. Paste it into a bug report. Each row has a value, and the rows that need a word of
+explanation have a note.
+
+```
+| Item               | Value                     | Note                          |
+|--------------------+---------------------------+-------------------------------|
+| trash-panda        | v0.2.3                    |                               |
+| Device             | cuda                      | Where a model runs by default.|
+| Unified memory     | no                        | ...                           |
+| RAM                | 2.66 GiB available of 15.95 GiB |                         |
+| GPU                | NVIDIA GeForce RTX 3060         |                         |
+| VRAM               | 10.99 GiB free of 12.00 GiB     |                         |
+```
+
+* **Device** is `cuda`, `mps` (the Apple GPU) or `cpu`.
+* **Unified memory** says whether the GPU and the CPU share one memory pool, as on an Apple silicon Mac. There, splitting a
+  model between "GPU" and "RAM" frees nothing. The planner does not use this yet; trash-panda treats an `mps` machine as
+  having no VRAM.
+* **RAM** is what is free now, out of what is installed. **Commit headroom** (Windows only) is how much more memory the
+  system lets programs reserve, which is RAM plus the page file; it is the number to look at when a process ends without an
+  error.
+* With CUDA, the table also shows the **GPU**, its **VRAM** (free now, out of the total), the CUDA version PyTorch was built
+  for, the GPU's **compute capability** (its architecture version), whether it supports **bf16**, and whether it computes
+  in **fp8** itself (compute capability 8.9 or higher). On an `mps` machine one row says the GPU memory is shared with RAM; on a
+  machine with no GPU the row says none was detected.
+
+Sizes are in GiB (1024 x 1024 x 1024 bytes), the unit that memory is sold and shown in, so a "16 GB" machine reads about
+16 GiB and a "12 GB" card reads 12 GiB. `plan` counts in decimal gigabytes, so the same card is 12.88 GB there. The
+figures are read when the command runs, so free memory changes from one run to the next.
 
 ## Good to know
 
