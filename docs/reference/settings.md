@@ -62,8 +62,17 @@ Two options are arguments of `stage()`, not settings: `overlap=True`, and `order
 
 | Setting | Default | Meaning |
 |---|---|---|
+| `faulthandler` | `true` | turn Python's faulthandler on when a model loads (below) |
 | `profile` | `false` | print where the prefetching spent its time |
 | `trace` | `false` | record the run in a trace file in the trace folder (below) |
+
+`faulthandler` is on by default and prints nothing unless the process crashes in native code (an access violation, a
+segmentation fault). It then prints the kind of crash and the Python stack of every thread, which shows where the process
+was. It is turned on when the first model loads (`stream_load()`, so also `stage()`, `preload()` and a `Coordinator`), and
+it is left alone if it is on already (your own `faulthandler.enable()`, `python -X faulthandler`, `PYTHONFAULTHANDLER=1`)
+or if stderr has no file descriptor to write to, as in a notebook. `TRASH_PANDA_FAULTHANDLER=0` turns it off. A process
+that the system ends, for example when memory runs out, prints nothing, because no code runs in it then; when a run ends
+with no Python error and no faulthandler output, that is the likely cause.
 
 In code, `trash_panda.offload.config.DEFAULTS` holds the shipped values and `config.current()` returns them with the
 environment applied.

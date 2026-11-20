@@ -52,7 +52,8 @@ class Defaults:
     find_blocks_min_blocks: int = 2             # ... and have at least this many blocks
 
     # diagnostics
-    profile: bool = False                       # print where the prefetching spent its time
+    faulthandler: bool = True                   # turn faulthandler on when a model loads: a crash in native code then prints where (nothing is printed otherwise)
+    profile: bool = False                      # print where the prefetching spent its time
     trace: bool = False                         # record the run in a trace file (docs/design/trace-format.md), in TRASH_PANDA_TRACE_DIR
 
 

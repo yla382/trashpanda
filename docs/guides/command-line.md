@@ -248,7 +248,7 @@ explanation have a note.
 ```
 | Item               | Value                     | Note                          |
 |--------------------+---------------------------+-------------------------------|
-| trash-panda        | v0.2.3                    |                               |
+| trash-panda        | v0.2.4                    |                               |
 | Device             | cuda                      | Where a model runs by default.|
 | Unified memory     | no                        | ...                           |
 | RAM                | 2.66 GiB available of 15.95 GiB |                         |

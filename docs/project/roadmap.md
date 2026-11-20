@@ -36,19 +36,14 @@ planned. Nothing here is promised or scheduled.
 * Investigate sudden exits: rarely, and only when RAM is already high (about 12 GB in use on a 16 GB machine)
   before a large model is loaded, the process ends with no Python error, usually while the weights are being
   loaded. It is probably the operating system ending the process or a crash in native code, but this has not been
-  confirmed. Next time, record the exit code and run with `PYTHONFAULTHANDLER=1`, and check whether it also happens
-  from a clean memory state.
-* Find out where a sudden exit goes wrong: when a run ends without a Python error, check the exit code right
-  afterwards (`$LASTEXITCODE` in PowerShell) and run with `PYTHONFAULTHANDLER=1`. A large negative code such as
-  `-1073741819` is a crash in native code, while a normal code points to the process being ended by the system. Also
-  print the memory in use and the available commit (RAM plus page file) before loading, so a failed run shows what
-  the machine had left.
+  confirmed. `faulthandler` is on by default now (see [settings](../reference/settings.md#diagnostics)), so a crash in
+  native code prints where it happened. Next time, record the exit code (`$LASTEXITCODE` in PowerShell), and check
+  whether it also happens from a clean memory state.
 * An option to keep chosen blocks or weights when `final_pass()` frees a model, if a model turns out to need it. By
   default every block is freed after it runs and the weights outside the blocks are left alone. A block that runs more
   than once in a pass (weight sharing as in ALBERT, or a caller that runs the model twice in one step) would be freed
   after its first run, and a weight tied between a block and an outside layer would be shared with a layer that still
   needs it. A list of name prefixes, like `skip_prefixes`, would leave those alone. It may not be needed.
-* Tests on tiny `transformers` and `diffusers` models on the CPU, in CI.
 * Tests on more models, GPUs and operating systems (Linux in particular), with benchmarks published here. A first
   test on a Mac is planned: the unit tests and `examples/sdxl_benchmark.py --size 512 --steps 10` in the baseline and
   trash-panda modes, to see whether it installs and runs on the CPU or the Apple GPU. Real Mac support, if there is

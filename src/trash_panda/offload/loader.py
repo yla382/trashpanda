@@ -12,6 +12,7 @@ Each tensor is read lazily from the checkpoint and placed according to its tier:
 
 from __future__ import annotations
 
+import faulthandler
 import threading
 import time
 from collections import defaultdict
@@ -137,6 +138,20 @@ def _to_meta(model: nn.Module, name: str) -> None:
             owner._parameters[leaf] = nn.Parameter(torch.empty_like(p, device="meta"), requires_grad=False)
 
 
+def _enable_faulthandler() -> None:
+    """Turn faulthandler on, so that a crash in native code (an access violation, a segmentation fault) prints the Python
+    traceback of every thread: where the process was when it died. Nothing is printed unless it crashes. It stays as it is
+    when it is on already (the user's own setting, `-X faulthandler`, PYTHONFAULTHANDLER=1), when TRASH_PANDA_FAULTHANDLER
+    turns it off, and when stderr has no file descriptor to write to (a notebook). A process that the system ends, as when
+    memory runs out, leaves no trace here: nothing runs in it then."""
+    if not config.current().faulthandler or faulthandler.is_enabled():
+        return
+    try:
+        faulthandler.enable(all_threads=True)
+    except (AttributeError, OSError, ValueError, RuntimeError):
+        pass
+
+
 def stream_load(
     model: nn.Module,
     path,
@@ -174,7 +189,8 @@ def stream_load(
     Returns a LoadReport (print it) and remembers the settings on the model for install_offload().
     """
     began_all = time.perf_counter()
-    tr = _trace.loading_model()                              # the trace of the model that this thread is loading, if one is recorded
+    _enable_faulthandler()
+    tr = _trace.loading_model()                             # the trace of the model that this thread is loading, if one is recorded
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     if plan is not None:
         cdt, sdt = plan.compute_dtype, plan.storage_dtype

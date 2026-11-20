@@ -3,6 +3,17 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com), versions follow [Semantic Versioning](https://semver.org).
 
+## [0.2.4] - 2026-11-19
+### Added
+- The setting `faulthandler` (`TRASH_PANDA_FAULTHANDLER`, default on). When the first model loads (`stream_load()`, so also `stage()`, `preload()` and a `Coordinator`), Python's `faulthandler` is turned on, so a crash in native code (an access violation, a segmentation fault) prints the kind of crash and the Python stack of every thread, which shows where the process was. Nothing is printed unless the process crashes. It is left alone when it is on already (`faulthandler.enable()`, `-X faulthandler`, `PYTHONFAULTHANDLER=1`) or when stderr has no file descriptor, as in a notebook; `TRASH_PANDA_FAULTHANDLER=0` turns it off
+
+### Changed
+- Docs: the settings reference covers `faulthandler`. The roadmap no longer lists the sudden-exit diagnostics item that this finishes (the item about finding the cause of the exits stays, and now says that faulthandler is on) or the tests on tiny `transformers` and `diffusers` models, which are part of the `transformers` helper if it is built
+
+### Notes
+- Tested with an access violation raised on purpose after a model load: with the default it printed `Windows fatal exception: access violation` and the stack, with `TRASH_PANDA_FAULTHANDLER=0` it did not. `ctypes` turned that violation into a Python `OSError`, so the exit code there was 1; a crash that nothing catches exits with a code such as `0xC0000005`, which was not tried
+- A process that the system ends, as when memory runs out, runs no code and prints nothing; a run that ends with no Python error and no faulthandler output points to that
+
 ## [0.2.3] - 2026-11-18
 ### Added
 - `trash-panda hardware` (`cli/hardware.py`): a table (Item, Value, Note) of the versions of trash-panda, Python and PyTorch, the operating system, the device, whether the memory is unified, the RAM, the commit headroom (Windows), and with CUDA the GPU, VRAM, CUDA version, compute capability and bf16 and fp8 support. Sizes are in GiB (1024 ** 3 bytes), as memory is sold, unlike the decimal GB of `plan`. A machine with no CUDA shows `none detected`, and one with `mps` says its GPU memory is shared with RAM. It imports `torch` only when it runs
